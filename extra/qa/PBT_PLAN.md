@@ -124,9 +124,9 @@ Legend:
 |---|---|---|---|---|
 | A1 | `binsrv::gtids` (uuid, tag, gtid, gtid_set) | text and binary roundtrip; byte-exact MySQL encoding; model agreement over add/subtract/clear sequences; union/difference laws; malformed text and binary rejected | reference model, `rpl_gtid_set.cc`, MySQL manual | ✅ |
 | A2 | `util` byte-span codecs: fixed, packed (`pack.cc`) and varlen ints | roundtrip for every width and signedness; `calculate_*_size` equals the bytes written; truncated input returns false without consuming; NULL marker 251 / 255 handling; narrowing extraction fails on overflow | MySQL encodings, re-implemented in the test | ✅ |
-| A3 | `events::composite_binlog_name` | `parse(str())` roundtrip; `next()` increments the sequence number, and 999999 throws; reject an empty base, `/` in the base, a non-6-digit suffix; base names with `\n` (they corrupt `binlog.index`) | README, `storage_core` index format | 🟢 |
+| A3 | `events::composite_binlog_name` | `parse(str())` roundtrip; `next()` increments the sequence number, and 999999 throws; reject an empty base, `/` in the base, a non-6-digit suffix; base names with `\n` (they corrupt `binlog.index`) | README, `storage_core` index format | ✅ |
 | A4 | `opensslpp::cipher_context` | `decrypt(encrypt(x)) == x` for every cipher/mode/padding; for CTR, `create_with_offset(k)` applied to a suffix equals the same suffix of a full encryption (this is how encrypted binlogs are read at random offsets) | OpenSSL as reference | ✅ |
-| A5 | `events::event` / `event_view` / `rewriter` | `create_event` → view → encode is byte-identical; flipping any byte makes CRC verification fail; truncation is rejected; checksum add then remove is the identity; rewritten tagged GTID events still parse, and `transaction_length` stays consistent | MySQL event format | 🟢 |
+| A5 | `events::event` / `event_view` / `rewriter` | `create_event` → view → encode is byte-identical; flipping any byte makes CRC verification fail; truncation is rejected; checksum add then remove is the identity; rewritten tagged GTID events still parse, and `transaction_length` stays consistent | MySQL event format | ✅ (rewriter still to do) |
 | A6 | `events::reader_context` | generated valid streams following the documented grammar (`ROTATE FDE PREV_GTIDS? (GTID ANY*)* (ROTATE\|STOP)?`) are accepted; each single grammar mutation (dropped or duplicated FDE, wrong `next_event_position`, wrong `transaction_length`, ANONYMOUS in GTID mode) throws | the grammar in `reader_context.hpp` | 🟢 (stateful) |
 | A7 | `util`: semantic_version, hex_value, ctime_timestamp(+range), flag_set, composite_name, crc32 | roundtrips; range is a monoid; crc32 matches zlib and `crc32_combine` | docs and zlib | 🟢 |
 | A8 | `util::nv_tuple` JSON + `models::*` | `from_json(to_json(x)) == x`; unknown keys are ignored; type mismatch throws and names the JSON path | — | 🟢 |
@@ -212,6 +212,31 @@ OpenSSL's EVP API, round trips, CTR random access through
 
 The packed and variable-length integer codecs matched the MySQL reference
 everywhere.
+
+### Binlog names and events (sandbox run)
+
+`composite_binlog_name_property_test` has 6 properties. `event_property_test`
+has 12. The event properties cover:
+- create → bytes → view → event round trips for 7 event types, both server
+  versions, with and without checksums
+- common header consistency
+- CRC detection of every single-bit corruption
+- rejection of truncated and extended events
+- parse/encode round trips of mutated bodies
+- forward compatibility of tagged GTID events
+
+The two suites have 5 new findings, `PBT-015`…`PBT-019`:
+- 7-digit binlog names are rejected
+- base names with line breaks or NUL are accepted
+- an unparseable FORMAT_DESCRIPTION server version terminates the process
+- `create_event<format_description>(include_checksum=false)` fails
+- unknown trailing fields in tagged GTID events are rejected
+
+From the adversarial review, waiting for later layers:
+- `indexed_event_block` loops forever on `event_size < 19` (B4, needs T1)
+- `binlog.index` order is not validated (B1)
+- 32-bit position truncation for binlogs larger than 4 GiB (A6 / B1)
+- `last_committed < sequence_number` is never validated (A6)
 
 ## 6. Open questions
 
