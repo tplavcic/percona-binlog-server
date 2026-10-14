@@ -1040,7 +1040,9 @@ BOOST_AUTO_TEST_CASE(TagValidationMatchesGrammar) {
 // scale probe (not generated): very large sets must work in reasonable time
 // ===========================================================================
 BOOST_AUTO_TEST_CASE(ScaleProbeLargeSet) {
-  static constexpr std::uint64_t interval_count{200000ULL};
+  // 200000 intervals by default; follows PBT_CASES_SCALE (--cases-scale)
+  const std::uint64_t interval_count{pbt::scaled(200000ULL)};
+  BOOST_TEST_MESSAGE("scale probe: " << interval_count << " intervals");
   const auto uuid{to_sut_uuid(
       model::raw_uuid{0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99,
                       0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x01})};
