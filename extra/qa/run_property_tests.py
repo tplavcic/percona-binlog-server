@@ -26,7 +26,17 @@ Output: $WORKDIR/testruns/<YYYYmmdd-HHMMSS>/
     junit.xml      JUnit report (Jenkins: junit 'testruns/latest/junit.xml')
     run_info.json  git revision, preset, knobs used for the run
     logs/<executable>/<property>.log   full output of every property
-and $WORKDIR/testruns/latest -> <YYYYmmdd-HHMMSS>
+and $WORKDIR/testruns/latest and latest-<variant> -> <YYYYmmdd-HHMMSS>
+
+Build variant: the preset plus extra sanitizers (e.g. asan_gcc14,
+release_gcc14-ubsan), read from pbt_build_info.json written by
+build_property_tests.sh. It prefixes the junit suite names
+(property.<variant>.<executable>) so runs of several variants can be told
+apart in Jenkins.
+
+Sanitizer reports (AddressSanitizer, LeakSanitizer, UBSan "runtime error:",
+ThreadSanitizer) are reported as failures of kind 'sanitizer' with the
+sanitizer's first report line as the message.
 
 Every failure is classified using extra/qa/known_bugs.md:
     known      - matches an open entry of known_bugs.md (old issue)
@@ -198,6 +208,9 @@ FAILURE_BLOCK_RE = re.compile(r"^--- Failure.*?(?=^rerun with:|\Z)",
 BLOB_RE = re.compile(r'rerun with:.*?\{"([A-Za-z0-9+/=]+)"\}')
 VIOLATION_RE = re.compile(r"PROPERTY VIOLATED: .*")
 BOOST_ERROR_RE = re.compile(r'(?:fatal error|error): in "[^"]*": (.*)')
+SANITIZER_RE = re.compile(
+    r"^(?:==\d+==)?\s*((?:ERROR|WARNING): (?:Address|Leak|Thread|Memory)"
+    r"Sanitizer.*|.*?: runtime error: .*)$", re.M)
 
 
 def extract_failure(log_text: str, result: Result) -> None:
@@ -268,9 +281,25 @@ def run_property(exe: Executable, name: str, args, env: Dict[str, str],
         result.status, result.kind = "error", "infra"
     else:
         result.status, result.kind = "failed", "violation"
+    sanitizer = SANITIZER_RE.search(log_text)
+    if sanitizer and result.kind != "timeout":
+        # sanitizers report and then exit/abort; their report is the root
+        # cause even when the property itself would have passed
+        result.status, result.kind = "failed", "sanitizer"
     if result.status != "passed":
         crash_message = result.message if result.kind == "crash" else ""
         extract_failure(log_text, result)
+        if sanitizer:
+            result.message = "SANITIZER: " + sanitizer.group(1).strip()
+            # every distinct report (UBSan keeps running after a report and
+            # prints each source location once)
+            reports = list(dict.fromkeys(
+                m.group(1).strip() for m in SANITIZER_RE.finditer(log_text)))
+            listing = "\n".join(reports[:20])
+            if len(reports) > 20:
+                listing += f"\n... {len(reports) - 20} more"
+            result.report = (f"sanitizer reports ({len(reports)}):\n{listing}"
+                             + (f"\n\n{result.report}" if result.report else ""))
         if crash_message:
             result.message = f"{crash_message}: {result.message}"
         # Boost.Test's execution monitor turns SIGSEGV/SIGABRT/... into a
@@ -319,7 +348,7 @@ def reproduce_command(res: Result, build_dir: Path) -> str:
 
 
 def write_junit(path: Path, results: List[Result], known_as: str,
-                run_name: str) -> None:
+                run_name: str, variant: str) -> None:
     suites: Dict[str, List[Result]] = {}
     for res in results:
         suites.setdefault(res.executable, []).append(res)
@@ -327,13 +356,14 @@ def write_junit(path: Path, results: List[Result], known_as: str,
     totals = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
     total_time = 0.0
     for exe, items in sorted(suites.items()):
-        suite = ET.SubElement(root, "testsuite", name=f"property.{exe}")
+        suite_name = f"property.{variant}.{exe}" if variant else f"property.{exe}"
+        suite = ET.SubElement(root, "testsuite", name=suite_name)
         counts = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
         suite_time = 0.0
         for res in items:
             counts["tests"] += 1
             suite_time += res.duration
-            case = ET.SubElement(suite, "testcase", classname=f"property.{exe}",
+            case = ET.SubElement(suite, "testcase", classname=suite_name,
                                  name=res.name, time=f"{res.duration:.3f}")
             if res.status == "passed":
                 continue
@@ -399,11 +429,13 @@ def write_markdown(path: Path, summary: Dict, results: List[Result],
     t = summary["totals"]
     info = summary["run"]
     lines = [
-        f"# Property test run {info['run_id']}",
+        f"# Property test run {info['run_id']} ({info['variant']})",
         "",
         f"- revision: `{info.get('git_revision', '?')}` "
         f"({info.get('git_branch', '?')}{', dirty' if info.get('git_dirty') else ''})",
-        f"- preset / build dir: `{info['build_preset']}` / `{info['build_dir']}`",
+        f"- variant: `{info['variant']}` (preset `{info['build_preset']}`"
+        f"{', sanitize=' + info['sanitizers'] if info['sanitizers'] else ''})",
+        f"- build dir: `{info['build_dir']}`",
         f"- host: {info['host']}, duration: {info['duration_s']:.1f}s, "
         f"test cases scale: {info['knobs'].get('PBT_CASES_SCALE', '1')}",
         "",
@@ -462,6 +494,15 @@ def write_markdown(path: Path, summary: Dict, results: List[Result],
     return text
 
 
+def variant_name(preset: str, sanitizers: str) -> str:
+    """Same naming as pbt_variant() in pbt_env.sh."""
+    suffix = {"undefined": "ubsan", "address": "asan", "thread": "tsan"}
+    variant = preset
+    for san in filter(None, sanitizers.split(",")):
+        variant += "-" + suffix.get(san, san)
+    return variant
+
+
 def git_info() -> Dict:
     def git(*a):
         try:
@@ -485,9 +526,15 @@ def main() -> int:
                         help="workspace directory (default: %(default)s)")
     parser.add_argument("--build-dir",
                         help="build directory (default: <workdir>/percona-binlog-"
-                             "server-build-<preset>-pbt)")
+                             "server-build-<variant>-pbt)")
     parser.add_argument("--preset", default=preset_default,
                         help="CMake preset the build used (default: %(default)s)")
+    parser.add_argument("--sanitize", default=os.environ.get("PBT_SANITIZE", ""),
+                        help="extra sanitizers the build used, as given to "
+                             "build_property_tests.sh (selects the build dir)")
+    parser.add_argument("--variant",
+                        help="label for reports / junit suite names (default: "
+                             "from pbt_build_info.json, else preset+sanitizers)")
     parser.add_argument("--filter", action="append", default=[],
                         help="regex on '<executable>::<property>' (repeatable)")
     parser.add_argument("--exclude", action="append", default=[],
@@ -521,9 +568,19 @@ def main() -> int:
     args = parser.parse_args()
 
     workdir = Path(args.workdir).resolve()
+    default_variant = variant_name(args.preset, args.sanitize)
     build_dir = Path(args.build_dir or
-                     workdir / f"percona-binlog-server-build-{args.preset}-pbt"
+                     workdir / f"percona-binlog-server-build-{default_variant}-pbt"
                      ).resolve()
+    build_info: Dict = {}
+    try:
+        build_info = json.loads(
+            (build_dir / "pbt_build_info.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        pass
+    variant = args.variant or build_info.get("variant") or default_variant
+    preset = build_info.get("preset") or args.preset
+    sanitizers = build_info.get("sanitizers", args.sanitize) or ""
     if not (build_dir / "CTestTestfile.cmake").exists():
         print(f"error: {build_dir} is not a configured build directory "
               f"(run extra/qa/build_property_tests.sh)", file=sys.stderr)
@@ -553,6 +610,10 @@ def main() -> int:
 
     run_id = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     out_dir = Path(args.output_dir or workdir / "testruns" / run_id).resolve()
+    if not args.output_dir and out_dir.exists():
+        # another variant started in the same second
+        run_id = f"{run_id}-{variant}"
+        out_dir = out_dir.parent / run_id
     out_dir.mkdir(parents=True, exist_ok=False)
     log_dir = out_dir / "logs"
 
@@ -572,6 +633,12 @@ def main() -> int:
                 "PBT_REPORT_MULTIPLE", "PBT_REPRODUCE", "PBT_DERANDOMIZE"]:
         env.pop(key, None)
     env.update(knobs)
+    # sanitizer defaults (kept if already set by the caller)
+    # UBSan builds are recoverable: keep running and report every distinct
+    # location (the runner turns any report into a failure)
+    env.setdefault("UBSAN_OPTIONS", "print_stacktrace=1:halt_on_error=0")
+    env.setdefault("ASAN_OPTIONS", "detect_leaks=1:abort_on_error=0")
+    env.setdefault("TSAN_OPTIONS", "halt_on_error=1:second_deadlock_stack=1")
 
     print(f"running {len(planned)} properties from {len(executables)} "
           f"executable(s), {args.jobs} in parallel -> {out_dir}", flush=True)
@@ -601,7 +668,9 @@ def main() -> int:
         "started": datetime.datetime.now().isoformat(timespec="seconds"),
         "duration_s": time.monotonic() - started,
         "host": platform.node(),
-        "build_preset": args.preset,
+        "variant": variant,
+        "build_preset": preset,
+        "sanitizers": sanitizers,
         "build_dir": str(build_dir),
         "known_bugs_file": args.known_bugs,
         "knobs": knobs,
@@ -612,17 +681,19 @@ def main() -> int:
     summary = build_summary(results, possibly_fixed, run_info)
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     write_junit(out_dir / "junit.xml", results, args.known_as,
-                f"pbs-property-tests-{run_id}")
+                f"pbs-property-tests-{variant}-{run_id}", variant)
     text = write_markdown(out_dir / "summary.md", summary, results,
                           possibly_fixed, build_dir)
 
-    latest = out_dir.parent / "latest"
-    try:
-        if latest.is_symlink() or latest.exists():
-            latest.unlink()
-        latest.symlink_to(out_dir.name)
-    except OSError:
-        pass
+    if not args.output_dir:
+        for link_name in ["latest", f"latest-{variant}"]:
+            latest = out_dir.parent / link_name
+            try:
+                if latest.is_symlink() or latest.exists():
+                    latest.unlink()
+                latest.symlink_to(out_dir.name)
+            except OSError:
+                pass
 
     t = summary["totals"]
     print()
