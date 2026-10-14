@@ -46,7 +46,10 @@ Every failure is classified using extra/qa/known_bugs.md:
     new        - matches no entry (new issue)
     regression - matches an entry whose status is 'fixed'
 An open known_bugs.md entry whose test passed is reported as
-"possibly fixed".
+"possibly fixed". Every known issue carries the severity of its
+known_bugs.md row (high / medium / low); new issues are "untriaged".
+Reports list issues ordered by severity and count known issues per
+severity.
 
 Exit code (--fail-on): 'new' (default) -> 1 if there are new issues,
 regressions or infrastructure errors; 'any' -> 1 on any failure;
@@ -90,6 +93,7 @@ class KnownBug:
     status: str        # open | fixed | wontfix
     description: str
     variant: str = ""  # optional fnmatch pattern on the build variant
+    severity: str = "unknown"  # high | medium | low
 
     def applies_to(self, variant: str) -> bool:
         return not self.variant or fnmatch.fnmatchcase(variant, self.variant)
@@ -107,6 +111,26 @@ def _strip_md(cell: str) -> str:
     if len(cell) >= 2 and cell[0] == "`" and cell[-1] == "`":
         cell = cell[1:-1]
     return cell.replace("\\|", "|").strip()
+
+
+SEVERITIES = ("high", "medium", "low")
+# report order: most severe first, then unrated / not yet triaged
+SEVERITY_ORDER = {name: index for index, name in
+                  enumerate(SEVERITIES + ("unknown", "untriaged"))}
+
+
+def normalize_severity(value: str) -> str:
+    value = (value or "").strip().lower()
+    if value in SEVERITIES:
+        return value
+    if value:
+        print(f"warning: unknown severity '{value}' in known bugs file",
+              file=sys.stderr)
+    return "unknown"
+
+
+def severity_key(severity: str) -> int:
+    return SEVERITY_ORDER.get(severity, len(SEVERITY_ORDER))
 
 
 def load_known_bugs(path: Path) -> List[KnownBug]:
@@ -138,6 +162,7 @@ def load_known_bugs(path: Path) -> List[KnownBug]:
             status=(row.get("status") or "open").lower(),
             description=row.get("description", ""),
             variant=row.get("variant", ""),
+            severity=normalize_severity(row.get("severity", "")),
         ))
     return bugs
 
@@ -199,6 +224,7 @@ class Result:
                                 # | timeout | infra
     classification: str = ""    # new | known | regression (failures only)
     issue: str = ""
+    severity: str = ""          # from known_bugs.md; "untriaged" for new
     message: str = ""
     report: str = ""            # Hegel minimal counterexample block
     blob: str = ""
@@ -366,11 +392,13 @@ def classify(results: List[Result], bugs: List[KnownBug], variant: str):
         text = "\n".join([res.message, res.report])
         matched = next((b for b in bugs if b.matches(res.test_id, text)), None)
         if matched is None:
-            res.classification = "new"
+            res.classification, res.severity = "new", "untriaged"
         elif matched.status == "fixed":
             res.classification, res.issue = "regression", matched.issue
+            res.severity = matched.severity
         else:
             res.classification, res.issue = "known", matched.issue
+            res.severity = matched.severity
     by_id = {r.test_id: r for r in results}
     for bug in bugs:
         if bug.status != "open":
@@ -413,13 +441,15 @@ def write_junit(path: Path, results: List[Result], known_as: str,
             if res.status == "passed":
                 continue
             body = "\n\n".join(x for x in [
-                res.message, res.report,
+                res.message,
+                (f"severity: {res.severity}" if res.severity else ""),
+                res.report,
                 f"reproduce: {res.command}" +
                 (f"\nblob: {res.blob}" if res.blob else ""),
                 f"log: {res.log}"] if x)
-            label = {"known": f"[KNOWN {res.issue}] ",
-                     "regression": f"[REGRESSION {res.issue}] ",
-                     "new": "[NEW] "}.get(res.classification, "")
+            label = {"known": f"[KNOWN {res.issue} {res.severity}] ",
+                     "regression": f"[REGRESSION {res.issue} {res.severity}] ",
+                     "new": "[NEW untriaged] "}.get(res.classification, "")
             if res.status == "error":
                 counts["errors"] += 1
                 el = ET.SubElement(case, "error", type=res.kind,
@@ -462,6 +492,11 @@ def build_summary(results, possibly_fixed, run_info) -> Dict:
             "known_issues": count(lambda r: r.classification == "known"),
             "regressions": count(lambda r: r.classification == "regression"),
             "possibly_fixed": len(possibly_fixed),
+            # failing properties per severity (known issues and regressions)
+            "known_by_severity": {
+                name: count(lambda r, n=name: r.classification in
+                            ("known", "regression") and r.severity == n)
+                for name in SEVERITIES + ("unknown",)},
         },
         "results": [{**dataclasses.asdict(r), "test_id": r.test_id}
                     for r in results],
@@ -490,6 +525,11 @@ def write_markdown(path: Path, summary: Dict, results: List[Result],
         f"{t['new_issues']} | {t['known_issues']} | {t['regressions']} | "
         f"{t['possibly_fixed']} |",
         "",
+        "Known issues by severity: " + ", ".join(
+            f"{name} {t['known_by_severity'][name]}"
+            for name in SEVERITIES + ("unknown",)
+            if name != "unknown" or t['known_by_severity'][name]),
+        "",
     ]
 
     def section(title, items):
@@ -498,7 +538,8 @@ def write_markdown(path: Path, summary: Dict, results: List[Result],
         lines.extend([f"## {title}", ""])
         for res in items:
             issue = f" ({res.issue})" if res.issue else ""
-            lines.append(f"### `{res.test_id}`{issue} - {res.kind}")
+            severity = f", severity {res.severity}" if res.severity else ""
+            lines.append(f"### `{res.test_id}`{issue} - {res.kind}{severity}")
             lines.append("")
             lines.append("```")
             lines.append(res.message)
@@ -513,26 +554,34 @@ def write_markdown(path: Path, summary: Dict, results: List[Result],
 
     section("New issues", [r for r in results if r.classification == "new"])
     section("Regressions (known bug marked fixed fails again)",
-            [r for r in results if r.classification == "regression"])
-    known = [r for r in results if r.classification == "known"]
+            sorted((r for r in results if r.classification == "regression"),
+                   key=lambda r: severity_key(r.severity)))
+    known = sorted((r for r in results if r.classification == "known"),
+                   key=lambda r: (severity_key(r.severity), r.issue))
     if known:
-        lines.extend(["## Known issues", "", "| test | issue | message |",
-                      "|---|---|---|"])
+        lines.extend(["## Known issues", "",
+                      "| severity | issue | test | message |",
+                      "|---|---|---|---|"])
         for res in known:
             msg = res.message.replace("|", "\\|").splitlines()[0][:160]
-            lines.append(f"| `{res.test_id}` | {res.issue} | {msg} |")
+            lines.append(f"| {res.severity} | {res.issue} | `{res.test_id}` "
+                         f"| {msg} |")
         lines.append("")
     if possibly_fixed:
         lines.extend(["## Possibly fixed (open known bug, test passed)", "",
-                      "| test | issue | description |", "|---|---|---|"])
-        for bug in possibly_fixed:
-            lines.append(f"| `{bug.test}` | {bug.issue} | {bug.description} |")
+                      "| severity | issue | test | description |",
+                      "|---|---|---|---|"])
+        for bug in sorted(possibly_fixed,
+                          key=lambda b: severity_key(b.severity)):
+            lines.append(f"| {bug.severity} | {bug.issue} | `{bug.test}` "
+                         f"| {bug.description} |")
         lines.append("")
     lines.extend(["## All results", "", "| test | status | time [s] |",
                   "|---|---|---:|"])
     for res in results:
         status = res.status if res.status == "passed" else \
-            f"{res.status} ({res.classification or res.kind})"
+            f"{res.status} ({res.classification or res.kind}" + \
+            (f", {res.severity})" if res.severity else ")")
         lines.append(f"| `{res.test_id}` | {status} | {res.duration:.1f} |")
     text = "\n".join(lines) + "\n"
     path.write_text(text, encoding="utf-8")
