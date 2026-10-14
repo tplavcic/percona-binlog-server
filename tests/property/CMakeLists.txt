@@ -95,3 +95,14 @@ pbs_add_property_test(gtid_set_property_test
   SOURCES gtid_set_property_test.cpp
   LIBRARIES binsrv::lib_gtids binsrv::lib_util
 )
+
+pbs_add_property_test(byte_span_codec_property_test
+  SOURCES byte_span_codec_property_test.cpp
+  LIBRARIES binsrv::lib_util
+)
+
+pbs_add_property_test(cipher_context_property_test
+  SOURCES cipher_context_property_test.cpp
+  # OpenSSL::Crypto: the test uses OpenSSL's EVP API directly as its oracle
+  LIBRARIES binsrv::lib_opensslpp binsrv::lib_util OpenSSL::Crypto
+)
