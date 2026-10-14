@@ -106,3 +106,13 @@ pbs_add_property_test(cipher_context_property_test
   # OpenSSL::Crypto: the test uses OpenSSL's EVP API directly as its oracle
   LIBRARIES binsrv::lib_opensslpp binsrv::lib_util OpenSSL::Crypto
 )
+
+pbs_add_property_test(composite_binlog_name_property_test
+  SOURCES composite_binlog_name_property_test.cpp
+  LIBRARIES binsrv::lib_events binsrv::lib_util
+)
+
+pbs_add_property_test(event_property_test
+  SOURCES event_property_test.cpp
+  LIBRARIES binsrv::lib_events binsrv::lib_gtids binsrv::lib_util ZLIB::ZLIB
+)
