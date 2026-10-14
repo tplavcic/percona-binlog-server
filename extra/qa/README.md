@@ -85,11 +85,15 @@ for example `testruns/20261014-112341-asan_gcc14-ubsan/`.
 `WORKDIR/testruns/latest` points to the newest run.
 
 - `summary.md`: the counts of passing tests, failing tests, new issues,
-  known issues, regressions and "possibly fixed". For every new issue it
-  also has the minimal counterexample and the reproduce command.
+  known issues, regressions and "possibly fixed", plus the known issues per
+  severity (high / medium / low). Known issues are listed most severe
+  first. For every new issue it also has the minimal counterexample and the
+  reproduce command; new issues are `untriaged` until they get a
+  `known_bugs.md` row.
 - `summary.json`: the same information in machine-readable form.
 - `junit.xml`: for Jenkins (`junit 'testruns/latest/junit.xml'`). Known
-  issues are failures with a `[KNOWN <issue>]` prefix. Pass
+  issues are failures with a `[KNOWN <issue> <severity>]` prefix, new ones
+  `[NEW untriaged]`. Pass
   `--known-as skipped` to report them as skipped instead.
 - `run_info.json`: the git revision, preset and knobs.
 - `logs/<executable>/<property>.log`: the full output of each property.
@@ -108,7 +112,8 @@ When a run reports a new issue:
 
 1. Reproduce it with the command from `summary.md`.
 2. File it in Jira.
-3. Add a row to `known_bugs.md`.
+3. Add a row to `known_bugs.md`, with its severity (the scale is defined at
+   the top of that file).
 
 ## S3 endpoint (SeaweedFS)
 
