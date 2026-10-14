@@ -34,9 +34,12 @@ build_property_tests.sh. It prefixes the junit suite names
 (property.<variant>.<executable>) so runs of several variants can be told
 apart in Jenkins.
 
-Sanitizer reports (AddressSanitizer, LeakSanitizer, UBSan "runtime error:",
+Sanitizer reports (AddressSanitizer, UBSan "runtime error:",
 ThreadSanitizer) are reported as failures of kind 'sanitizer' with the
-sanitizer's first report line as the message.
+sanitizer's first report line as the message; a failed assert() (Debug /
+ASan builds) as kind 'assertion' with the assert location and expression.
+LeakSanitizer reports count only when nothing else failed (an abort leaves
+objects behind).
 
 Every failure is classified using extra/qa/known_bugs.md:
     known      - matches an open entry of known_bugs.md (old issue)
@@ -86,6 +89,10 @@ class KnownBug:
     issue: str
     status: str        # open | fixed | wontfix
     description: str
+    variant: str = ""  # optional fnmatch pattern on the build variant
+
+    def applies_to(self, variant: str) -> bool:
+        return not self.variant or fnmatch.fnmatchcase(variant, self.variant)
 
     def matches(self, test_id: str, failure_text: str) -> bool:
         if not fnmatch.fnmatchcase(test_id, self.test):
@@ -130,6 +137,7 @@ def load_known_bugs(path: Path) -> List[KnownBug]:
             issue=row.get("issue", ""),
             status=(row.get("status") or "open").lower(),
             description=row.get("description", ""),
+            variant=row.get("variant", ""),
         ))
     return bugs
 
@@ -187,7 +195,8 @@ class Result:
     executable: str
     name: str
     status: str = "passed"      # passed | failed | error
-    kind: str = ""              # violation | crash | timeout | infra
+    kind: str = ""              # violation | assertion | sanitizer | crash
+                                # | timeout | infra
     classification: str = ""    # new | known | regression (failures only)
     issue: str = ""
     message: str = ""
@@ -208,9 +217,16 @@ FAILURE_BLOCK_RE = re.compile(r"^--- Failure.*?(?=^rerun with:|\Z)",
 BLOB_RE = re.compile(r'rerun with:.*?\{"([A-Za-z0-9+/=]+)"\}')
 VIOLATION_RE = re.compile(r"PROPERTY VIOLATED: .*")
 BOOST_ERROR_RE = re.compile(r'(?:fatal error|error): in "[^"]*": (.*)')
+# sanitizer reports that are a root cause on their own
 SANITIZER_RE = re.compile(
-    r"^(?:==\d+==)?\s*((?:ERROR|WARNING): (?:Address|Leak|Thread|Memory)"
+    r"^(?:==\d+==)?\s*((?:ERROR|WARNING): (?:Address|Thread|Memory)"
     r"Sanitizer.*|.*?: runtime error: .*)$", re.M)
+# leaks are only a root cause when nothing else failed: an abort (failed
+# assert) or a Boost.Test signal catch leaves objects behind
+LEAK_RE = re.compile(r"^(?:==\d+==)?\s*(ERROR: LeakSanitizer.*)$", re.M)
+# glibc assert(): "<prog>: <file>:<line>: <function>: Assertion `<expr>' failed."
+ASSERT_RE = re.compile(
+    r"^[^\n]*?: ([^\s:]+:\d+): [^\n]*?(Assertion `.*' failed\.)$", re.M)
 
 
 def extract_failure(log_text: str, result: Result) -> None:
@@ -281,11 +297,20 @@ def run_property(exe: Executable, name: str, args, env: Dict[str, str],
         result.status, result.kind = "error", "infra"
     else:
         result.status, result.kind = "failed", "violation"
+    # root cause, in priority order: sanitizer error, failed assert(),
+    # property violation / crash, and a leak report only when nothing else
+    # failed
     sanitizer = SANITIZER_RE.search(log_text)
-    if sanitizer and result.kind != "timeout":
-        # sanitizers report and then exit/abort; their report is the root
-        # cause even when the property itself would have passed
-        result.status, result.kind = "failed", "sanitizer"
+    assertion = ASSERT_RE.search(log_text)
+    leak = LEAK_RE.search(log_text)
+    if result.kind != "timeout":
+        if sanitizer:
+            result.status, result.kind = "failed", "sanitizer"
+        elif assertion:
+            result.status, result.kind = "failed", "assertion"
+        elif leak and result.status == "passed":
+            result.status, result.kind = "failed", "sanitizer"
+            sanitizer = leak
     if result.status != "passed":
         crash_message = result.message if result.kind == "crash" else ""
         extract_failure(log_text, result)
@@ -295,11 +320,16 @@ def run_property(exe: Executable, name: str, args, env: Dict[str, str],
             # prints each source location once)
             reports = list(dict.fromkeys(
                 m.group(1).strip() for m in SANITIZER_RE.finditer(log_text)))
+            if not reports:
+                reports = [sanitizer.group(1).strip()]
             listing = "\n".join(reports[:20])
             if len(reports) > 20:
                 listing += f"\n... {len(reports) - 20} more"
             result.report = (f"sanitizer reports ({len(reports)}):\n{listing}"
                              + (f"\n\n{result.report}" if result.report else ""))
+        elif assertion:
+            result.message = (f"ASSERTION: {assertion.group(1)}: "
+                              f"{assertion.group(2)}")
         if crash_message:
             result.message = f"{crash_message}: {result.message}"
         # Boost.Test's execution monitor turns SIGSEGV/SIGABRT/... into a
@@ -309,12 +339,18 @@ def run_property(exe: Executable, name: str, args, env: Dict[str, str],
                 r"(?:SIG|signal)", result.message + "\n" + log_text):
             if "PROPERTY VIOLATED" not in result.message:
                 result.kind = "crash"
+        if leak and result.kind != "sanitizer":
+            result.report += ("\n\n(LeakSanitizer also reported leaks, "
+                              "expected after an abort; see the log)")
     return result
 
 
-def classify(results: List[Result], bugs: List[KnownBug]):
+def classify(results: List[Result], bugs: List[KnownBug], variant: str):
     """Classifies failures; returns open known bugs whose test passed."""
     possibly_fixed = []
+    # rows restricted to other variants (e.g. UBSan-only findings) neither
+    # match failures nor count as "possibly fixed" in this run
+    bugs = [b for b in bugs if b.applies_to(variant)]
     for res in results:
         if res.status != "failed":
             continue  # infrastructure errors are not product issues
@@ -666,7 +702,7 @@ def main() -> int:
                               "(run extra/qa/build_property_tests.sh)"))
 
     bugs = load_known_bugs(Path(args.known_bugs))
-    possibly_fixed = classify(results, bugs)
+    possibly_fixed = classify(results, bugs, variant)
 
     run_info = {
         "run_id": run_id,
