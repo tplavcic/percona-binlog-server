@@ -181,17 +181,30 @@ These complement the existing MTR suite rather than replacing it.
 4. Layer C, which reuses B1's generators.
 5. Layer D, once a MySQL is available on the QA host.
 
-## 5. First results (gtid_set suite, prototype run)
+## 5. Results
+
+Findings so far, by severity (scale defined in `known_bugs.md`; the table
+there is authoritative):
+
+| Severity | Issues |
+|---|---|
+| high | PBT-015, PBT-017 |
+| medium | PBT-001, PBT-002, PBT-004, PBT-012, PBT-013, PBT-016, PBT-019 |
+| low | PBT-003, PBT-005, PBT-006, PBT-007, PBT-008, PBT-009, PBT-010, PBT-011, PBT-014, PBT-018 |
+
+### GTID sets (prototype run)
 
 The suite has 32 properties, and 13 of them fail. They correspond to 8
 distinct defects, all listed in `known_bugs.md` as `PBT-001`…`PBT-008`:
-- the text parser accepts trailing garbage and silently drops later UUID
-  sets
-- gno overflow and out-of-range values are accepted
-- `add_interval`/`subtract_interval` do not validate the upper bound
-- tags are case-sensitive, whereas MySQL lower-cases them
-- binary decoding creates empty entries, accepts intervals MySQL rejects,
-  accepts the nil UUID, and throws `bad_alloc` for over-long tags
+- [medium] PBT-001: the text parser accepts trailing garbage and silently
+  drops later UUID sets
+- [medium] PBT-002: gno overflow and out-of-range values are accepted
+- [low] PBT-003: `add_interval`/`subtract_interval` do not validate the
+  upper bound
+- [medium] PBT-004: tags are case-sensitive, whereas MySQL lower-cases them
+- [low] PBT-005…008: binary decoding creates empty entries, accepts
+  intervals MySQL rejects, accepts the nil UUID, and throws `bad_alloc` for
+  over-long tags
 
 ### Byte-span codecs and cipher context (sandbox run)
 
@@ -201,14 +214,16 @@ variable-length integers for every integer width, plus raw byte copies.
 OpenSSL's EVP API, round trips, CTR random access through
 `create_with_offset()`, GCM tampering, and validation. The two suites have
 6 new findings, `PBT-009`…`PBT-014`:
-- the checked fixed-int functions don't validate the width
-- the byte-span copy functions pass a null pointer to `memcpy` for empty
-  spans (found by UBSan)
-- the CTR offset context doesn't carry into the upper 64 bits of the IV
-- the CTR offset context rejects mixed-case cipher names that storage
-  configuration accepts
-- "supported" legacy ciphers can't be initialised in OpenSSL 3
-- `create_with_offset(0)` accepts non-CTR ciphers
+- [low] PBT-009: the checked fixed-int functions don't validate the width
+- [low] PBT-010: the byte-span copy functions pass a null pointer to
+  `memcpy` for empty spans (found by UBSan)
+- [low] PBT-011: the CTR offset context doesn't carry into the upper 64
+  bits of the IV
+- [medium] PBT-012: the CTR offset context rejects mixed-case cipher names
+  that storage configuration accepts
+- [medium] PBT-013: "supported" legacy ciphers can't be initialised in
+  OpenSSL 3
+- [low] PBT-014: `create_with_offset(0)` accepts non-CTR ciphers
 
 The packed and variable-length integer codecs matched the MySQL reference
 everywhere.
@@ -226,11 +241,14 @@ has 12. The event properties cover:
 - forward compatibility of tagged GTID events
 
 The two suites have 5 new findings, `PBT-015`…`PBT-019`:
-- 7-digit binlog names are rejected
-- base names with line breaks or NUL are accepted
-- an unparseable FORMAT_DESCRIPTION server version terminates the process
-- `create_event<format_description>(include_checksum=false)` fails
-- unknown trailing fields in tagged GTID events are rejected
+- [high] PBT-015: 7-digit binlog names are rejected
+- [medium] PBT-016: base names with line breaks or NUL are accepted
+- [high] PBT-017: an unparseable FORMAT_DESCRIPTION server version
+  terminates the process
+- [low] PBT-018: `create_event<format_description>(include_checksum=false)`
+  fails
+- [medium] PBT-019: unknown trailing fields in tagged GTID events are
+  rejected
 
 From the adversarial review, waiting for later layers:
 - `indexed_event_block` loops forever on `event_size < 19` (B4, needs T1)
