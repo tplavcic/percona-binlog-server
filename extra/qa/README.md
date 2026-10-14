@@ -15,12 +15,41 @@ cd ~/ws/percona-binlog-server
 export BUILD_PRESET=release_gcc14       # default; any preset from CMakePresets.json
 
 extra/qa/setup_pbt_env.sh               # libhegel + hegel-cpp + SeaweedFS -> ~/ws
-extra/qa/build_property_tests.sh        # -> ~/ws/percona-binlog-server-build-release_gcc14-pbt
+extra/qa/build_property_tests.sh        # -> ~/ws/percona-binlog-server-build-release_gcc14-pbt (see "Build variants")
 extra/qa/run_property_tests.py          # -> ~/ws/testruns/<timestamp>/
 ```
 
 Boost and the AWS SDK must already be installed in `WORKDIR` for the chosen
 preset, as described in the top-level `README.md`.
+
+## Build variants
+
+A build variant is a CMake preset, optionally with extra sanitizers. Each
+variant gets its own build directory,
+`~/ws/percona-binlog-server-build-<variant>-pbt`, so several can coexist.
+
+| Variant | Build | Run | Use |
+|---|---|---|---|
+| `asan_gcc14` | `build_property_tests.sh --preset asan_gcc14` | `run_property_tests.py --preset asan_gcc14` | main variant: Debug + AddressSanitizer, `assert`s active |
+| `release_gcc14` | `build_property_tests.sh --preset release_gcc14` | `run_property_tests.py --preset release_gcc14` | what ships: optimised, `assert`s compiled out |
+| `asan_gcc14-ubsan` | `build_property_tests.sh --preset asan_gcc14 --sanitize undefined` | `run_property_tests.py --preset asan_gcc14 --sanitize undefined` | adds UndefinedBehaviorSanitizer |
+
+- `--sanitize` takes a comma-separated `-fsanitize=` list. Each entry adds a
+  suffix to the variant name: `undefined` → `-ubsan`, `address` → `-asan`,
+  `thread` → `-tsan`.
+- UBSan builds keep running after a report. Each distinct source location
+  is reported once.
+- ThreadSanitizer is not useful yet (todo.md T6).
+- The build script writes `pbt_build_info.json` into the build directory.
+  The runner reads it, so reports carry the variant name:
+  - `summary.md` has the variant in its header;
+  - `junit.xml` suites are named `property.<variant>.<executable>`;
+  - `testruns/latest-<variant>` points to the newest run of that variant
+    (`testruns/latest` points to the newest run of any variant).
+- Sanitizer reports (AddressSanitizer, LeakSanitizer, UBSan
+  `runtime error:`, ThreadSanitizer) always fail the property, with kind
+  `sanitizer` and the first report line as the message.
+  `known_bugs.md` can match them like any other failure.
 
 ## Running tests
 
@@ -31,7 +60,7 @@ preset, as described in the top-level `README.md`.
 | nightly run (10x cases) | `extra/qa/run_property_tests.py --cases-scale 10` |
 | a subset | `extra/qa/run_property_tests.py --filter 'gtid_set.*Decode'` |
 | list properties | `extra/qa/run_property_tests.py --list` |
-| one executable | `~/ws/percona-binlog-server-build-<preset>-pbt/tests/property/gtid_set_property_test` |
+| one executable | `~/ws/percona-binlog-server-build-<variant>-pbt/tests/property/gtid_set_property_test` |
 | one property | `.../gtid_set_property_test --run_test=TextRoundTrip` |
 | replay a failure | `PBT_REPRODUCE='<blob>' .../gtid_set_property_test --run_test=<name>` (the command is in `summary.md`) |
 | via ctest | `ctest --test-dir <build dir> -L property` |
