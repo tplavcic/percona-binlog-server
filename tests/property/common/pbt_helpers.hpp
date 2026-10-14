@@ -46,6 +46,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <concepts>
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
@@ -56,6 +57,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <typeinfo>
 #include <utility>
 #include <vector>
@@ -130,16 +132,23 @@ void require_equal(
 // Expects 'func' to throw exactly 'Expected' (or a type derived from it).
 // Returning normally or throwing any other exception type is a violation.
 template <typename Expected, typename Func>
+  requires std::derived_from<Expected, std::exception>
 void require_throws(
     Func &&func, std::string_view message,
     const std::source_location &location = std::source_location::current()) {
   try {
     std::forward<Func>(func)();
-  } catch (const Expected &) {
-    return;
   } catch (const property_violation &) {
+    // a nested property failure is never the expected exception
     throw;
   } catch (const std::exception &e) {
+    if constexpr (std::is_same_v<Expected, std::exception>) {
+      return;
+    } else {
+      if (dynamic_cast<const Expected *>(&e) != nullptr) {
+        return;
+      }
+    }
     fail(std::string{message} + "\n    expected exception: " +
              boost::core::demangle(typeid(Expected).name()) +
              "\n    actual exception:   " +
