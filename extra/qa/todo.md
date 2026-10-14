@@ -63,3 +63,34 @@ for it. When a change lands, move the tests into `PBT_PLAN.md` as
 - **Why:** model checks would run in-process, about 100x faster than
   spawning the binary for each generated case. That allows far more cases
   per run.
+
+## T5 - g++-14 -Wconversion false positive under UBSan (build fix)
+
+- **Tests that need it:** none are blocked. `build_property_tests.sh --sanitize undefined`
+  works around it with `-Wno-error=conversion`, which downgrades every
+  `-Wconversion` error to a warning in UBSan builds.
+- **Change:** in `src/binsrv/gtids/gtid_set.cpp`, in
+  `gtid_set_parser::parse_hexadecimal_pair()`, write
+  `result = static_cast<std::uint8_t>(result << 4U);` instead of
+  `result <<= 4U;` (or an equivalent that compiles cleanly).
+- **Why:** with `-fsanitize=undefined`, g++-14 reports "conversion from 'int'
+  to 'uint8_t' may change value" on that line, and the project's `-Werror`
+  breaks the build. Without the workaround, a UBSan build of the whole
+  project fails.
+
+## T6 - ThreadSanitizer preset
+
+- **Tests that need it:** the future multi-threaded properties: storage
+  readers and writers sharing `storage_core` (shared mutex), the
+  `pull` / `sender_context` tests, and layer D.
+- **Change:**
+  - add `tsan_gcc14` and `tsan_clang20` presets to `CMakePresets.json`, with
+    `-fsanitize=thread` (and a `WITH_TSAN` option in `CMakeLists.txt`, like
+    `WITH_ASAN`);
+  - build Boost and the AWS SDK with the same presets
+    (`boost-install-tsan_gcc14`, `aws-sdk-cpp-install-tsan_gcc14`).
+- **Why:** TSan needs every library in the process instrumented, otherwise
+  it reports false races in uninstrumented code. The current properties are
+  single-threaded, so TSan would find nothing yet.
+  `build_property_tests.sh --sanitize thread` can be used for an
+  experiment, but expect noise from the uninstrumented libraries.
