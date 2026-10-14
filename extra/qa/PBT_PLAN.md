@@ -94,6 +94,22 @@ Proposed Jenkins wiring (later):
 followed by `junit 'testruns/latest/junit.xml'` and archiving
 `testruns/latest/**`.
 
+### Build variants
+
+Property tests generate hostile inputs, so they are most valuable under
+sanitizers. Plain `debug` adds nothing that `asan` does not already cover,
+because the asan preset is a Debug build.
+
+| Variant | When | Why |
+|---|---|---|
+| `asan_gcc14` | every commit | memory errors that do not crash; `assert`s active |
+| `release_gcc14` | nightly (`--cases-scale 10`) | shipped configuration; `assert`s off; optimiser-dependent UB |
+| `asan_gcc14-ubsan` | nightly | integer overflow, invalid shifts, `isalpha` on negative `char`, ... |
+| `tsan` | later (todo.md T6) | needed once multi-threaded properties exist |
+
+Each variant has its own build directory. Reports and junit suite names
+carry the variant name (`property.<variant>.<executable>`).
+
 ## 4. Test areas (ranked by risk x feasibility)
 
 Legend:
