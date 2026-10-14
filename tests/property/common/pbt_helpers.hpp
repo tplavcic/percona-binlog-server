@@ -29,7 +29,9 @@
 //   PBT_TEST_CASES      - override the number of generated cases for every
 //                         property (default: the per-property value)
 //   PBT_CASES_SCALE     - multiply the per-property default by this factor
-//                         (e.g. 0.1 for a smoke run, 10 for a nightly run)
+//                         (e.g. 0.1 for a smoke run, 10 for a nightly run);
+//                         also scales the input size of non-generated probe
+//                         tests (see pbt::scaled())
 //   PBT_SEED            - fixed seed (makes the run reproducible)
 //   PBT_DERANDOMIZE     - "1" to use Hegel's deterministic mode
 //   PBT_DATABASE        - directory of Hegel's example database (failing
@@ -42,6 +44,7 @@
 //                         ("rerun with: ... {"<blob>"}"); replays exactly that
 //                         counterexample. Use together with --run_test=<name>.
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -205,6 +208,17 @@ inline hegel::Settings make_settings(std::uint64_t default_test_cases) {
 }
 
 } // namespace detail
+
+// Scales a size used by a non-generated test (e.g. the scale probe) with
+// PBT_CASES_SCALE, so that smoke runs stay fast and nightly runs probe
+// larger inputs. Never returns less than 1.
+inline std::uint64_t scaled(std::uint64_t base) {
+  if (const auto scale{detail::env("PBT_CASES_SCALE")}; scale) {
+    return static_cast<std::uint64_t>(std::max(
+        1.0, std::round(static_cast<double>(base) * std::stod(*scale))));
+  }
+  return base;
+}
 
 struct check_options {
   // default number of generated test cases for this property

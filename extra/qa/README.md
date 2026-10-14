@@ -16,7 +16,7 @@ export BUILD_PRESET=release_gcc14       # default; any preset from CMakePresets.
 
 extra/qa/setup_pbt_env.sh               # libhegel + hegel-cpp + SeaweedFS -> ~/ws
 extra/qa/build_property_tests.sh        # -> ~/ws/percona-binlog-server-build-release_gcc14-pbt (see "Build variants")
-extra/qa/run_property_tests.py          # -> ~/ws/testruns/<timestamp>/
+extra/qa/run_property_tests.py          # -> ~/ws/testruns/<timestamp>-<variant>/
 ```
 
 Boost and the AWS SDK must already be installed in `WORKDIR` for the chosen
@@ -56,7 +56,7 @@ variant gets its own build directory,
 | What | Command |
 |---|---|
 | all properties + report | `extra/qa/run_property_tests.py` |
-| quick smoke run (10% of the cases) | `extra/qa/run_property_tests.py --cases-scale 0.1` |
+| quick smoke run (10% of the cases, 10% scale-probe size) | `extra/qa/run_property_tests.py --cases-scale 0.1` |
 | nightly run (10x cases) | `extra/qa/run_property_tests.py --cases-scale 10` |
 | a subset | `extra/qa/run_property_tests.py --filter 'gtid_set.*Decode'` |
 | list properties | `extra/qa/run_property_tests.py --list` |
@@ -70,7 +70,7 @@ These environment variables are read by every property executable:
 | Variable | Meaning |
 |---|---|
 | `PBT_TEST_CASES` | number of generated cases for every property |
-| `PBT_CASES_SCALE` | multiplies each property's default case count |
+| `PBT_CASES_SCALE` | multiplies each property's default case count and the scale-probe input size |
 | `PBT_SEED` | fixed seed |
 | `PBT_DERANDOMIZE` | `1` makes the run deterministic |
 | `PBT_DATABASE` | Hegel example database directory, or `off` |
@@ -80,7 +80,8 @@ These environment variables are read by every property executable:
 
 ## Report
 
-Each run writes these files to `WORKDIR/testruns/<YYYYmmdd-HHMMSS>/`.
+Each run writes these files to `WORKDIR/testruns/<YYYYmmdd-HHMMSS>-<variant>/`,
+for example `testruns/20261014-112341-asan_gcc14-ubsan/`.
 `WORKDIR/testruns/latest` points to the newest run.
 
 - `summary.md`: the counts of passing tests, failing tests, new issues,

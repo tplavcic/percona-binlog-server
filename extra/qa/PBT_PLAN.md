@@ -71,7 +71,7 @@ Design decisions:
 ```
 extra/qa/setup_pbt_env.sh            # once per WORKDIR (idempotent)
 extra/qa/build_property_tests.sh     # after every pull
-extra/qa/run_property_tests.py       # -> WORKDIR/testruns/<timestamp>/
+extra/qa/run_property_tests.py       # -> WORKDIR/testruns/<timestamp>-<variant>/
 ```
 
 The report directory contains:
