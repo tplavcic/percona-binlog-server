@@ -643,6 +643,7 @@ def main() -> int:
     print(f"running {len(planned)} properties from {len(executables)} "
           f"executable(s), {args.jobs} in parallel -> {out_dir}", flush=True)
     started = time.monotonic()
+    started_at = datetime.datetime.now().isoformat(timespec="seconds")
     results: List[Result] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
         futures = {pool.submit(run_property, exe, name, args, env, log_dir):
@@ -665,7 +666,8 @@ def main() -> int:
 
     run_info = {
         "run_id": run_id,
-        "started": datetime.datetime.now().isoformat(timespec="seconds"),
+        "started": started_at,
+        "finished": datetime.datetime.now().isoformat(timespec="seconds"),
         "duration_s": time.monotonic() - started,
         "host": platform.node(),
         "variant": variant,
