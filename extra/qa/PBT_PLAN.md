@@ -123,9 +123,9 @@ Legend:
 | # | Area | Key properties | Oracle | State |
 |---|---|---|---|---|
 | A1 | `binsrv::gtids` (uuid, tag, gtid, gtid_set) | text and binary roundtrip; byte-exact MySQL encoding; model agreement over add/subtract/clear sequences; union/difference laws; malformed text and binary rejected | reference model, `rpl_gtid_set.cc`, MySQL manual | ✅ |
-| A2 | `util` byte-span codecs: fixed, packed (`pack.cc`) and varlen ints | roundtrip for every width and signedness; `calculate_*_size` equals the bytes written; truncated input returns false without consuming; NULL marker 251 / 255 handling; narrowing extraction fails on overflow | MySQL encodings, re-implemented in the test | 🟢 |
+| A2 | `util` byte-span codecs: fixed, packed (`pack.cc`) and varlen ints | roundtrip for every width and signedness; `calculate_*_size` equals the bytes written; truncated input returns false without consuming; NULL marker 251 / 255 handling; narrowing extraction fails on overflow | MySQL encodings, re-implemented in the test | ✅ |
 | A3 | `events::composite_binlog_name` | `parse(str())` roundtrip; `next()` increments the sequence number, and 999999 throws; reject an empty base, `/` in the base, a non-6-digit suffix; base names with `\n` (they corrupt `binlog.index`) | README, `storage_core` index format | 🟢 |
-| A4 | `opensslpp::cipher_context` | `decrypt(encrypt(x)) == x` for every cipher/mode/padding; for CTR, `create_with_offset(k)` applied to a suffix equals the same suffix of a full encryption (this is how encrypted binlogs are read at random offsets) | OpenSSL as reference | 🟢 |
+| A4 | `opensslpp::cipher_context` | `decrypt(encrypt(x)) == x` for every cipher/mode/padding; for CTR, `create_with_offset(k)` applied to a suffix equals the same suffix of a full encryption (this is how encrypted binlogs are read at random offsets) | OpenSSL as reference | ✅ |
 | A5 | `events::event` / `event_view` / `rewriter` | `create_event` → view → encode is byte-identical; flipping any byte makes CRC verification fail; truncation is rejected; checksum add then remove is the identity; rewritten tagged GTID events still parse, and `transaction_length` stays consistent | MySQL event format | 🟢 |
 | A6 | `events::reader_context` | generated valid streams following the documented grammar (`ROTATE FDE PREV_GTIDS? (GTID ANY*)* (ROTATE\|STOP)?`) are accepted; each single grammar mutation (dropped or duplicated FDE, wrong `next_event_position`, wrong `transaction_length`, ANONYMOUS in GTID mode) throws | the grammar in `reader_context.hpp` | 🟢 (stateful) |
 | A7 | `util`: semantic_version, hex_value, ctime_timestamp(+range), flag_set, composite_name, crc32 | roundtrips; range is a monoid; crc32 matches zlib and `crc32_combine` | docs and zlib | 🟢 |
@@ -192,6 +192,26 @@ distinct defects, all listed in `known_bugs.md` as `PBT-001`…`PBT-008`:
 - tags are case-sensitive, whereas MySQL lower-cases them
 - binary decoding creates empty entries, accepts intervals MySQL rejects,
   accepts the nil UUID, and throws `bad_alloc` for over-long tags
+
+### Byte-span codecs and cipher context (sandbox run)
+
+`byte_span_codec_property_test` has 31 properties: fixed, packed and
+variable-length integers for every integer width, plus raw byte copies.
+`cipher_context_property_test` has 14 properties: equivalence with
+OpenSSL's EVP API, round trips, CTR random access through
+`create_with_offset()`, GCM tampering, and validation. The two suites have
+6 new findings, `PBT-009`…`PBT-014`:
+- the checked fixed-int functions don't validate the width
+- the byte-span copy functions pass a null pointer to `memcpy` for empty
+  spans (found by UBSan)
+- the CTR offset context doesn't carry into the upper 64 bits of the IV
+- the CTR offset context rejects mixed-case cipher names that storage
+  configuration accepts
+- "supported" legacy ciphers can't be initialised in OpenSSL 3
+- `create_with_offset(0)` accepts non-CTR ciphers
+
+The packed and variable-length integer codecs matched the MySQL reference
+everywhere.
 
 ## 6. Open questions
 
