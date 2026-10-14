@@ -224,6 +224,11 @@ SANITIZER_RE = re.compile(
 # leaks are only a root cause when nothing else failed: an abort (failed
 # assert) or a Boost.Test signal catch leaves objects behind
 LEAK_RE = re.compile(r"^(?:==\d+==)?\s*(ERROR: LeakSanitizer.*)$", re.M)
+# std::terminate() after an uncaught exception (e.g. thrown from a noexcept
+# function): "terminate called after throwing an instance of '<type>'"
+# followed by "  what():  <message>"
+TERMINATE_RE = re.compile(
+    r"terminate called after throwing an instance of '([^']*)'\n\s*what\(\):\s*(.*)")
 # glibc assert(): "<prog>: <file>:<line>: <function>: Assertion `<expr>' failed."
 ASSERT_RE = re.compile(
     r"^[^\n]*?: ([^\s:]+:\d+): [^\n]*?(Assertion `.*' failed\.)$", re.M)
@@ -330,6 +335,10 @@ def run_property(exe: Executable, name: str, args, env: Dict[str, str],
         elif assertion:
             result.message = (f"ASSERTION: {assertion.group(1)}: "
                               f"{assertion.group(2)}")
+        elif (terminate := TERMINATE_RE.search(log_text)) is not None:
+            result.kind = "crash"
+            result.message = (f"TERMINATE: uncaught {terminate.group(1)}: "
+                              f"{terminate.group(2).strip()}")
         if crash_message:
             result.message = f"{crash_message}: {result.message}"
         # Boost.Test's execution monitor turns SIGSEGV/SIGABRT/... into a
@@ -723,7 +732,7 @@ def main() -> int:
     summary = build_summary(results, possibly_fixed, run_info)
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     write_junit(out_dir / "junit.xml", results, args.known_as,
-                f"pbs-property-tests-{variant}-{run_id}", variant)
+                f"pbs-property-tests-{run_id}", variant)
     text = write_markdown(out_dir / "summary.md", summary, results,
                           possibly_fixed, build_dir)
 
