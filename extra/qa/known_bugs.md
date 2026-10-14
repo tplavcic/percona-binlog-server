@@ -22,24 +22,35 @@ Columns:
   that still have to be filed; replace them with the Jira key once filed.
 - **Status** - `open`, `fixed` or `wontfix`.
 - **Description** - one line; the minimal counterexample.
+- **Variant** - optional shell wildcard on the build variant (e.g.
+  `*ubsan*` for a finding only a UBSan build can see); empty means every
+  variant. Rows for other variants are ignored, so they are neither matched
+  nor reported as "possibly fixed".
 
 Workflow: when a run reports a new issue, reproduce it with the command
 printed in `summary.md`, file it in Jira and add a row here (in the same
 commit as any test change), so the next run counts it as known.
 
-| Test | Match | Issue | Status | Description |
-|---|---|---|---|---|
-| `gtid_set_property_test::ParseRejectsTrailingGarbage` | | PBT-001 | open | GTID-set text parser ignores everything after the last valid token: `U:1abc` -> `U:1`, `U:1 , V:2` -> `U:1` (second UUID set silently lost). `gtid_set_parser::parse()` never checks that the input was fully consumed. |
-| `gtid_set_property_test::ParseRejectsOutOfRangeGno` | | PBT-002 | open | gno not range-checked in text: `U:18446744073709551617` wraps to `U:1` (`parse_gno` has no overflow check, see TODO); `U:1-9223372036854775808` (> 2^63-1) accepted; `U:1-18446744073709551615` produces an entry without intervals (`str()` = `U`, not re-parseable). |
-| `gtid_set_property_test::AddIntervalRejectsOutOfRangeUpperBound` | | PBT-003 | open | `gtid_set::add_interval()` validates only the lower bound: upper > 2^63-1 accepted, upper = 2^64-1 overflows `upper + 1` into an empty interval and leaves an empty TSID entry. `add(uuid, tag, gno)` rejects the same value. |
-| `gtid_set_property_test::SubtractIntervalRejectsOutOfRangeUpperBound` | | PBT-003 | open | Same root cause as above for `subtract_interval()`: upper bound not validated, `upper = 2^64-1` turns the erase into a no-op. |
-| `gtid_set_property_test::TagsAreCaseInsensitiveLikeMySQL` | | PBT-004 | open | `U:ABC:1` and `U:abc:1` are different sets in PBS, MySQL lower-cases tags (`mysql::gtid::Tag::replace`). An upper-case tag in a `search_by_gtid_set` argument never matches stored GTIDs. |
-| `gtid_set_property_test::DecodeZeroIntervalTsidIsConsistent` | | PBT-005 | open | Binary decoding of a TSID with 0 intervals (MySQL accepts it) creates an empty map entry: `is_empty()` = false, `!= gtid_set{}`, `str()` = bare UUID which cannot be parsed back. `process_intervals()` uses `data_[uuid][tag]` before reading intervals. |
-| `gtid_set_property_test::DecodeRejectsZeroLowerBound` | | PBT-006 | open | Binary decoding accepts interval start 0 (`U:0-4`); MySQL rejects `start <= last` with `last = 0`. |
-| `gtid_set_property_test::DecodeRejectsBoundAboveMaxGno` | | PBT-006 | open | Binary decoding accepts interval bounds >= 2^63; MySQL reads them as signed and rejects them. |
-| `gtid_set_property_test::DecodeRejectsUnsortedIntervals` | | PBT-006 | open | Binary decoding accepts unsorted / overlapping intervals (see `TODO: validate that interval boundary values are increasing` in `gtid_set.cpp`); MySQL rejects them. |
-| `gtid_set_property_test::DecodeRejectsAdjacentIntervals` | | PBT-006 | open | Binary decoding accepts adjacent intervals `[a,b)[b,c)`; MySQL requires `start > previous end`. |
-| `gtid_set_property_test::DecodeNilUuidIsConsistent` | | PBT-007 | open | Binary decoding accepts the nil UUID; the resulting set prints `00000000-0000-0000-0000-000000000000:1`, which the text parser (and `gtid` constructor) rejects. |
-| `gtid_set_property_test::DecodeRejectsTooLongTag` | | PBT-008 | open | Encoded tag length > 32 throws `boost::container::bad_alloc` from `tag_storage::resize()` instead of `std::invalid_argument`. |
-| `gtid_set_property_test::DecodeArbitraryBytesIsRejectedOrConsistent` | `bad_alloc` | PBT-008 | open | Same as above, reached through random byte mutation. |
-| `gtid_set_property_test::DecodeArbitraryBytesIsRejectedOrConsistent` | `cannot be parsed back\|is_empty` | PBT-005 | open | Mutated encodings decoding into empty TSID entries / nil UUID (PBT-005, PBT-007). |
+| Test | Match | Issue | Status | Description | Variant |
+|---|---|---|---|---|---|
+| `gtid_set_property_test::ParseRejectsTrailingGarbage` | | PBT-001 | open | GTID-set text parser ignores everything after the last valid token: `U:1abc` -> `U:1`, `U:1 , V:2` -> `U:1` (second UUID set silently lost). `gtid_set_parser::parse()` never checks that the input was fully consumed. | |
+| `gtid_set_property_test::ParseRejectsOutOfRangeGno` | | PBT-002 | open | gno not range-checked in text: `U:18446744073709551617` wraps to `U:1` (`parse_gno` has no overflow check, see TODO); `U:1-9223372036854775808` (> 2^63-1) accepted; `U:1-18446744073709551615` produces an entry without intervals (`str()` = `U`, not re-parseable). | |
+| `gtid_set_property_test::AddIntervalRejectsOutOfRangeUpperBound` | | PBT-003 | open | `gtid_set::add_interval()` validates only the lower bound: upper > 2^63-1 accepted, upper = 2^64-1 overflows `upper + 1` into an empty interval and leaves an empty TSID entry. `add(uuid, tag, gno)` rejects the same value. | |
+| `gtid_set_property_test::SubtractIntervalRejectsOutOfRangeUpperBound` | | PBT-003 | open | Same root cause as above for `subtract_interval()`: upper bound not validated, `upper = 2^64-1` turns the erase into a no-op. | |
+| `gtid_set_property_test::TagsAreCaseInsensitiveLikeMySQL` | | PBT-004 | open | `U:ABC:1` and `U:abc:1` are different sets in PBS, MySQL lower-cases tags (`mysql::gtid::Tag::replace`). An upper-case tag in a `search_by_gtid_set` argument never matches stored GTIDs. | |
+| `gtid_set_property_test::DecodeZeroIntervalTsidIsConsistent` | | PBT-005 | open | Binary decoding of a TSID with 0 intervals (MySQL accepts it) creates an empty map entry: `is_empty()` = false, `!= gtid_set{}`, `str()` = bare UUID which cannot be parsed back. `process_intervals()` uses `data_[uuid][tag]` before reading intervals. | |
+| `gtid_set_property_test::DecodeRejectsZeroLowerBound` | | PBT-006 | open | Binary decoding accepts interval start 0 (`U:0-4`); MySQL rejects `start <= last` with `last = 0`. | |
+| `gtid_set_property_test::DecodeRejectsBoundAboveMaxGno` | | PBT-006 | open | Binary decoding accepts interval bounds >= 2^63; MySQL reads them as signed and rejects them. | |
+| `gtid_set_property_test::DecodeRejectsUnsortedIntervals` | | PBT-006 | open | Binary decoding accepts unsorted / overlapping intervals (see `TODO: validate that interval boundary values are increasing` in `gtid_set.cpp`); MySQL rejects them. | |
+| `gtid_set_property_test::DecodeRejectsAdjacentIntervals` | | PBT-006 | open | Binary decoding accepts adjacent intervals `[a,b)[b,c)`; MySQL requires `start > previous end`. | |
+| `gtid_set_property_test::DecodeNilUuidIsConsistent` | | PBT-007 | open | Binary decoding accepts the nil UUID; the resulting set prints `00000000-0000-0000-0000-000000000000:1`, which the text parser (and `gtid` constructor) rejects. | |
+| `gtid_set_property_test::DecodeRejectsTooLongTag` | | PBT-008 | open | Encoded tag length > 32 throws `boost::container::bad_alloc` from `tag_storage::resize()` instead of `std::invalid_argument`. | |
+| `gtid_set_property_test::DecodeArbitraryBytesIsRejectedOrConsistent` | `bad_alloc` | PBT-008 | open | Same as above, reached through random byte mutation. | |
+| `gtid_set_property_test::DecodeArbitraryBytesIsRejectedOrConsistent` | `cannot be parsed back\|is_empty` | PBT-005 | open | Mutated encodings decoding into empty TSID entries / nil UUID (PBT-005, PBT-007). | |
+| `byte_span_codec_property_test::FixedIntCheckedRejectsZeroWidth` | | PBT-009 | open | `insert/extract_fixed_int_*_checked<unsigned T>` do not validate the width (only an `assert` in the unchecked function): width 0 returns `true` (Debug: assertion `bytes_to_insert != 0U`). | |
+| `byte_span_codec_property_test::FixedIntCheckedRejectsOversizedWidth` | | PBT-009 | open | Same functions with width > `sizeof(T)` return `true` and copy past the integer / advance the span further than they copied (`uint8_t` width 2); Debug: assertion `bytes_to_insert <= sizeof(T)`. The signed variants reject this correctly. | |
+| `byte_span_codec_property_test::ByteSpanCopyRoundTrip` | `null pointer` | PBT-010 | open | UBSan: `insert/extract_byte_span_*` call `memcpy` with a null pointer for empty spans (`std::span` of an empty `std::vector`), undefined behaviour even with length 0. Only visible in UBSan builds. | `*ubsan*` |
+| `cipher_context_property_test::CtrOffsetHandlesCounterCarry` | | PBT-011 | open | `cipher_context::create_with_offset()` adds the block offset to the low 64 bits of the IV only; OpenSSL's CTR counter is the whole 128-bit IV, so when the low 64 bits wrap inside a file the offset context produces a different keystream than the full stream (encrypted binlog read/written at an offset decrypts to garbage). Needs an IV whose low 64 bits are within (file size / 16) of 2^64: astronomically unlikely with random IVs, but a correctness bug. | |
+| `cipher_context_property_test::CtrOffsetAcceptsSameCipherNamesAsConstructor` | | PBT-012 | open | `create_with_offset()` rejects mode spellings other than `CTR` / `ctr` (e.g. `AES-128-cTR`, `Aes-256-Ctr`) that OpenSSL, the constructor and `encryption_config` validation accept. With such a `storage.encryption.cipher` every event write (offset >= 4) throws "does not have the expected format". | |
+| `cipher_context_property_test::SupportedCipherNamesAreUsable` | | PBT-013 | open | `is_cipher_name_supported()` returns `true` for ciphers OpenSSL 3 only provides in the legacy provider (DES-CBC, BF-CBC, CAST5, SEED, RC2, ...), whose initialisation then fails ("digital envelope routines::unsupported"). The keyring validates KEK ciphers with it, so such a KEK is accepted and fails at the first encrypted binlog. | |
+| `cipher_context_property_test::OffsetRejectsNonCtrCiphers` | | PBT-014 | open | `create_with_offset(0, ...)` accepts any cipher (early return before the CTR check) while every non-zero offset rejects non-CTR ciphers, so acceptance depends on the offset. | |
