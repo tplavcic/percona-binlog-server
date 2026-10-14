@@ -20,13 +20,13 @@ Every property (Boost.Test test case) of every property test executable
 (CTest label "property") is run in its own process, so a crash or hang in
 one property cannot hide the results of the others.
 
-Output: $WORKDIR/testruns/<YYYYmmdd-HHMMSS>/
+Output: $WORKDIR/testruns/<YYYYmmdd-HHMMSS>-<variant>/
     summary.md     human readable report (also printed to stdout)
     summary.json   machine readable report
     junit.xml      JUnit report (Jenkins: junit 'testruns/latest/junit.xml')
     run_info.json  git revision, preset, knobs used for the run
     logs/<executable>/<property>.log   full output of every property
-and $WORKDIR/testruns/latest and latest-<variant> -> <YYYYmmdd-HHMMSS>
+and $WORKDIR/testruns/latest and latest-<variant> -> <YYYYmmdd-HHMMSS>-<variant>
 
 Build variant: the preset plus extra sanitizers (e.g. asan_gcc14,
 release_gcc14-ubsan), read from pbt_build_info.json written by
@@ -562,7 +562,8 @@ def main() -> int:
     parser.add_argument("--fail-on", choices=["new", "any", "never"],
                         default="new", help="exit code policy (default: %(default)s)")
     parser.add_argument("--output-dir",
-                        help="report directory (default: <workdir>/testruns/<timestamp>)")
+                        help="report directory (default: "
+                             "<workdir>/testruns/<timestamp>-<variant>)")
     parser.add_argument("--list", action="store_true",
                         help="only list the properties that would run")
     args = parser.parse_args()
@@ -608,12 +609,15 @@ def main() -> int:
         print("error: no property tests found", file=sys.stderr)
         return 2
 
-    run_id = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_id = datetime.datetime.now().strftime("%Y%m%d-%H%M%S") + f"-{variant}"
     out_dir = Path(args.output_dir or workdir / "testruns" / run_id).resolve()
-    if not args.output_dir and out_dir.exists():
-        # another variant started in the same second
-        run_id = f"{run_id}-{variant}"
-        out_dir = out_dir.parent / run_id
+    if not args.output_dir:
+        # the same variant started twice in the same second
+        base_id, counter = run_id, 2
+        while out_dir.exists():
+            run_id = f"{base_id}-{counter}"
+            out_dir = out_dir.parent / run_id
+            counter += 1
     out_dir.mkdir(parents=True, exist_ok=False)
     log_dir = out_dir / "logs"
 

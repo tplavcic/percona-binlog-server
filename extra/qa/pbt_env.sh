@@ -28,7 +28,7 @@
 #                                                     - build_property_tests.sh
 #     <variant> = $BUILD_PRESET plus extra sanitizers, e.g. release_gcc14,
 #                 asan_gcc14, asan_gcc14-ubsan (see pbt_variant below)
-#   $WORKDIR/testruns/<timestamp>                     - run_property_tests.py
+#   $WORKDIR/testruns/<timestamp>-<variant>           - run_property_tests.py
 #   $WORKDIR/testruns/hegel-db                        - Hegel example database
 
 PBT_QA_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
