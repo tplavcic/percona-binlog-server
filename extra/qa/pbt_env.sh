@@ -24,8 +24,10 @@
 #   $WORKDIR/hegel-cpp, hegel-build, hegel-install    - setup_pbt_env.sh
 #   $WORKDIR/libhegel                                 - setup_pbt_env.sh
 #   $WORKDIR/seaweedfs                                - setup_pbt_env.sh
-#   $WORKDIR/percona-binlog-server-build-$BUILD_PRESET-pbt
+#   $WORKDIR/percona-binlog-server-build-<variant>-pbt
 #                                                     - build_property_tests.sh
+#     <variant> = $BUILD_PRESET plus extra sanitizers, e.g. release_gcc14,
+#                 asan_gcc14, asan_gcc14-ubsan (see pbt_variant below)
 #   $WORKDIR/testruns/<timestamp>                     - run_property_tests.py
 #   $WORKDIR/testruns/hegel-db                        - Hegel example database
 
@@ -34,7 +36,7 @@ PBT_REPO_DIR="$(cd "${PBT_QA_DIR}/../.." && pwd)"
 
 : "${WORKDIR:=$(cd "${PBT_REPO_DIR}/.." && pwd)}"
 : "${BUILD_PRESET:=release_gcc14}"
-: "${PBT_BUILD_DIR:=${WORKDIR}/percona-binlog-server-build-${BUILD_PRESET}-pbt}"
+: "${PBT_SANITIZE:=}"   # extra sanitizers, e.g. "undefined" (see build_property_tests.sh)
 : "${PBT_JOBS:=$(nproc 2>/dev/null || echo 4)}"
 
 # hegel-cpp (C++ front-end) and libhegel (native engine) versions;
@@ -73,4 +75,26 @@ pbt_require_in_workdir() {
     "$(realpath -m "${WORKDIR}")"/*) ;;
     *) pbt_die "refusing to write outside WORKDIR (${WORKDIR}): ${path}" ;;
   esac
+}
+
+# Build variant name: the preset plus a suffix per extra sanitizer
+# (undefined -> ubsan, address -> asan, thread -> tsan, other -> its name).
+# Used for the build directory and to label reports (junit suite names).
+pbt_variant() {
+  local sanitizers="$2" variant="$1" san
+  local IFS=','
+  for san in ${sanitizers}; do
+    case "${san}" in
+      undefined) variant+="-ubsan" ;;
+      address) variant+="-asan" ;;
+      thread) variant+="-tsan" ;;
+      "") ;;
+      *) variant+="-${san}" ;;
+    esac
+  done
+  printf '%s' "${variant}"
+}
+
+pbt_build_dir() { # variant
+  printf '%s' "${WORKDIR}/percona-binlog-server-build-$1-pbt"
 }
