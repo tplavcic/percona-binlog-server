@@ -639,7 +639,7 @@ def seaweedfs(env: Dict[str, str], workdir: Path, *command: str):
                           check=False)
 
 
-def ensure_seaweedfs(env: Dict[str, str], workdir: Path):
+def ensure_seaweedfs(env: Dict[str, str], workdir: Path, log_dir: Path):
     """Puts PBT_S3_* into env, starting SeaweedFS if needed. Returns
     (started here, problem text or ""). On failure the S3 properties report
     an infrastructure error and the reason goes into the report."""
@@ -651,6 +651,19 @@ def ensure_seaweedfs(env: Dict[str, str], workdir: Path):
             problem = "cannot start SeaweedFS (extra/qa/seaweedfs.sh start): " + \
                 (output.splitlines()[-1] if output else
                  f"exit code {result.returncode}")
+            # keep the script output and the SeaweedFS log with the report
+            log_dir.mkdir(parents=True, exist_ok=True)
+            details = log_dir / "seaweedfs-start.log"
+            weed_log = Path(env.get("SEAWEEDFS_DIR",
+                                    str(workdir / "seaweedfs"))) / "run" / "weed.log"
+            text = output + "\n"
+            try:
+                text += f"\n--- {weed_log} ---\n" + weed_log.read_text(
+                    encoding="utf-8", errors="replace")[-20000:]
+            except OSError:
+                pass
+            details.write_text(text, encoding="utf-8")
+            problem += f" (details: {details})"
             print(f"warning: {problem}", file=sys.stderr)
             return False, problem
         started = True
@@ -798,7 +811,8 @@ def main() -> int:
     started_seaweedfs, s3_problem = False, ""
     if any("S3" in name for _, name in planned) and \
             "PBT_S3_ENDPOINT" not in env:
-        started_seaweedfs, s3_problem = ensure_seaweedfs(env, workdir)
+        started_seaweedfs, s3_problem = ensure_seaweedfs(env, workdir,
+                                                          log_dir)
 
     # temporary files of the properties (storage tests create binlog
     # directories) stay inside WORKDIR: <run dir>/tmp, removed at the end
