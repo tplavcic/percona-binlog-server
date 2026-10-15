@@ -69,6 +69,7 @@ import json
 import os
 import platform
 import re
+import shutil
 import shlex
 import signal
 import subprocess
@@ -737,6 +738,11 @@ def main() -> int:
     env.setdefault("UBSAN_OPTIONS", "print_stacktrace=1:halt_on_error=0")
     env.setdefault("ASAN_OPTIONS", "detect_leaks=1:abort_on_error=0")
     env.setdefault("TSAN_OPTIONS", "halt_on_error=1:second_deadlock_stack=1")
+    # temporary files of the properties (storage tests create binlog
+    # directories) stay inside WORKDIR: <run dir>/tmp, removed at the end
+    tmp_dir = out_dir / "tmp"
+    tmp_dir.mkdir()
+    env["TMPDIR"] = str(tmp_dir)
 
     print(f"running {len(planned)} properties from {len(executables)} "
           f"executable(s), {args.jobs} in parallel -> {out_dir}", flush=True)
@@ -758,6 +764,9 @@ def main() -> int:
         results.append(Result(exe.name, "<executable>", status="error",
                               kind="infra", message="executable is not built "
                               "(run extra/qa/build_property_tests.sh)"))
+
+    # leftovers of killed / crashed properties
+    shutil.rmtree(tmp_dir, ignore_errors=True)
 
     bugs = load_known_bugs(Path(args.known_bugs))
     possibly_fixed = classify(results, bugs, variant)
