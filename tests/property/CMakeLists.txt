@@ -91,6 +91,35 @@ function(pbs_add_property_test name)
   set_tests_properties(${name} PROPERTIES LABELS "property")
 endfunction()
 
+# pbs_test_binsrv: a test-only static library with everything that is
+# compiled only into the binlog_server executable (src/binsrv,
+# src/operations, src/minimysql), except src/app.cpp (main()).
+#
+# This is the workaround for extra/qa/todo.md T1 (no library target for
+# these sources yet). It needs no change to the server build: the source
+# list, include directories and link libraries are read from the
+# binlog_server target, so they follow it automatically. The sources are
+# compiled a second time, only when a property test that needs them is
+# built.
+if(TARGET binlog_server)
+  get_target_property(pbs_binsrv_sources binlog_server SOURCES)
+  get_target_property(pbs_binsrv_source_dir binlog_server SOURCE_DIR)
+  get_target_property(pbs_binsrv_include_dirs binlog_server INCLUDE_DIRECTORIES)
+  get_target_property(pbs_binsrv_link_libraries binlog_server LINK_LIBRARIES)
+  list(FILTER pbs_binsrv_sources EXCLUDE REGEX "(^|/)src/app\\.cpp$")
+  list(TRANSFORM pbs_binsrv_sources PREPEND "${pbs_binsrv_source_dir}/"
+    REGEX "^[^/]")
+  add_library(pbs_test_binsrv STATIC EXCLUDE_FROM_ALL ${pbs_binsrv_sources})
+  if(pbs_binsrv_include_dirs)
+    target_include_directories(pbs_test_binsrv PUBLIC ${pbs_binsrv_include_dirs})
+  endif()
+  target_link_libraries(pbs_test_binsrv PUBLIC ${pbs_binsrv_link_libraries})
+  set_target_properties(pbs_test_binsrv PROPERTIES
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS NO
+  )
+endif()
+
 pbs_add_property_test(gtid_set_property_test
   SOURCES gtid_set_property_test.cpp
   LIBRARIES binsrv::lib_gtids binsrv::lib_util
@@ -126,3 +155,10 @@ pbs_add_property_test(rewriter_property_test
   SOURCES rewriter_property_test.cpp
   LIBRARIES binsrv::lib_events binsrv::lib_gtids binsrv::lib_util ZLIB::ZLIB
 )
+
+if(TARGET pbs_test_binsrv)
+  pbs_add_property_test(storage_property_test
+    SOURCES storage_property_test.cpp
+    LIBRARIES pbs_test_binsrv
+  )
+endif()
