@@ -52,11 +52,13 @@ s3_answers() {
 }
 
 bucket_ready() {
+  # S3 buckets are directories /buckets/<name> in the filer; asking the
+  # filer needs no request signing (a signed S3 request made with curl
+  # --aws-sigv4 was never accepted with curl 7.81 on Ubuntu 22.04)
   local code
   code="$(curl --silent --output /dev/null --max-time 5 --write-out '%{http_code}' \
-    --aws-sigv4 "aws:amz:us-east-1:s3" \
-    --user "${SEAWEEDFS_ACCESS_KEY}:${SEAWEEDFS_SECRET_KEY}" \
-    "${endpoint}/${SEAWEEDFS_BUCKET}/" || true)"
+    -H 'Accept: application/json' \
+    "http://127.0.0.1:${SEAWEEDFS_FILER_PORT}/buckets/${SEAWEEDFS_BUCKET}/" || true)"
   [[ "${code}" == "200" ]]
 }
 
@@ -138,7 +140,7 @@ EOF
     fail_start "SeaweedFS has no free volumes (not enough disk space in ${data_dir} for SEAWEEDFS_VOLUME_MAX=${SEAWEEDFS_VOLUME_MAX} x ${SEAWEEDFS_VOLUME_SIZE_MB} MB volumes?)"
   fi
   if [[ ${s3_up} -eq 1 ]]; then
-    fail_start "SeaweedFS S3 answers on ${endpoint} but bucket '${SEAWEEDFS_BUCKET}' is not accessible with the configured keys in ${SEAWEEDFS_START_TIMEOUT}s (curl $(curl --version | head -1 | cut -d' ' -f2) needs >= 7.75 for --aws-sigv4)"
+    fail_start "SeaweedFS S3 answers on ${endpoint} but bucket '${SEAWEEDFS_BUCKET}' was not created in ${SEAWEEDFS_START_TIMEOUT}s (filer http://127.0.0.1:${SEAWEEDFS_FILER_PORT}/buckets/${SEAWEEDFS_BUCKET}/)"
   fi
   fail_start "SeaweedFS S3 endpoint ${endpoint} did not answer in ${SEAWEEDFS_START_TIMEOUT}s"
 }
