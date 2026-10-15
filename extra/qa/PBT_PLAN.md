@@ -137,10 +137,10 @@ Legend:
 
 | # | Area | Key properties | State |
 |---|---|---|---|
-| B1 | `storage` with filesystem backend (stateful model test) | random sequences of open/write/discard/flush/close/reopen. Persisted bytes equal the transactions written up to the last boundary. Record `size` equals the object size. `added_gtids` is the union of the GTIDs. `previous_gtids(n+1) == previous ∪ added (n)`. min/max timestamps hold. Reopening reproduces `get_binlog_records()`. Any chunking of `fetch_event_block` concatenates to the written bytes. | 🟡 (T1) |
-| B2 | B1 against SeaweedFS S3 | backend equivalence: the same operation sequence on fs and s3 gives identical observable state | 🟡 (T1) |
-| B3 | encryption at rest | bytes on disk differ from the plaintext; `fetch_event_block` at arbitrary offsets/lengths returns the plaintext for every KEK cipher; documented 192-bit + ECB/CBC restriction | 🟡 (T1) |
-| B4 | crash recovery | junk appended to the tail file is truncated back; a short tail file is rejected; a size mismatch in a non-tail file is rejected; orphan objects are rejected | 🟡 (T1); fault injection 🔴 (T3) |
+| B1 | `storage` with filesystem backend (stateful model test) | random sequences of open/write/discard/flush/close/reopen. Persisted bytes equal the transactions written up to the last boundary. Record `size` equals the object size. `added_gtids` is the union of the GTIDs. `previous_gtids(n+1) == previous ∪ added (n)`. min/max timestamps hold. Reopening reproduces `get_binlog_records()`. Any chunking of `fetch_event_block` concatenates to the written bytes. Also: `fetch_event_block` contract, `purge_binlogs` contract, `indexed_event_block` splitting | ✅ (T1 workaround; interval checkpoints need T2) |
+| B2 | B1 against SeaweedFS S3 | backend equivalence: the same operation sequence on fs and s3 gives identical observable state | 🟢 |
+| B3 | encryption at rest | bytes on disk differ from the plaintext; `fetch_event_block` at arbitrary offsets/lengths returns the plaintext for every KEK cipher; documented 192-bit + ECB/CBC restriction | 🟢 |
+| B4 | crash recovery | junk appended to the tail file is truncated back; a short tail file is rejected; a size mismatch in a non-tail file is rejected; a crash while creating a binlog is recovered | ✅ (file-level); fault injection 🔴 (T3) |
 | B5 | checkpointing by size/interval | flush points obey the configured size and interval | 🔴 (T2, needs a clock seam) |
 
 ### Layer C: `binlog_server` binary on generated storage (no MySQL)
@@ -177,7 +177,8 @@ These complement the existing MTR suite rather than replacing it.
 1. A1 ✅
 2. A2 → A4 → A3 → A5 → A6. These need no infrastructure, are high risk
    (hand-written codecs, crypto offsets) and are cheap.
-3. Decide on todo T1 (the `lib_binsrv` target), then A9/A10 and B1 to B4.
+3. T1 workaround in place (`pbs_test_binsrv`): B1 ✅, then B4, B3, B2,
+   A9/A10.
 4. Layer C, which reuses B1's generators.
 5. Layer D, once a MySQL is available on the QA host.
 
@@ -189,8 +190,8 @@ there is authoritative):
 | Severity | Issues |
 |---|---|
 | high | PBT-015, PBT-017, PBT-022 |
-| medium | PBT-001, PBT-002, PBT-004, PBT-012, PBT-013, PBT-016, PBT-019 |
-| low | PBT-003, PBT-005, PBT-006, PBT-007, PBT-008, PBT-009, PBT-010, PBT-011, PBT-014, PBT-018, PBT-020, PBT-021, PBT-023 |
+| medium | PBT-001, PBT-002, PBT-004, PBT-012, PBT-013, PBT-016, PBT-019, PBT-026 |
+| low | PBT-003, PBT-005, PBT-006, PBT-007, PBT-008, PBT-009, PBT-010, PBT-011, PBT-014, PBT-018, PBT-020, PBT-021, PBT-023, PBT-024, PBT-025 |
 
 ### GTID sets (prototype run)
 
@@ -258,6 +259,58 @@ From the adversarial review, waiting for later layers:
   `collector_context` casts the storage position to 32 bits (B1 / D)
 - `last_committed < sequence_number`: `rewriter` rejects violations;
   `reader_context` does not check it (low, MySQL never writes it)
+
+### Storage (sandbox run)
+
+`storage_property_test` is the first suite linked against
+`pbs_test_binsrv`. That is a test-only library that compiles the
+`binlog_server` sources (except `src/app.cpp`) a second time. It is the T1
+workaround: no server change, and the source list, include directories and
+link libraries are read from the `binlog_server` target.
+
+The suite has 10 properties, all on the filesystem backend in a temporary
+directory under the run directory:
+- a stateful model of open / write / flush / discard / close / restart,
+  checking the reported state after every step and the bytes on disk after
+  every restart;
+- the documented `fetch_event_block()` contract;
+- the `purge_binlogs()` contract;
+- purged GTIDs across a restart;
+- crash recovery:
+  - unrecorded bytes at the tail are truncated;
+  - other size mismatches are rejected;
+  - a crash while a binlog is being created;
+- `querying_only` mode with broken metadata;
+- `indexed_event_block` splitting;
+- `indexed_event_block` on damaged data, run in a forked child with a
+  50 ms timer and default signal handlers.
+
+There are 3 new findings, `PBT-024`…`PBT-026`:
+- [low] PBT-024: after a restart `get_purged_gtids()` returns the first
+  binlog's added GTIDs instead of its previous GTIDs
+- [low] PBT-025: `indexed_event_block` loops forever (Debug: aborts) on an
+  `event_size` of 0 and indexes "events" of 1..18 bytes. A damaged stored
+  binlog makes the 'pull' source hang and exhaust memory.
+- [medium] PBT-026: a crash while a new binlog is being created leaves an
+  unlisted binlog file, and the storage can no longer be opened
+
+From the review, not turned into properties yet:
+- `close_binlog()` with an incomplete transaction keeps its timestamps for
+  the next binlog (Debug: an assert in `open_binlog`). The collector closes
+  only at a transaction boundary, so this is unreachable today.
+- `querying_only` mode calls `binlog_records_.front()` after every record
+  was dropped for broken metadata (`storage_core.cpp`, end of
+  `load_and_validate_binlog_metadata_set`). This is undefined behaviour,
+  but harmless with libstdc++, because the vector keeps its memory and
+  the destroyed optional reads as empty. The property passes, ASan
+  included.
+- `binlog.index` order, base names and the `previous_gtids` chain are not
+  validated when loading. This is only reachable with a damaged storage.
+- The filesystem backend never fsyncs streamed binlog data, only metadata
+  and the index. After a power loss the metadata can be larger than the
+  file, which is rejected. This needs layer D / fault injection (T3).
+- Timestamp 0 (epoch) is ignored by `ctime_timestamp_range`. The model
+  draws timestamps ≥ 1.
 
 ### Stream state machine and rewriter (sandbox run)
 
