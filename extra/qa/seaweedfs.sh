@@ -60,12 +60,37 @@ bucket_ready() {
   [[ "${code}" == "200" ]]
 }
 
+port_in_use() {
+  (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null
+}
+
+# stops a SeaweedFS that did not come up and exits with the reason
+fail_start() {
+  tail -20 "${log_file}" >&2 || true
+  stop
+  pbt_die "$1 (log: ${log_file})"
+}
+
 start() {
   [[ -x "${weed}" ]] || pbt_die "${weed} not found; run extra/qa/setup_pbt_env.sh"
   if is_running; then
     pbt_log "SeaweedFS already running (pid $(cat "${pid_file}"))"
     return 0
   fi
+  local port
+  for port in "${SEAWEEDFS_S3_PORT}" "${SEAWEEDFS_MASTER_PORT}" \
+              "${SEAWEEDFS_VOLUME_PORT}" "${SEAWEEDFS_FILER_PORT}"; do
+    if port_in_use "${port}"; then
+      pbt_die "port ${port} on 127.0.0.1 is already in use (another SeaweedFS / service?); set SEAWEEDFS_S3_PORT / _MASTER_PORT / _VOLUME_PORT / _FILER_PORT"
+    fi
+  done
+  # gRPC ports are the HTTP ports + 10000
+  for port in "${SEAWEEDFS_MASTER_PORT}" "${SEAWEEDFS_VOLUME_PORT}" \
+              "${SEAWEEDFS_FILER_PORT}"; do
+    if port_in_use "$((port + 10000))"; then
+      pbt_die "gRPC port $((port + 10000)) (= ${port} + 10000) on 127.0.0.1 is already in use; set SEAWEEDFS_*_PORT"
+    fi
+  done
   pbt_require_in_workdir "${data_dir}"
   mkdir -p "${data_dir}" "${run_dir}"
   cat > "${s3_config}" <<EOF
@@ -95,16 +120,22 @@ EOF
     -admin.ui=false -webdav=false \
     >"${log_file}" 2>&1 < /dev/null &
   echo $! > "${pid_file}"
-  for _ in $(seq 1 60); do
-    if s3_answers && bucket_ready; then
-      pbt_log "SeaweedFS ready, bucket '${SEAWEEDFS_BUCKET}'"
-      return 0
+  local s3_up=0
+  for _ in $(seq 1 "${SEAWEEDFS_START_TIMEOUT}"); do
+    if s3_answers; then
+      s3_up=1
+      if bucket_ready; then
+        pbt_log "SeaweedFS ready, bucket '${SEAWEEDFS_BUCKET}'"
+        return 0
+      fi
     fi
-    is_running || { tail -20 "${log_file}" >&2; pbt_die "SeaweedFS exited"; }
+    is_running || fail_start "SeaweedFS exited"
     sleep 1
   done
-  tail -20 "${log_file}" >&2
-  pbt_die "SeaweedFS did not become ready in 60s"
+  if [[ ${s3_up} -eq 1 ]]; then
+    fail_start "SeaweedFS S3 answers on ${endpoint} but bucket '${SEAWEEDFS_BUCKET}' is not accessible with the configured keys in ${SEAWEEDFS_START_TIMEOUT}s (curl $(curl --version | head -1 | cut -d' ' -f2) needs >= 7.75 for --aws-sigv4)"
+  fi
+  fail_start "SeaweedFS S3 endpoint ${endpoint} did not answer in ${SEAWEEDFS_START_TIMEOUT}s"
 }
 
 stop() {
