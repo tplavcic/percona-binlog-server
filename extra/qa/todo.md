@@ -14,6 +14,11 @@ for it. When a change lands, move the tests into `PBT_PLAN.md` as
   - B1–B4: storage stateful model, S3 equivalence, encryption at rest,
     crash recovery
   - C1–C4: storage generator for the binary-level tests
+  - `rewriter_property_test::CollectorRewriteFlowIsAccepted` currently
+    tests a model of `collector_context` (rewrite mode) written in the test.
+    With `lib_operations` it could drive the real
+    `rewrite_and_process_binlog_event()` / `process_binlog_event()`, given
+    a storage on a temporary directory.
 - **Change:** add a static library, e.g. `lib_binsrv` (`binsrv::lib_binsrv`),
   built from the `src/binsrv/*.cpp` files that are currently compiled only
   into the `binlog_server` executable (`CMakeLists.txt`, the
