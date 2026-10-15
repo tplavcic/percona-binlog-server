@@ -98,6 +98,15 @@ for example `testruns/20261014-112341-asan_gcc14-ubsan/`.
 - `run_info.json`: the git revision, preset and knobs.
 - `logs/<executable>/<property>.log`: the full output of each property.
 
+Properties that need temporary files (storage tests) create them under
+`$TMPDIR`. The runner sets it to `<run dir>/tmp` and removes that directory
+at the end, so nothing is written outside `WORKDIR`. When you run a test
+executable by hand, set `TMPDIR` yourself.
+
+`storage_property_test` links the server sources through the
+`pbs_test_binsrv` test library (todo.md T1). It needs the same dependencies
+as `binlog_server` (MySQL client library, AWS SDK, Boost).
+
 The exit code (`--fail-on`) is set as follows. With `new` (the default) it
 is `1` when there are new issues, regressions or infrastructure errors.
 With `any` it is `1` on any failure. With `never` it is always `0`.
