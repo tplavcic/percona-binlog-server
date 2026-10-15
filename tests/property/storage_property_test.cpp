@@ -663,7 +663,8 @@ gs::Generator<binsrv::gtids::gtid> gtids() {
 // flushed bytes.
 namespace {
 
-void run_storage_model(hegel::TestCase &tc, const storage_settings &base) {
+void run_storage_model(hegel::TestCase &tc, const storage_settings &base,
+                       std::size_t max_steps = 30U) {
         const temporary_directory directory;
         storage_model expected;
         expected.settings = base;
@@ -687,7 +688,8 @@ void run_storage_model(hegel::TestCase &tc, const storage_settings &base) {
             gs::integers<std::uint32_t>({.min_value = 1U, .max_value = 999U}))};
         binsrv::events::seq_no_t next_sequence_number{1U};
         const auto steps{tc.draw(
-            "steps", gs::integers<std::size_t>({.min_value = 1U, .max_value = 30U}))};
+            "steps",
+            gs::integers<std::size_t>({.min_value = 1U, .max_value = max_steps}))};
         for (std::size_t step{0U}; step < steps; ++step) {
           std::vector<operation> possible{operation::restart};
           if (!expected.open) {
@@ -1724,9 +1726,10 @@ BOOST_AUTO_TEST_CASE(StorageMatchesModelOnS3) {
           settings = draw_encryption(tc, true);
         }
         settings.s3_uri = s3_uri_for(prefix_source);
-        run_storage_model(tc, settings);
+        // every write is a whole-object upload: fewer, shorter sequences
+        run_storage_model(tc, settings, 15U);
       },
-      {.test_cases = 100U});
+      {.test_cases = 20U, .slow = true});
 }
 
 // ===========================================================================
