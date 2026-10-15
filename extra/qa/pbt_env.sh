@@ -58,6 +58,11 @@ PBT_REPO_DIR="$(cd "${PBT_QA_DIR}/../.." && pwd)"
 : "${SEAWEEDFS_SECRET_KEY:=pbsqasecret}"
 : "${SEAWEEDFS_BUCKET:=pbs-pbt}"
 : "${SEAWEEDFS_START_TIMEOUT:=120}"
+# small volumes and an explicit volume count: 'weed mini' otherwise derives
+# the number of volumes from the free disk space and can end up with none
+# (QA host: 4 GiB free -> "Free Volumes: 0", bucket never accessible)
+: "${SEAWEEDFS_VOLUME_SIZE_MB:=64}"
+: "${SEAWEEDFS_VOLUME_MAX:=8}"
 
 # compiler used to build hegel-cpp (must be ABI compatible with BUILD_PRESET)
 case "${BUILD_PRESET}" in
