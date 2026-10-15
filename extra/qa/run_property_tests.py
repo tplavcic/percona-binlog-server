@@ -323,6 +323,11 @@ def run_property(exe: Executable, name: str, args, env: Dict[str, str],
         except ValueError:
             sig_name = str(sig)
         result.message = f"crashed with signal {sig_name}"
+    elif "PBT_INFRA:" in log_text:
+        # the test could not run (e.g. no S3 endpoint): not a finding
+        result.status, result.kind = "error", "infra"
+        match = re.search(r"PBT_INFRA: ([^\n\[]*)", log_text)
+        result.message = match.group(1).strip() if match else "infrastructure"
     elif "PROPERTY VIOLATED" in log_text or "--- Failure" in log_text:
         result.status, result.kind = "failed", "violation"
     elif "Test setup error" in log_text or "no test cases matching" in log_text:
@@ -612,6 +617,33 @@ def git_info() -> Dict:
 
 
 # ---------------------------------------------------------------------------
+def seaweedfs(env: Dict[str, str], workdir: Path, *command: str):
+    script_env = dict(env)
+    script_env["WORKDIR"] = str(workdir)
+    return subprocess.run([str(QA_DIR / "seaweedfs.sh"), *command],
+                          env=script_env, capture_output=True, text=True,
+                          check=False)
+
+
+def ensure_seaweedfs(env: Dict[str, str], workdir: Path) -> bool:
+    """Puts PBT_S3_* into env, starting SeaweedFS if needed; returns
+    whether it was started here. On failure the S3 properties report an
+    infrastructure error."""
+    started = False
+    if seaweedfs(env, workdir, "status").returncode != 0:
+        result = seaweedfs(env, workdir, "start")
+        if result.returncode != 0:
+            print("warning: cannot start SeaweedFS for the S3 properties:\n"
+                  + (result.stdout + result.stderr).strip(), file=sys.stderr)
+            return False
+        started = True
+    for line in seaweedfs(env, workdir, "env").stdout.splitlines():
+        match = re.match(r"export (PBT_S3_\w+)='([^']*)'", line.strip())
+        if match:
+            env[match.group(1)] = match.group(2)
+    return started
+
+
 def main() -> int:
     workdir_default = os.environ.get("WORKDIR", str(REPO_DIR.parent))
     preset_default = os.environ.get("BUILD_PRESET", "release_gcc14")
@@ -659,6 +691,12 @@ def main() -> int:
     parser.add_argument("--output-dir",
                         help="report directory (default: "
                              "<workdir>/testruns/<timestamp>-<variant>)")
+    parser.add_argument("--s3", choices=["auto", "off"], default="auto",
+                        help="properties that need S3 (names containing "
+                             "'S3'): 'auto' uses PBT_S3_* from the environment "
+                             "or starts SeaweedFS with extra/qa/seaweedfs.sh "
+                             "(and stops it afterwards); 'off' skips them "
+                             "(default: %(default)s)")
     parser.add_argument("--list", action="store_true",
                         help="only list the properties that would run")
     args = parser.parse_args()
@@ -694,6 +732,8 @@ def main() -> int:
             if args.filter and not any(re.search(f, test_id) for f in args.filter):
                 continue
             if any(re.search(f, test_id) for f in args.exclude):
+                continue
+            if args.s3 == "off" and "S3" in name:
                 continue
             planned.append((exe, name))
     if args.list:
@@ -738,6 +778,11 @@ def main() -> int:
     env.setdefault("UBSAN_OPTIONS", "print_stacktrace=1:halt_on_error=0")
     env.setdefault("ASAN_OPTIONS", "detect_leaks=1:abort_on_error=0")
     env.setdefault("TSAN_OPTIONS", "halt_on_error=1:second_deadlock_stack=1")
+    started_seaweedfs = False
+    if any("S3" in name for _, name in planned) and \
+            "PBT_S3_ENDPOINT" not in env:
+        started_seaweedfs = ensure_seaweedfs(env, workdir)
+
     # temporary files of the properties (storage tests create binlog
     # directories) stay inside WORKDIR: <run dir>/tmp, removed at the end
     tmp_dir = out_dir / "tmp"
@@ -767,6 +812,9 @@ def main() -> int:
 
     # leftovers of killed / crashed properties
     shutil.rmtree(tmp_dir, ignore_errors=True)
+    if started_seaweedfs:
+        # started for this run only: stop it and drop the test objects
+        seaweedfs(env, workdir, "wipe")
 
     bugs = load_known_bugs(Path(args.known_bugs))
     possibly_fixed = classify(results, bugs, variant)
