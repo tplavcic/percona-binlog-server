@@ -191,7 +191,7 @@ there is authoritative):
 |---|---|
 | high | PBT-015, PBT-017, PBT-022 |
 | medium | PBT-001, PBT-002, PBT-004, PBT-012, PBT-013, PBT-016, PBT-019, PBT-026 |
-| low | PBT-003, PBT-005, PBT-006, PBT-007, PBT-008, PBT-009, PBT-010, PBT-011, PBT-014, PBT-018, PBT-020, PBT-021, PBT-023, PBT-024, PBT-025 |
+| low | PBT-003, PBT-005, PBT-006, PBT-007, PBT-008, PBT-009, PBT-010, PBT-011, PBT-014, PBT-018, PBT-020, PBT-021, PBT-023, PBT-024, PBT-025, PBT-027 |
 
 ### GTID sets (prototype run)
 
@@ -259,6 +259,17 @@ From the adversarial review, waiting for later layers:
   `collector_context` casts the storage position to 32 bits (B1 / D)
 - `last_committed < sequence_number`: `rewriter` rejects violations;
   `reader_context` does not check it (low, MySQL never writes it)
+
+### First full-scale QA run (asan_gcc14-ubsan, `--cases-scale 1`)
+
+Earlier QA runs used `--cases-scale 0.1`. At the full case count,
+`event_property_test::FormatDescriptionMutationsRoundTrip` found one more
+defect:
+- [low] PBT-027: re-encoding a parsed event keeps its old CRC footer, so a
+  FORMAT_DESCRIPTION whose `server_version` has bytes after the NUL is
+  re-encoded with an invalid checksum. No production path is affected.
+
+Nightly runs should use scale ≥ 1; scale 0.1 is a smoke test.
 
 ### Storage (sandbox run)
 
