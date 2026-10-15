@@ -14,11 +14,7 @@ for it. When a change lands, move the tests into `PBT_PLAN.md` as
   - B1–B4: storage stateful model, S3 equivalence, encryption at rest,
     crash recovery
   - C1–C4: storage generator for the binary-level tests
-  - `rewriter_property_test::CollectorRewriteFlowIsAccepted` currently
-    tests a model of `collector_context` (rewrite mode) written in the test.
-    With `lib_operations` it could drive the real
-    `rewrite_and_process_binlog_event()` / `process_binlog_event()`, given
-    a storage on a temporary directory.
+  - `rewriter_property_test::CollectorRewriteFlowIsAccepted` (see T7)
 - **Change:** add a static library, e.g. `lib_binsrv` (`binsrv::lib_binsrv`),
   built from the `src/binsrv/*.cpp` files that are currently compiled only
   into the `binlog_server` executable (`CMakeLists.txt`, the
@@ -28,10 +24,14 @@ for it. When a change lands, move the tests into `PBT_PLAN.md` as
 - **Why:** the tests need `storage`, `storage_core`, both storage backends,
   `main_config`, `size_unit`, `time_unit` and the keyring classes. None of
   them is reachable from a test target today.
-- **Workaround until then:** `tests/property/CMakeLists.txt` can compile the
-  needed `.cpp` files straight into the test executable. That needs no
-  server change, but it compiles them twice, and the test's source list has
-  to be updated whenever the server's list changes.
+- **Workaround (in place):** `tests/property/CMakeLists.txt` builds
+  `pbs_test_binsrv`, a test-only static library made of the
+  `binlog_server` target's sources (minus `src/app.cpp`), include
+  directories and link libraries, read with `get_target_property()`. No
+  server change is needed and the list follows the server automatically.
+  The cost is compiling those files twice, only when a test that needs
+  them is built. `storage_property_test` uses it. A real `lib_binsrv` /
+  `lib_operations` target would remove the double compilation.
 
 ## T2 - injectable clock in `binsrv::storage`
 
@@ -99,3 +99,20 @@ for it. When a change lands, move the tests into `PBT_PLAN.md` as
   single-threaded, so TSan would find nothing yet.
   `build_property_tests.sh --sanitize thread` can be used for an
   experiment, but expect noise from the uninstrumented libraries.
+
+## T7 - test entry point for collector event processing
+
+- **Tests that need it:** `rewriter_property_test::CollectorRewriteFlowIsAccepted`
+  (PBT-022), which currently tests a model of `collector_context` written in
+  the test. Future properties on the collector: reconnects, file switching
+  in rewrite mode, checkpoints.
+- **Change:** make the per-event processing of `collector_context`
+  reachable without a MySQL connection. For example, move
+  `rewrite_and_process_binlog_event()` / `process_binlog_event()` (and the
+  `reader_context` they share) into a small public class that
+  `receive_binlog_events()` uses, or add a public
+  `process_received_event(util::const_byte_span)` method.
+- **Why:** the methods are private, and `receive_binlog_events()` needs a
+  live MySQL source. The T1 workaround makes the code linkable but not
+  callable. Without this change the real flow can only be tested at layer
+  D (with MySQL) or layer C (with another PBS as the source).
