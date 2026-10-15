@@ -161,4 +161,8 @@ if(TARGET pbs_test_binsrv)
     SOURCES storage_property_test.cpp
     LIBRARIES pbs_test_binsrv
   )
+  pbs_add_property_test(units_property_test
+    SOURCES units_property_test.cpp
+    LIBRARIES pbs_test_binsrv
+  )
 endif()

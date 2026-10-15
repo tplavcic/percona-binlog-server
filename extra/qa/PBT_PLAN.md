@@ -130,7 +130,7 @@ Legend:
 | A6 | `events::reader_context` | generated valid streams following the documented grammar (`ROTATE FDE PREV_GTIDS? (GTID ANY*)* (ROTATE\|STOP)?`) are accepted; each single grammar mutation (dropped or duplicated FDE, wrong `next_event_position`, wrong `transaction_length`, ANONYMOUS in GTID mode) throws | the grammar in `reader_context.hpp` | ✅ |
 | A7 | `util`: semantic_version, hex_value, ctime_timestamp(+range), flag_set, composite_name, crc32 | roundtrips; range is a monoid; crc32 matches zlib and `crc32_combine` | docs and zlib | 🟢 |
 | A8 | `util::nv_tuple` JSON + `models::*` | `from_json(to_json(x)) == x`; unknown keys are ignored; type mismatch throws and names the JSON path | — | 🟢 |
-| A9 | `size_unit`, `time_unit` | `"N<suffix>"` value equals N × multiplier; `to_string` roundtrip; overflow rejected; malformed suffixes rejected | README grammar | 🟡 (todo T1) |
+| A9 | `size_unit`, `time_unit` | `"N<suffix>"` value equals N × multiplier; `to_string` roundtrip; overflow rejected; malformed suffixes rejected | README grammar | ✅ (`units_property_test`) |
 | A10 | `main_config` + keyring + `storage_config` URIs | generated valid configs load; every single-rule mutation is rejected; `get_masked_uri()` never contains the secret | README config reference | 🟡 (T1) |
 
 ### Layer B: in-process storage (filesystem and S3)
@@ -138,10 +138,10 @@ Legend:
 | # | Area | Key properties | State |
 |---|---|---|---|
 | B1 | `storage` with filesystem backend (stateful model test) | random sequences of open/write/discard/flush/close/reopen. Persisted bytes equal the transactions written up to the last boundary. Record `size` equals the object size. `added_gtids` is the union of the GTIDs. `previous_gtids(n+1) == previous ∪ added (n)`. min/max timestamps hold. Reopening reproduces `get_binlog_records()`. Any chunking of `fetch_event_block` concatenates to the written bytes. Also: `fetch_event_block` contract, `purge_binlogs` contract, `indexed_event_block` splitting | ✅ (T1 workaround; interval checkpoints need T2) |
-| B2 | B1 against SeaweedFS S3 | backend equivalence: the same operation sequence on fs and s3 gives identical observable state | 🟢 |
-| B3 | encryption at rest | bytes on disk differ from the plaintext; `fetch_event_block` at arbitrary offsets/lengths returns the plaintext for every KEK cipher; documented 192-bit + ECB/CBC restriction | 🟢 |
+| B2 | B1 against SeaweedFS S3 | backend equivalence: the same operation sequence on fs and s3 gives identical observable state | ✅ (`StorageMatchesModelOnS3`; the runner starts SeaweedFS) |
+| B3 | encryption at rest | bytes on disk differ from the plaintext; `fetch_event_block` at arbitrary offsets/lengths returns the plaintext for every KEK cipher; documented 192-bit + ECB/CBC restriction | ✅ |
 | B4 | crash recovery | junk appended to the tail file is truncated back; a short tail file is rejected; a size mismatch in a non-tail file is rejected; a crash while creating a binlog is recovered | ✅ (file-level); fault injection 🔴 (T3) |
-| B5 | checkpointing by size/interval | flush points obey the configured size and interval | 🔴 (T2, needs a clock seam) |
+| B5 | checkpointing by size/interval | flush points obey the configured size and interval | size ✅ (in B1); interval: only "not before it elapsed" ✅, the rest 🔴 (T2, needs a clock seam) |
 
 ### Layer C: `binlog_server` binary on generated storage (no MySQL)
 
@@ -191,7 +191,7 @@ there is authoritative):
 |---|---|
 | high | PBT-015, PBT-017, PBT-022 |
 | medium | PBT-001, PBT-002, PBT-004, PBT-012, PBT-013, PBT-016, PBT-019, PBT-026 |
-| low | PBT-003, PBT-005, PBT-006, PBT-007, PBT-008, PBT-009, PBT-010, PBT-011, PBT-014, PBT-018, PBT-020, PBT-021, PBT-023, PBT-024, PBT-025, PBT-027 |
+| low | PBT-003, PBT-005, PBT-006, PBT-007, PBT-008, PBT-009, PBT-010, PBT-011, PBT-014, PBT-018, PBT-020, PBT-021, PBT-023, PBT-024, PBT-025, PBT-027, PBT-028 |
 
 ### GTID sets (prototype run)
 
@@ -259,6 +259,33 @@ From the adversarial review, waiting for later layers:
   `collector_context` casts the storage position to 32 bits (B1 / D)
 - `last_committed < sequence_number`: `rewriter` rejects violations;
   `reader_context` does not check it (low, MySQL never writes it)
+
+### Encryption, S3, units (sandbox run)
+
+The storage suite grew to 15 properties (`units_property_test` adds 4):
+- encryption at rest:
+  - the stateful model with every KEK cipher (ECB, CBC, GCM, CTR; AES,
+    ARIA, CAMELLIA) and data cipher (128 / 192 / 256-bit CTR);
+  - on-disk files decrypted independently with OpenSSL and the envelopes
+    in the binlog metadata;
+  - random-range reads;
+  - the documented ECB/CBC + 192-bit rejection;
+  - switching encryption on and off for an existing storage;
+  - refusing to open without the KEK;
+- the S3 backend (SeaweedFS): the same stateful model, with and without
+  encryption. `run_property_tests.py --s3 auto` (the default) uses
+  `PBT_S3_*` or starts SeaweedFS with `extra/qa/seaweedfs.sh`, then stops
+  and wipes it. `--s3 off` skips these properties. A missing endpoint is
+  reported as an infrastructure error (`PBT_INFRA:`), not as a finding;
+- `size_unit` / `time_unit` (A9): the documented spellings, 64-bit
+  overflow and the rejection of anything else;
+- a long `checkpoint_interval`.
+
+Encryption, S3 and the unit parsers matched their documentation.
+There is 1 new finding:
+- [low] PBT-028: a `checkpoint_interval` of 106752 days or more overflows
+  the nanosecond clock duration, and every transaction is then flushed
+  immediately. This is undefined behaviour.
 
 ### First full-scale QA run (asan_gcc14-ubsan, `--cases-scale 1`)
 
