@@ -166,6 +166,13 @@ void require_throws(
        location);
 }
 
+// The test cannot run because something outside the code under test is
+// missing (e.g. no S3 endpoint). run_property_tests.py reports the marker
+// as an infrastructure error, not as a property failure.
+[[noreturn]] inline void infrastructure_error(std::string_view message) {
+  throw std::runtime_error{"PBT_INFRA: " + std::string{message}};
+}
+
 namespace detail {
 
 inline std::optional<std::string> env(const char *name) {
