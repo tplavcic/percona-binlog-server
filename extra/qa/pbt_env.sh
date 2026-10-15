@@ -57,6 +57,7 @@ PBT_REPO_DIR="$(cd "${PBT_QA_DIR}/../.." && pwd)"
 : "${SEAWEEDFS_ACCESS_KEY:=pbsqaaccess}"
 : "${SEAWEEDFS_SECRET_KEY:=pbsqasecret}"
 : "${SEAWEEDFS_BUCKET:=pbs-pbt}"
+: "${SEAWEEDFS_START_TIMEOUT:=120}"
 
 # compiler used to build hegel-cpp (must be ABI compatible with BUILD_PRESET)
 case "${BUILD_PRESET}" in
