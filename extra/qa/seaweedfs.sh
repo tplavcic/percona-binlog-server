@@ -115,6 +115,8 @@ EOF
     -volume.port="${SEAWEEDFS_VOLUME_PORT}" \
     -filer.port="${SEAWEEDFS_FILER_PORT}" \
     -s3.port="${SEAWEEDFS_S3_PORT}" \
+    -master.volumeSizeLimitMB="${SEAWEEDFS_VOLUME_SIZE_MB}" \
+    -volume.max="${SEAWEEDFS_VOLUME_MAX}" \
     -s3.config="${s3_config}" \
     -bucket="${SEAWEEDFS_BUCKET}" \
     -admin.ui=false -webdav=false \
@@ -132,6 +134,9 @@ EOF
     is_running || fail_start "SeaweedFS exited"
     sleep 1
   done
+  if grep -q "Free Volumes: *0" "${log_file}" 2>/dev/null; then
+    fail_start "SeaweedFS has no free volumes (not enough disk space in ${data_dir} for SEAWEEDFS_VOLUME_MAX=${SEAWEEDFS_VOLUME_MAX} x ${SEAWEEDFS_VOLUME_SIZE_MB} MB volumes?)"
+  fi
   if [[ ${s3_up} -eq 1 ]]; then
     fail_start "SeaweedFS S3 answers on ${endpoint} but bucket '${SEAWEEDFS_BUCKET}' is not accessible with the configured keys in ${SEAWEEDFS_START_TIMEOUT}s (curl $(curl --version | head -1 | cut -d' ' -f2) needs >= 7.75 for --aws-sigv4)"
   fi
