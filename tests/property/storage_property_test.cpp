@@ -35,7 +35,13 @@
 //    is created does not make the storage unusable, querying_only mode
 //    skips broken metadata;
 //  - indexed_event_block splits blocks into events and terminates on any
-//    (damaged) data.
+//    (damaged) data;
+//  - encryption at rest: the model with every KEK / data cipher
+//    combination, independently decrypted on-disk files, the documented
+//    cipher restrictions, switching encryption on / off, the KEK being
+//    required;
+//  - the model on the S3 backend (SeaweedFS, PBT_S3_* environment);
+//  - a long checkpoint_interval does not flush early.
 //
 // Built against pbs_test_binsrv (see tests/property/CMakeLists.txt and
 // extra/qa/todo.md T1).
@@ -59,6 +65,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <tuple>
 #include <csignal>
@@ -68,6 +75,12 @@
 #include <vector>
 
 #include <boost/test/unit_test.hpp>
+
+#include <boost/json/object.hpp>
+#include <boost/json/parse.hpp>
+#include <boost/json/value.hpp>
+
+#include <openssl/evp.h>
 
 #include "binsrv/indexed_event_block.hpp"
 #include "binsrv/main_config.hpp"
@@ -166,10 +179,26 @@ private:
   fs::path path_;
 };
 
+struct keyring_key {
+  std::string id;
+  std::string cipher;
+  bytes data;
+};
+
 struct storage_settings {
   bool gtid_mode{};
   // storage.checkpoint_size in bytes (0: not set)
   std::uint64_t checkpoint_size{};
+  // storage.checkpoint_interval (not set when empty)
+  std::string checkpoint_interval{};
+  // keyring file content (no keyring section when empty)
+  std::vector<keyring_key> keyring{};
+  // storage.encryption: KEK id and data cipher (no section when empty)
+  std::string kek_id{};
+  std::string data_cipher{};
+  // storage.uri of an S3 backend (filesystem backend in <dir>/vault when
+  // empty)
+  std::string s3_uri{};
 };
 
 // main_config for a filesystem storage in <directory>/vault
@@ -189,11 +218,44 @@ make_config(const temporary_directory &directory,
        << (settings.gtid_mode ? "gtid" : "position") << R"("},
   "replication_source": {"port": 3307, "read_timeout": 1, "write_timeout": 1,
                          "authentication": {"user": "u", "password": "p",
-                                            "plugin": "caching_sha2_password"}},
+                                            "plugin": "caching_sha2_password"}},)";
+  if (!settings.keyring.empty()) {
+    const auto keyring_path{directory.path() / "keyring.json"};
+    std::ostringstream keyring;
+    keyring << R"({"version": 1, "keys": [)";
+    for (std::size_t i{0U}; i < settings.keyring.size(); ++i) {
+      const auto &key{settings.keyring[i]};
+      keyring << (i == 0U ? "" : ", ") << R"({"id": ")" << key.id
+              << R"(", "cipher": ")" << key.cipher << R"(", "data_hex": ")"
+              << hex(key.data) << R"("})";
+    }
+    keyring << "]}\n";
+    std::ofstream output{keyring_path};
+    output << keyring.str();
+    json << R"(
+  "keyring": {"uri": "file://)"
+         << keyring_path.generic_string() << R"("},)";
+  }
+  if (settings.s3_uri.empty()) {
+    json << R"(
   "storage": {"backend": "file", "uri": "file://)"
-       << vault.generic_string() << '"';
+         << vault.generic_string() << '"';
+  } else {
+    json << R"(
+  "storage": {"backend": "s3", "uri": ")"
+         << settings.s3_uri << '"';
+  }
   if (settings.checkpoint_size != 0U) {
     json << R"(, "checkpoint_size": ")" << settings.checkpoint_size << '"';
+  }
+  if (!settings.checkpoint_interval.empty()) {
+    json << R"(, "checkpoint_interval": ")" << settings.checkpoint_interval
+         << '"';
+  }
+  if (!settings.kek_id.empty()) {
+    json << R"(, "encryption": {"format": "generic", "kek_id": ")"
+         << settings.kek_id << R"(", "cipher": ")" << settings.data_cipher
+         << R"("})";
   }
   json << "}\n}\n";
   const auto config_path{directory.path() / "config.json"};
@@ -221,6 +283,111 @@ binsrv::gtids::uuid to_uuid(const model::raw_uuid &raw) {
 }
 
 // ---------------------------------------------------------------------------
+// independent decryption oracle (OpenSSL EVP + the metadata JSON)
+// ---------------------------------------------------------------------------
+bytes from_hex(std::string_view text) {
+  const auto digit{[](char value) -> std::uint8_t {
+    if (value >= '0' && value <= '9') {
+      return static_cast<std::uint8_t>(value - '0');
+    }
+    if (value >= 'a' && value <= 'f') {
+      return static_cast<std::uint8_t>(value - 'a' + 10);
+    }
+    if (value >= 'A' && value <= 'F') {
+      return static_cast<std::uint8_t>(value - 'A' + 10);
+    }
+    throw std::invalid_argument{"invalid hex digit"};
+  }};
+  bytes result;
+  for (std::size_t i{0U}; i + 1U < text.size(); i += 2U) {
+    result.push_back(
+        static_cast<std::uint8_t>((digit(text[i]) << 4U) | digit(text[i + 1U])));
+  }
+  return result;
+}
+
+bytes evp_decrypt(const std::string &cipher_name, const bytes &key,
+                  const bytes &iv, const bytes &tag, const bytes &input) {
+  const EVP_CIPHER *cipher{EVP_get_cipherbyname(cipher_name.c_str())};
+  pbt::require(cipher != nullptr, "oracle: unknown cipher " + cipher_name);
+  const std::unique_ptr<EVP_CIPHER_CTX, decltype(&EVP_CIPHER_CTX_free)> ctx{
+      EVP_CIPHER_CTX_new(), &EVP_CIPHER_CTX_free};
+  pbt::require(EVP_DecryptInit_ex(ctx.get(), cipher, nullptr, key.data(),
+                                  iv.empty() ? nullptr : iv.data()) == 1,
+               "oracle: EVP_DecryptInit_ex");
+  EVP_CIPHER_CTX_set_padding(ctx.get(), 0);
+  bytes output(input.size() + 32U);
+  int length{0};
+  pbt::require(EVP_DecryptUpdate(ctx.get(), output.data(), &length,
+                                 input.data(),
+                                 static_cast<int>(input.size())) == 1,
+               "oracle: EVP_DecryptUpdate");
+  auto total{static_cast<std::size_t>(length)};
+  if (!tag.empty()) {
+    pbt::require(
+        EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_AEAD_SET_TAG,
+                            static_cast<int>(tag.size()),
+                            // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
+                            const_cast<std::uint8_t *>(tag.data())) == 1,
+        "oracle: set tag");
+  }
+  pbt::require(EVP_DecryptFinal_ex(ctx.get(), output.data() + total, &length) ==
+                   1,
+               "oracle: EVP_DecryptFinal_ex (authentication)");
+  total += static_cast<std::size_t>(length);
+  output.resize(total);
+  return output;
+}
+
+std::optional<bytes> optional_hex(const boost::json::object &object,
+                                  std::string_view key) {
+  const auto *value{object.if_contains(key)};
+  if (value == nullptr || value->is_null()) {
+    return std::nullopt;
+  }
+  return from_hex(value->as_string());
+}
+
+// The plaintext of a stored binlog file, decrypted with the KEK from the
+// keyring and the envelopes in <binlog>.json, following the README
+// ("encryption at rest"): file key = KEK-decrypt(file_key_envelope),
+// data = <file_data_envelope.cipher>-decrypt(file key, iv) from offset 0.
+// Returns the file content unchanged for an unencrypted binlog.
+bytes stored_plaintext(const temporary_directory &directory,
+                       const storage_settings &settings,
+                       const std::string &binlog_name, bool &encrypted) {
+  const auto data{read_file(directory.path() / "vault" / binlog_name)};
+  const auto metadata_bytes{
+      read_file(directory.path() / "vault" / (binlog_name + ".json"))};
+  const std::string metadata_text(metadata_bytes.begin(), metadata_bytes.end());
+  const auto metadata{boost::json::parse(metadata_text).as_object()};
+  const auto *encryption{metadata.if_contains("encryption")};
+  encrypted = encryption != nullptr && !encryption->is_null();
+  if (!encrypted) {
+    return data;
+  }
+  const auto &key_envelope{
+      encryption->as_object().at("file_key_envelope").as_object()};
+  const auto &data_envelope{
+      encryption->as_object().at("file_data_envelope").as_object()};
+  const std::string kek_id{key_envelope.at("kek_id").as_string()};
+  const auto kek{std::ranges::find_if(settings.keyring,
+                                      [&kek_id](const keyring_key &key) {
+                                        return key.id == kek_id;
+                                      })};
+  pbt::require(kek != settings.keyring.end(),
+               "oracle: KEK of the binlog is in the keyring");
+  const auto file_key{evp_decrypt(
+      kek->cipher, kek->data,
+      optional_hex(key_envelope, "iv_hex").value_or(bytes{}),
+      optional_hex(key_envelope, "tag_hex").value_or(bytes{}),
+      from_hex(key_envelope.at("data_hex").as_string()))};
+  return evp_decrypt(std::string{data_envelope.at("cipher").as_string()},
+                     file_key, from_hex(data_envelope.at("iv_hex").as_string()),
+                     {}, data);
+}
+
+// ---------------------------------------------------------------------------
 // model
 // ---------------------------------------------------------------------------
 struct model_file {
@@ -230,6 +397,8 @@ struct model_file {
   binsrv::gtids::gtid_set added_gtids;
   util::ctime_timestamp_range timestamps;
   binsrv::events::seq_no_t last_sequence_number{0U};
+  // created while storage.encryption was configured
+  bool encrypted{false};
 };
 
 struct storage_model {
@@ -291,7 +460,8 @@ struct storage_model {
                       .previous_gtids = all_gtids(),
                       .added_gtids = {},
                       .timestamps = {},
-                      .last_sequence_number = 0U};
+                      .last_sequence_number = 0U,
+                      .encrypted = !settings.kek_id.empty()};
       files.push_back(std::move(file));
       ready_sequence_number = 0U;
       incomplete_sequence_number = 0U;
@@ -410,25 +580,45 @@ void check_reported_state(const binsrv::storage &storage,
 }
 
 // what is persisted must be exactly the flushed data
+void check_fetched_binlog(const binsrv::storage &storage,
+                          const model_file &file) {
+  auto name{file.name};
+  // length 0 for a file without events (offset == size would continue into
+  // the next file)
+  util::byte_range range{binsrv::events::magic_binlog_offset,
+                         file.flushed.size() -
+                             binsrv::events::magic_binlog_offset};
+  util::dynamic_byte_buffer buffer;
+  pbt::require(storage.fetch_event_block(name, range, buffer),
+               "fetch_event_block() of a whole binlog succeeds");
+  const bytes payload(file.flushed.begin() + 4, file.flushed.end());
+  pbt::require_equal(hex(to_bytes(buffer)), hex(payload),
+                     "fetch_event_block() returns the flushed data");
+}
+
 void check_persisted_state(const temporary_directory &directory,
                            const binsrv::storage &storage,
                            const storage_model &expected) {
   for (const auto &file : expected.files) {
-    const auto on_disk{read_file(directory.path() / "vault" / file.name.str())};
-    pbt::require_equal(hex(on_disk), hex(file.flushed),
+    if (!expected.settings.s3_uri.empty()) {
+      // S3: the objects are checked through fetch_event_block() only
+      check_fetched_binlog(storage, file);
+      continue;
+    }
+    bool encrypted{false};
+    const auto plaintext{stored_plaintext(directory, expected.settings,
+                                          file.name.str(), encrypted)};
+    pbt::require_equal(encrypted, file.encrypted,
+                       "binlog encrypted exactly when it was created with "
+                       "encryption enabled");
+    pbt::require_equal(hex(plaintext), hex(file.flushed),
                        "binlog file content on disk = flushed data");
-    auto name{file.name};
-    // length 0 for a file without events (offset == size would continue
-    // into the next file)
-    util::byte_range range{binsrv::events::magic_binlog_offset,
-                           file.flushed.size() -
-                               binsrv::events::magic_binlog_offset};
-    util::dynamic_byte_buffer buffer;
-    pbt::require(storage.fetch_event_block(name, range, buffer),
-                 "fetch_event_block() of a whole binlog succeeds");
-    const bytes payload(file.flushed.begin() + 4, file.flushed.end());
-    pbt::require_equal(hex(to_bytes(buffer)), hex(payload),
-                       "fetch_event_block() returns the flushed data");
+    if (encrypted) {
+      pbt::require(read_file(directory.path() / "vault" / file.name.str()) !=
+                       file.flushed,
+                   "encrypted binlog is not stored in plaintext");
+    }
+    check_fetched_binlog(storage, file);
   }
 }
 
@@ -471,11 +661,12 @@ gs::Generator<binsrv::gtids::gtid> gtids() {
 // operation the storage reports the model's state; after every restart
 // (and at the end) the files and fetch_event_block() hold exactly the
 // flushed bytes.
-BOOST_AUTO_TEST_CASE(StorageMatchesModel) {
-  pbt::check(
-      [](hegel::TestCase &tc) {
+namespace {
+
+void run_storage_model(hegel::TestCase &tc, const storage_settings &base) {
         const temporary_directory directory;
         storage_model expected;
+        expected.settings = base;
         expected.settings.gtid_mode = tc.draw("gtid_mode", gs::booleans());
         expected.settings.checkpoint_size = tc.draw(
             "checkpoint_size",
@@ -581,8 +772,41 @@ BOOST_AUTO_TEST_CASE(StorageMatchesModel) {
         storage = make_storage(*config);
         check_reported_state(*storage, expected);
         check_persisted_state(directory, *storage, expected);
-      },
-      {.test_cases = 300U});
+
+        // random ranges inside the binlogs read back the flushed bytes
+        // (for encrypted binlogs: CTR decryption from any offset)
+        for (const auto &file : expected.files) {
+          if (file.flushed.size() <= binsrv::events::magic_binlog_offset) {
+            continue;
+          }
+          const auto offset{tc.draw(
+              "fetch_offset",
+              gs::integers<std::uint64_t>(
+                  {.min_value = binsrv::events::magic_binlog_offset,
+                   .max_value = file.flushed.size() - 1U}))};
+          const auto length{tc.draw(
+              "fetch_length",
+              gs::integers<std::uint64_t>(
+                  {.min_value = 1U, .max_value = file.flushed.size() - offset}))};
+          auto name{file.name};
+          util::byte_range range{offset, length};
+          util::dynamic_byte_buffer buffer;
+          pbt::require(storage->fetch_event_block(name, range, buffer),
+                       "fetch_event_block() of a range succeeds");
+          const auto first{file.flushed.begin() +
+                           static_cast<std::ptrdiff_t>(offset)};
+          pbt::require_equal(
+              hex(to_bytes(buffer)),
+              hex(bytes(first, first + static_cast<std::ptrdiff_t>(length))),
+              "fetch_event_block() of a range returns the flushed bytes");
+        }
+}
+
+} // namespace
+
+BOOST_AUTO_TEST_CASE(StorageMatchesModel) {
+  pbt::check([](hegel::TestCase &tc) { run_storage_model(tc, {}); },
+             {.test_cases = 300U});
 }
 
 // ===========================================================================
@@ -776,6 +1000,30 @@ void populate(const binsrv::main_config &config, storage_model &expected,
       storage->write_event(cspan(data), true, gtid, timestamp, t + 1U);
       expected.write(data, true, gtid, timestamp, t + 1U);
     }
+    storage->close_binlog();
+    expected.close();
+  }
+  storage.reset();
+  expected.restart();
+}
+
+// like populate(), appending binlogs after the existing ones
+void populate_more(const binsrv::main_config &config, storage_model &expected,
+                   hegel::TestCase &tc, std::size_t number_of_files) {
+  auto storage{make_storage(config)};
+  const auto first_number{expected.files.empty()
+                              ? 1U
+                              : expected.files.back().name.get_sequence_number() + 1U};
+  for (std::size_t i{0U}; i < number_of_files; ++i) {
+    const binsrv::events::composite_binlog_name name{
+        "binlog", static_cast<std::uint32_t>(first_number + i)};
+    std::ignore = storage->open_binlog(name);
+    expected.open_binlog(name);
+    const auto data{
+        tc.draw("event", gs::binary({.min_size = 1U, .max_size = 32U}))};
+    const auto gtid{tc.draw("gtid", gtids())};
+    storage->write_event(cspan(data), true, gtid, util::ctime_timestamp{7}, 1U);
+    expected.write(data, true, gtid, util::ctime_timestamp{7}, 1U);
     storage->close_binlog();
     expected.close();
   }
@@ -1277,4 +1525,246 @@ BOOST_AUTO_TEST_CASE(QueryingOnlyModeSkipsBrokenMetadata) {
                      "records are the binlogs with readable metadata");
       },
       {.test_cases = 200U});
+}
+
+// ===========================================================================
+// encryption at rest
+// ===========================================================================
+namespace {
+
+const std::vector<std::string> &kek_ciphers() {
+  static const std::vector<std::string> ciphers{
+      "AES-128-ECB", "AES-256-ECB", "AES-128-CBC",  "AES-256-CBC",
+      "AES-128-GCM", "AES-256-GCM", "AES-256-CTR",  "ARIA-256-GCM",
+      "CAMELLIA-128-CBC"};
+  return ciphers;
+}
+
+const std::vector<std::string> &data_ciphers() {
+  static const std::vector<std::string> ciphers{
+      "AES-128-CTR",  "AES-192-CTR",      "AES-256-CTR",     "ARIA-128-CTR",
+      "ARIA-192-CTR", "CAMELLIA-128-CTR", "CAMELLIA-256-CTR"};
+  return ciphers;
+}
+
+std::size_t key_size(const std::string &cipher) {
+  const EVP_CIPHER *evp{EVP_get_cipherbyname(cipher.c_str())};
+  if (evp == nullptr) {
+    throw std::invalid_argument{"unknown cipher " + cipher};
+  }
+  return static_cast<std::size_t>(EVP_CIPHER_get_key_length(evp));
+}
+
+// README: an ECB / CBC KEK can only wrap file keys whose length is a
+// multiple of 16 bytes (so not the 24-byte keys of 192-bit data ciphers)
+bool compatible(const std::string &kek_cipher, const std::string &data_cipher) {
+  const bool block_mode{kek_cipher.ends_with("-ECB") ||
+                        kek_cipher.ends_with("-CBC")};
+  return !block_mode || key_size(data_cipher) % 16U == 0U;
+}
+
+keyring_key draw_key(hegel::TestCase &tc, const std::string &id,
+                     const std::string &cipher) {
+  const auto size{key_size(cipher)};
+  return {id, cipher,
+          tc.draw("key_" + id, gs::binary({.min_size = size, .max_size = size}))};
+}
+
+// a keyring with the KEK "kek" (and an unrelated key) and encryption enabled
+storage_settings draw_encryption(hegel::TestCase &tc, bool compatible_only) {
+  storage_settings settings;
+  const auto kek_cipher{tc.draw("kek_cipher", gs::sampled_from(kek_ciphers()))};
+  auto data_cipher{tc.draw("data_cipher", gs::sampled_from(data_ciphers()))};
+  if (compatible_only && !compatible(kek_cipher, data_cipher)) {
+    data_cipher = "AES-256-CTR";
+  }
+  settings.keyring.push_back(draw_key(tc, "other", "AES-256-GCM"));
+  settings.keyring.push_back(draw_key(tc, "kek", kek_cipher));
+  settings.kek_id = "kek";
+  settings.data_cipher = data_cipher;
+  return settings;
+}
+
+} // namespace
+
+// The stateful storage model with storage.encryption enabled, for every
+// supported combination of KEK cipher (ECB, CBC, GCM, CTR; AES, ARIA,
+// CAMELLIA) and data cipher (CTR, 128 / 192 / 256 bits). Everything the
+// storage reports is unchanged by encryption, the files on disk are not the
+// plaintext, decrypting them independently (OpenSSL + the envelopes in the
+// binlog metadata) gives exactly the flushed data, and fetch_event_block()
+// returns the plaintext for any range - also for binlogs appended to after a
+// restart (CTR encryption continued at an offset).
+BOOST_AUTO_TEST_CASE(EncryptedStorageMatchesModel) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        run_storage_model(tc, draw_encryption(tc, true));
+      },
+      {.test_cases = 300U});
+}
+
+// An ECB / CBC KEK cannot wrap a 24-byte file key, so such a KEK together
+// with a 192-bit data cipher is rejected when the storage is created
+// (README "storage.encryption"), not at the first binlog.
+BOOST_AUTO_TEST_CASE(IncompatibleKekAndDataCipherIsRejected) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        const temporary_directory directory;
+        auto settings{draw_encryption(tc, false)};
+        settings.keyring.back() = draw_key(
+            tc, "kek",
+            tc.draw("block_kek_cipher",
+                    gs::sampled_from<std::string>(
+                        {"AES-128-ECB", "AES-256-ECB", "AES-128-CBC",
+                         "AES-256-CBC", "CAMELLIA-128-CBC"})));
+        settings.data_cipher = tc.draw(
+            "data_cipher_192",
+            gs::sampled_from<std::string>({"AES-192-CTR", "ARIA-192-CTR"}));
+        const auto config{make_config(directory, settings)};
+        pbt::require_throws<std::runtime_error>(
+            [&] { std::ignore = make_storage(*config); },
+            "incompatible KEK / data cipher must be rejected");
+      },
+      {.test_cases = 50U});
+}
+
+// Encryption can be switched on or off for an existing storage: binlogs
+// keep the format they were created with, new binlogs follow the current
+// configuration, and all of them read back. A storage that has encrypted
+// binlogs cannot be opened without a keyring that holds their KEK (README:
+// the keyring section "must be present if the storage has at least one
+// encrypted binlog file").
+BOOST_AUTO_TEST_CASE(EncryptionCanBeToggledButNeedsTheKek) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        const temporary_directory directory;
+        storage_model expected;
+        const auto encryption{draw_encryption(tc, true)};
+        const bool encrypted_first{tc.draw("encrypted_first", gs::booleans())};
+        storage_settings first{encrypted_first ? encryption : storage_settings{}};
+        storage_settings second{encrypted_first ? storage_settings{}
+                                                : encryption};
+        first.gtid_mode = second.gtid_mode = tc.draw("gtid_mode", gs::booleans());
+        if (encrypted_first) {
+          // the KEK must stay available after encryption is switched off
+          second.keyring = encryption.keyring;
+        }
+        expected.settings = first;
+        populate(*make_config(directory, first), expected, tc,
+                 tc.draw("files_before", gs::integers<std::size_t>(
+                                             {.min_value = 1U, .max_value = 2U})));
+        expected.settings = second;
+        const auto second_config{make_config(directory, second)};
+        populate_more(*second_config, expected, tc,
+                      tc.draw("files_after", gs::integers<std::size_t>(
+                                                 {.min_value = 1U,
+                                                  .max_value = 2U})));
+        {
+          const auto reopened{make_storage(*second_config)};
+          check_reported_state(*reopened, expected);
+          check_persisted_state(directory, *reopened, expected);
+        }
+
+        // without the KEK the encrypted binlogs cannot be used
+        storage_settings without{second};
+        without.kek_id.clear();
+        if (tc.draw("drop_whole_keyring", gs::booleans())) {
+          without.keyring.clear();
+        } else {
+          std::erase_if(without.keyring,
+                        [](const keyring_key &key) { return key.id == "kek"; });
+        }
+        const auto config_without{make_config(directory, without)};
+        pbt::require_throws<std::logic_error>(
+            [&] { std::ignore = make_storage(*config_without); },
+            "storage with encrypted binlogs must not open without their KEK");
+      },
+      {.test_cases = 100U});
+}
+
+// ===========================================================================
+// S3 backend (SeaweedFS)
+// ===========================================================================
+namespace {
+
+// storage.uri for a fresh prefix in the S3 bucket given by PBT_S3_* (set by
+// run_property_tests.py, which starts SeaweedFS with extra/qa/seaweedfs.sh)
+std::string s3_uri_for(const temporary_directory &directory) {
+  const auto endpoint{pbt::detail::env("PBT_S3_ENDPOINT")};
+  const auto access_key{pbt::detail::env("PBT_S3_ACCESS_KEY")};
+  const auto secret_key{pbt::detail::env("PBT_S3_SECRET_KEY")};
+  const auto bucket{pbt::detail::env("PBT_S3_BUCKET")};
+  if (!endpoint || !access_key || !secret_key || !bucket) {
+    pbt::infrastructure_error(
+        "S3 endpoint not configured: set PBT_S3_ENDPOINT / _ACCESS_KEY / "
+        "_SECRET_KEY / _BUCKET (extra/qa/seaweedfs.sh env)");
+  }
+  const auto scheme_end{endpoint->find("://")};
+  if (scheme_end == std::string::npos) {
+    pbt::infrastructure_error("PBT_S3_ENDPOINT must be http[s]://host:port");
+  }
+  // README: http[s]://key:secret@host[:port]/bucket/path
+  return endpoint->substr(0U, scheme_end + 3U) + *access_key + ":" +
+         *secret_key + "@" + endpoint->substr(scheme_end + 3U) + "/" +
+         *bucket + "/" + directory.path().filename().string();
+}
+
+} // namespace
+
+// The stateful storage model on the S3 backend: the same operation sequences
+// give the same observable state as on the filesystem (records, positions,
+// GTIDs, data read back after every restart and for random ranges), with
+// and without encryption. Every case uses its own prefix in the bucket.
+BOOST_AUTO_TEST_CASE(StorageMatchesModelOnS3) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        const temporary_directory prefix_source;
+        storage_settings settings{};
+        if (tc.draw("encrypted", gs::booleans())) {
+          settings = draw_encryption(tc, true);
+        }
+        settings.s3_uri = s3_uri_for(prefix_source);
+        run_storage_model(tc, settings);
+      },
+      {.test_cases = 100U});
+}
+
+// ===========================================================================
+// checkpoint interval
+// ===========================================================================
+
+// storage.checkpoint_interval accepts any 64-bit number of seconds
+// (time_unit, README "/\d+[smhd]?/"). A complete transaction written right
+// after opening a binlog must not be flushed by the interval checkpoint
+// before the interval has elapsed - also for intervals so long that they
+// do not fit into std::chrono::steady_clock::duration (nanoseconds, about
+// 292 years). Interval checkpoints themselves need a clock seam (todo.md
+// T2); this only checks the "not yet" side, which needs no waiting.
+BOOST_AUTO_TEST_CASE(LongCheckpointIntervalDoesNotFlushEarly) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        const temporary_directory directory;
+        storage_settings settings;
+        settings.checkpoint_interval = tc.draw(
+            "checkpoint_interval",
+            gs::sampled_from<std::string>(
+                {"1h", "30d", "36500d", "106751d", "106752d", "1000000d",
+                 "9223372036s", "9223372037s", "9223372036854775807s",
+                 "9223372036854775808s", "18446744073709551615s",
+                 "213503982334601d"}));
+        const auto config{make_config(directory, settings)};
+        const auto storage{make_storage(*config)};
+        const binsrv::events::composite_binlog_name name{"binlog", 1U};
+        std::ignore = storage->open_binlog(name);
+        const auto data{
+            tc.draw("event", gs::binary({.min_size = 1U, .max_size = 32U}))};
+        storage->write_event(cspan(data), true, {}, util::ctime_timestamp{1},
+                             1U);
+        const auto records{storage->get_binlog_records()};
+        pbt::require_equal(records.back().size,
+                           binsrv::events::magic_binlog_offset,
+                           "transaction flushed before the checkpoint "
+                           "interval elapsed");
+      },
+      {.test_cases = 100U});
 }

@@ -103,6 +103,13 @@ Properties that need temporary files (storage tests) create them under
 at the end, so nothing is written outside `WORKDIR`. When you run a test
 executable by hand, set `TMPDIR` yourself.
 
+Properties whose name contains `S3` need an S3 endpoint. By default
+(`--s3 auto`) the runner uses the `PBT_S3_*` variables from the
+environment. If they are not set, it starts SeaweedFS
+(`extra/qa/seaweedfs.sh start`, installed by `setup_pbt_env.sh`), then
+stops and wipes it after the run. `--s3 off` skips these properties. To
+run one of them by hand: `eval "$(extra/qa/seaweedfs.sh env)"`.
+
 `storage_property_test` links the server sources through the
 `pbs_test_binsrv` test library (todo.md T1). It needs the same dependencies
 as `binlog_server` (MySQL client library, AWS SDK, Boost).
