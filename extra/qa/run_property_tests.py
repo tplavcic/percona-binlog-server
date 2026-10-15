@@ -808,6 +808,11 @@ def main() -> int:
     env.setdefault("UBSAN_OPTIONS", "print_stacktrace=1:halt_on_error=0")
     env.setdefault("ASAN_OPTIONS", "detect_leaks=1:abort_on_error=0")
     env.setdefault("TSAN_OPTIONS", "halt_on_error=1:second_deadlock_stack=1")
+    # the AWS SDK otherwise probes the EC2 instance metadata service for a
+    # region / credentials every time an S3 client is created (every
+    # storage construction), which can cost seconds per probe on hosts
+    # where 169.254.169.254 does not answer
+    env.setdefault("AWS_EC2_METADATA_DISABLED", "true")
     started_seaweedfs, s3_problem = False, ""
     if any("S3" in name for _, name in planned) and \
             "PBT_S3_ENDPOINT" not in env:
