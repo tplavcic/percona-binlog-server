@@ -348,6 +348,9 @@ def run_property(exe: Executable, name: str, args, env: Dict[str, str],
         elif leak and result.status == "passed":
             result.status, result.kind = "failed", "sanitizer"
             sanitizer = leak
+    if result.kind == "infra":
+        # keep the PBT_INFRA reason, no failure analysis
+        return result
     if result.status != "passed":
         crash_message = result.message if result.kind == "crash" else ""
         extract_failure(log_text, result)
@@ -558,6 +561,17 @@ def write_markdown(path: Path, summary: Dict, results: List[Result],
             lines.append(f"- reproduce: `{reproduce_command(res, build_dir)}`")
             lines.append("")
 
+    if info.get("s3_problem"):
+        lines.extend([f"S3 endpoint for the S3 properties: not available - "
+                      f"{info['s3_problem']}", ""])
+    errors = [r for r in results if r.status == "error"]
+    if errors:
+        lines.extend(["## Errors (the test could not run)", "",
+                      "| test | message |", "|---|---|"])
+        for res in errors:
+            lines.append(f"| `{res.test_id}` | "
+                         f"{res.message.replace('|', '/')} |")
+        lines.append("")
     section("New issues", [r for r in results if r.classification == "new"])
     section("Regressions (known bug marked fixed fails again)",
             sorted((r for r in results if r.classification == "regression"),
@@ -625,23 +639,26 @@ def seaweedfs(env: Dict[str, str], workdir: Path, *command: str):
                           check=False)
 
 
-def ensure_seaweedfs(env: Dict[str, str], workdir: Path) -> bool:
-    """Puts PBT_S3_* into env, starting SeaweedFS if needed; returns
-    whether it was started here. On failure the S3 properties report an
-    infrastructure error."""
+def ensure_seaweedfs(env: Dict[str, str], workdir: Path):
+    """Puts PBT_S3_* into env, starting SeaweedFS if needed. Returns
+    (started here, problem text or ""). On failure the S3 properties report
+    an infrastructure error and the reason goes into the report."""
     started = False
     if seaweedfs(env, workdir, "status").returncode != 0:
         result = seaweedfs(env, workdir, "start")
         if result.returncode != 0:
-            print("warning: cannot start SeaweedFS for the S3 properties:\n"
-                  + (result.stdout + result.stderr).strip(), file=sys.stderr)
-            return False
+            output = (result.stdout + result.stderr).strip()
+            problem = "cannot start SeaweedFS (extra/qa/seaweedfs.sh start): " + \
+                (output.splitlines()[-1] if output else
+                 f"exit code {result.returncode}")
+            print(f"warning: {problem}", file=sys.stderr)
+            return False, problem
         started = True
     for line in seaweedfs(env, workdir, "env").stdout.splitlines():
         match = re.match(r"export (PBT_S3_\w+)='([^']*)'", line.strip())
         if match:
             env[match.group(1)] = match.group(2)
-    return started
+    return started, ""
 
 
 def main() -> int:
@@ -778,10 +795,10 @@ def main() -> int:
     env.setdefault("UBSAN_OPTIONS", "print_stacktrace=1:halt_on_error=0")
     env.setdefault("ASAN_OPTIONS", "detect_leaks=1:abort_on_error=0")
     env.setdefault("TSAN_OPTIONS", "halt_on_error=1:second_deadlock_stack=1")
-    started_seaweedfs = False
+    started_seaweedfs, s3_problem = False, ""
     if any("S3" in name for _, name in planned) and \
             "PBT_S3_ENDPOINT" not in env:
-        started_seaweedfs = ensure_seaweedfs(env, workdir)
+        started_seaweedfs, s3_problem = ensure_seaweedfs(env, workdir)
 
     # temporary files of the properties (storage tests create binlog
     # directories) stay inside WORKDIR: <run dir>/tmp, removed at the end
@@ -831,6 +848,7 @@ def main() -> int:
         "build_dir": str(build_dir),
         "known_bugs_file": args.known_bugs,
         "knobs": knobs,
+        "s3_problem": s3_problem,
         "command_line": sys.argv,
         **git_info(),
     }
