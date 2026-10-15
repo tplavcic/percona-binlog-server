@@ -126,8 +126,8 @@ Legend:
 | A2 | `util` byte-span codecs: fixed, packed (`pack.cc`) and varlen ints | roundtrip for every width and signedness; `calculate_*_size` equals the bytes written; truncated input returns false without consuming; NULL marker 251 / 255 handling; narrowing extraction fails on overflow | MySQL encodings, re-implemented in the test | ✅ |
 | A3 | `events::composite_binlog_name` | `parse(str())` roundtrip; `next()` increments the sequence number, and 999999 throws; reject an empty base, `/` in the base, a non-6-digit suffix; base names with `\n` (they corrupt `binlog.index`) | README, `storage_core` index format | ✅ |
 | A4 | `opensslpp::cipher_context` | `decrypt(encrypt(x)) == x` for every cipher/mode/padding; for CTR, `create_with_offset(k)` applied to a suffix equals the same suffix of a full encryption (this is how encrypted binlogs are read at random offsets) | OpenSSL as reference | ✅ |
-| A5 | `events::event` / `event_view` / `rewriter` | `create_event` → view → encode is byte-identical; flipping any byte makes CRC verification fail; truncation is rejected; checksum add then remove is the identity; rewritten tagged GTID events still parse, and `transaction_length` stays consistent | MySQL event format | ✅ (rewriter still to do) |
-| A6 | `events::reader_context` | generated valid streams following the documented grammar (`ROTATE FDE PREV_GTIDS? (GTID ANY*)* (ROTATE\|STOP)?`) are accepted; each single grammar mutation (dropped or duplicated FDE, wrong `next_event_position`, wrong `transaction_length`, ANONYMOUS in GTID mode) throws | the grammar in `reader_context.hpp` | 🟢 (stateful) |
+| A5 | `events::event` / `event_view` / `rewriter` | `create_event` → view → encode is byte-identical; flipping any byte makes CRC verification fail; truncation is rejected; checksum add then remove is the identity; rewritten tagged GTID events still parse, and `transaction_length` stays consistent | MySQL event format | ✅ |
+| A6 | `events::reader_context` | generated valid streams following the documented grammar (`ROTATE FDE PREV_GTIDS? (GTID ANY*)* (ROTATE\|STOP)?`) are accepted; each single grammar mutation (dropped or duplicated FDE, wrong `next_event_position`, wrong `transaction_length`, ANONYMOUS in GTID mode) throws | the grammar in `reader_context.hpp` | ✅ |
 | A7 | `util`: semantic_version, hex_value, ctime_timestamp(+range), flag_set, composite_name, crc32 | roundtrips; range is a monoid; crc32 matches zlib and `crc32_combine` | docs and zlib | 🟢 |
 | A8 | `util::nv_tuple` JSON + `models::*` | `from_json(to_json(x)) == x`; unknown keys are ignored; type mismatch throws and names the JSON path | — | 🟢 |
 | A9 | `size_unit`, `time_unit` | `"N<suffix>"` value equals N × multiplier; `to_string` roundtrip; overflow rejected; malformed suffixes rejected | README grammar | 🟡 (todo T1) |
@@ -188,9 +188,9 @@ there is authoritative):
 
 | Severity | Issues |
 |---|---|
-| high | PBT-015, PBT-017 |
+| high | PBT-015, PBT-017, PBT-022 |
 | medium | PBT-001, PBT-002, PBT-004, PBT-012, PBT-013, PBT-016, PBT-019 |
-| low | PBT-003, PBT-005, PBT-006, PBT-007, PBT-008, PBT-009, PBT-010, PBT-011, PBT-014, PBT-018 |
+| low | PBT-003, PBT-005, PBT-006, PBT-007, PBT-008, PBT-009, PBT-010, PBT-011, PBT-014, PBT-018, PBT-020, PBT-021, PBT-023 |
 
 ### GTID sets (prototype run)
 
@@ -253,8 +253,66 @@ The two suites have 5 new findings, `PBT-015`…`PBT-019`:
 From the adversarial review, waiting for later layers:
 - `indexed_event_block` loops forever on `event_size < 19` (B4, needs T1)
 - `binlog.index` order is not validated (B1)
-- 32-bit position truncation for binlogs larger than 4 GiB (A6 / B1)
-- `last_committed < sequence_number` is never validated (A6)
+- 32-bit position truncation for binlogs larger than 4 GiB: the event
+  ending at 2^32 is PBT-023; resuming beyond 4 GiB is still open, because
+  `collector_context` casts the storage position to 32 bits (B1 / D)
+- `last_committed < sequence_number`: `rewriter` rejects violations;
+  `reader_context` does not check it (low, MySQL never writes it)
+
+### Stream state machine and rewriter (sandbox run)
+
+`tests/property/common/event_stream.hpp` models what the MySQL dump thread
+sends (checked against `rpl_binlog_sender.cc` of MySQL 8.4):
+- one to three binlog files, each with an artificial ROTATE,
+  FORMAT_DESCRIPTION and PREVIOUS_GTIDS_LOG;
+- transactions with GTID_LOG, ANONYMOUS_GTID_LOG or GTID_TAGGED_LOG plus
+  opaque events, and ROTATE / STOP / nothing at the end of a file;
+- server versions that only go up across files;
+- per-file CRC32 or none;
+- for the footer of the artificial ROTATE: the client setting first, then
+  the previous FORMAT_DESCRIPTION;
+- resuming inside a file in both replication modes: the pseudo
+  FORMAT_DESCRIPTION with log_pos 0, and the stale FORMAT_DESCRIPTION CRC
+  sent with `binlog_checksum=NONE`.
+
+`reader_context_property_test` has 5 properties:
+- valid streams are accepted with the expected `info_only` / boundary /
+  GTID / sequence number after every event;
+- 18 kinds of single violations are each rejected at or after the
+  violating event, with `std::logic_error`;
+- the preamble ends at a transaction boundary;
+- artificial GTID events are rejected;
+- positions wrap at 4 GiB.
+
+`rewriter_property_test` has 8 properties:
+- byte-level oracles for `materialize` / `materialize_and_relocate` /
+  `rewrite`;
+- sequence number renumbering;
+- GTID_TAGGED_LOG `transaction_length` adjustment;
+- a model of `collector_context` in rewrite mode (one `reader_context`
+  per connection, generated preamble, file switching at
+  `rewrite.file_size`).
+
+There are 4 new findings, `PBT-020`…`PBT-023`:
+- [low] PBT-020: `is_at_transaction_boundary()` is false after the preamble
+  of a new binlog, so it is not checkpointed until the first transaction
+- [low] PBT-021: the artificial flag is accepted on GTID events
+- [high] PBT-022: rewrite mode with `verify_checksum = false` stops at the
+  first transaction of every connection. Found with the collector model;
+  confirm against a real server (layer D).
+- [low] PBT-023: the event that ends exactly at 4 GiB is rejected
+
+Not modelled, so for later:
+- MySQL skipping transactions in GTID mode. The client already has them,
+  and heartbeats are skipped (`MYSQL_RPL_SKIP_HEARTBEAT`). The next event's
+  position then jumps, which `reader_context` rejects outside rewrite
+  mode. That is expected for a source with the same file layout, but it
+  needs a decision for failover to a source with a different layout (D).
+- Reconnects in the collector model (fresh context, non-empty storage)
+  (B / D).
+- Transactions larger than 4 GiB are rejected ("too large"). MySQL itself
+  recommends `max_binlog_cache_size` ≤ 4 GiB, so this is documented, not
+  tested.
 
 ## 6. Open questions
 
