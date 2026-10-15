@@ -239,6 +239,9 @@ inline std::uint64_t scaled(std::uint64_t base) {
 struct check_options {
   // default number of generated test cases for this property
   std::uint64_t test_cases{5000U};
+  // the property does slow I/O (e.g. an S3 server) while drawing its
+  // steps: suppress Hegel's TooSlow health check
+  bool slow{false};
 };
 
 // Runs a Hegel property inside the current Boost.Test test case. The Hegel
@@ -252,6 +255,9 @@ check(const std::function<void(hegel::TestCase &)> &body,
   const auto &boost_tc{boost::unit_test::framework::current_test_case()};
   const std::string test_name{boost_tc.p_name.get()};
   auto settings{detail::make_settings(options.test_cases)};
+  if (options.slow) {
+    settings.suppress_health_check.push_back(hegel::HealthCheck::TooSlow);
+  }
   settings.database_key =
       std::string{
           boost::unit_test::framework::master_test_suite().p_name.get()} +
