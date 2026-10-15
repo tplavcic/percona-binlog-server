@@ -116,3 +116,13 @@ pbs_add_property_test(event_property_test
   SOURCES event_property_test.cpp
   LIBRARIES binsrv::lib_events binsrv::lib_gtids binsrv::lib_util ZLIB::ZLIB
 )
+
+pbs_add_property_test(reader_context_property_test
+  SOURCES reader_context_property_test.cpp
+  LIBRARIES binsrv::lib_events binsrv::lib_gtids binsrv::lib_util ZLIB::ZLIB
+)
+
+pbs_add_property_test(rewriter_property_test
+  SOURCES rewriter_property_test.cpp
+  LIBRARIES binsrv::lib_events binsrv::lib_gtids binsrv::lib_util ZLIB::ZLIB
+)
