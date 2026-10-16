@@ -475,7 +475,7 @@ void apply(sql_connection &sql, const operation &op) {
 void apply_all(hegel::TestCase &tc, sql_connection &sql,
                const std::vector<operation> &ops) {
   for (const auto &op : ops) {
-    tc.note("  " + describe(op));
+    pbt::note(tc, "  " + describe(op));
     apply(sql, op);
   }
 }
@@ -597,7 +597,7 @@ std::string log_tail(const pbs_storage &storage, std::size_t lines = 25U) {
 void fetch(hegel::TestCase &tc, const pbs_storage &storage) {
   const auto result{run({"fetch", storage.config_path})};
   if (result.signaled || result.exit_code != 0) {
-    tc.note("binlog_server log:" + log_tail(storage));
+    pbt::note(tc, "binlog_server log:" + log_tail(storage));
   }
   pbt::require(!result.signaled && result.exit_code == 0,
                "binlog_server fetch failed (" + result.describe() + ")");
@@ -612,7 +612,7 @@ json::object list(hegel::TestCase &tc, const pbs_storage &storage) {
   try {
     parsed = json::parse(result.output);
   } catch (const std::exception &e) {
-    tc.note("list output: " + result.output);
+    pbt::note(tc, "list output: " + result.output);
     pbt::fail(std::string{"list output is not JSON: "} + e.what());
   }
   return parsed.as_object();
@@ -852,7 +852,7 @@ void require_storage_matches_server(
               .transactions != 0U) {
         return false;  // must be stored: reported by the comparison below
       }
-      tc.note("(" + binlog.name + " has no transaction and was not sent "
+      pbt::note(tc, "(" + binlog.name + " has no transaction and was not sent "
               "by the server: GTID auto-positioning)");
       return true;
     });
@@ -882,7 +882,7 @@ void require_storage_matches_server(
           walk(server_file(info, name), "server " + name).transactions == 0U) {
         preamble_only.push_back(name);
         server_binlog_it->size = 4U;
-        tc.note("(PBT-020 tolerated: " + name +
+        pbt::note(tc, "(PBT-020 tolerated: " + name +
                 " stored without its preamble)");
       }
     }
@@ -907,7 +907,7 @@ void require_storage_matches_server(
           expected.compare(0U, actual.size(), actual) == 0) {
         without_rotate.push_back(name);
         server_binlog_it->size = actual.size();
-        tc.note("(PBT-033 tolerated: " + name +
+        pbt::note(tc, "(PBT-033 tolerated: " + name +
                 " stored without the server's final ROTATE / STOP)");
       }
     }
@@ -988,7 +988,7 @@ void start_case(hegel::TestCase &tc, server_session &server) {
   const auto max_binlog_size{tc.draw(
       "max_binlog_size",
       gs::sampled_from<std::uint64_t>({4096U, 16384U, 1073741824U}))};
-  tc.note("server " + server.info.version + ", max_binlog_size " +
+  pbt::note(tc, "server " + server.info.version + ", max_binlog_size " +
           std::to_string(max_binlog_size));
   reset_server(server.sql, server.info, max_binlog_size);
 }
@@ -1036,7 +1036,7 @@ public:
 
   void require_running() {
     if (const auto exited{process_->poll()}; exited) {
-      tc_.note("binlog_server log:" + log_tail(storage_));
+      pbt::note(tc_, "binlog_server log:" + log_tail(storage_));
       pbt::fail("binlog_server pull exited on its own (" + exited->describe() +
                 ")");
     }
@@ -1056,7 +1056,7 @@ public:
     process_->send(SIGTERM);
     const auto [result, in_time]{process_->wait_for(std::chrono::seconds{20})};
     if (!in_time || result.signaled || result.exit_code != 0) {
-      tc_.note("binlog_server log:" + log_tail(storage_));
+      pbt::note(tc_, "binlog_server log:" + log_tail(storage_));
     }
     pbt::require(in_time, "pull did not stop within 20 s of SIGTERM");
     pbt::require(!result.signaled && result.exit_code == 0,
@@ -1111,7 +1111,7 @@ void wait_until_pull_caught_up(hegel::TestCase &tc, sql_connection &sql,
   while (seen < 2U) {
     pull.require_running();
     if (std::chrono::steady_clock::now() >= deadline) {
-      tc.note("(pull did not report catching up in 60 s)");
+      pbt::note(tc, "(pull did not report catching up in 60 s)");
       break;
     }
     seen = all_sent() ? seen + 1U : 0U;
@@ -1242,9 +1242,9 @@ BOOST_AUTO_TEST_CASE(FetchMatchesServerBinlogsMySQL) {
         server_session server;
         start_case(tc, server);
         const auto options{draw_options(tc)};
-        tc.note("binlog_server: " + describe(options));
+        pbt::note(tc, "binlog_server: " + describe(options));
         const auto storage{make_storage(options)};
-        tc.note("workload:");
+        pbt::note(tc, "workload:");
         apply_all(tc, server.sql, draw_workload(tc, server.info, 12U));
         fetch(tc, *storage);
         require_storage_matches_server(tc, server.sql, server.info, *storage);
@@ -1261,9 +1261,9 @@ BOOST_AUTO_TEST_CASE(FetchStoresBinlogWithoutTransactionsMySQL) {
         server_session server;
         start_case(tc, server);
         const auto options{draw_options(tc)};
-        tc.note("binlog_server: " + describe(options));
+        pbt::note(tc, "binlog_server: " + describe(options));
         const auto storage{make_storage(options)};
-        tc.note("workload:");
+        pbt::note(tc, "workload:");
         auto workload{draw_workload(tc, server.info, 4U)};
         workload.push_back(operation{.kind = op_kind::flush});
         apply_all(tc, server.sql, workload);
@@ -1287,12 +1287,12 @@ BOOST_AUTO_TEST_CASE(RepeatedFetchResumesMySQL) {
         server_session server;
         start_case(tc, server);
         const auto options{draw_options(tc)};
-        tc.note("binlog_server: " + describe(options));
+        pbt::note(tc, "binlog_server: " + describe(options));
         const auto storage{make_storage(options)};
         const auto rounds{tc.draw(
             "rounds", gs::integers<std::size_t>({.min_value = 2U, .max_value = 4U}))};
         for (std::size_t round{0U}; round < rounds; ++round) {
-          tc.note("round " + std::to_string(round + 1U) + ":");
+          pbt::note(tc, "round " + std::to_string(round + 1U) + ":");
           apply_all(tc, server.sql, draw_workload(tc, server.info, 5U));
           fetch(tc, *storage);
           require_storage_matches_server(tc, server.sql, server.info, *storage);
@@ -1311,14 +1311,14 @@ BOOST_AUTO_TEST_CASE(GtidResumeStoresRotateEventMySQL) {
         server_session server;
         start_case(tc, server);
         const auto options{draw_options(tc, true)};
-        tc.note("binlog_server: " + describe(options));
+        pbt::note(tc, "binlog_server: " + describe(options));
         const auto storage{make_storage(options)};
-        tc.note("round 1:");
+        pbt::note(tc, "round 1:");
         auto first{draw_workload(tc, server.info, 3U)};
         first.push_back(operation{.kind = op_kind::insert_rows, .count = 1});
         apply_all(tc, server.sql, first);
         fetch(tc, *storage);
-        tc.note("round 2:");
+        pbt::note(tc, "round 2:");
         std::vector<operation> second{operation{.kind = op_kind::flush}};
         const auto more{draw_workload(tc, server.info, 3U)};
         second.insert(second.end(), more.begin(), more.end());
@@ -1347,7 +1347,7 @@ BOOST_AUTO_TEST_CASE(KilledPullResumesMySQL) {
         server_session server;
         start_case(tc, server);
         const auto options{draw_options(tc)};
-        tc.note("binlog_server: " + describe(options));
+        pbt::note(tc, "binlog_server: " + describe(options));
         const auto storage{make_storage(options)};
         pull_process pull{tc, *storage};
         const auto steps{tc.draw(
@@ -1357,12 +1357,12 @@ BOOST_AUTO_TEST_CASE(KilledPullResumesMySQL) {
               "action", gs::sampled_from<std::string>(
                             {"workload", "workload", "sleep", "kill", "stop"}))};
           if (action == "workload") {
-            tc.note("workload:");
+            pbt::note(tc, "workload:");
             apply_all(tc, server.sql, draw_workload(tc, server.info, 3U));
           } else if (action == "sleep") {
             const auto delay{tc.draw("sleep_ms", gs::sampled_from<std::uint64_t>(
                                                      {10U, 100U, 400U, 1500U}))};
-            tc.note("sleep " + std::to_string(delay) + " ms");
+            pbt::note(tc, "sleep " + std::to_string(delay) + " ms");
             wait_ms(delay);
           } else {
             const auto delay{tc.draw(
@@ -1370,10 +1370,10 @@ BOOST_AUTO_TEST_CASE(KilledPullResumesMySQL) {
             wait_ms(delay);
             pull.require_running();
             if (action == "kill") {
-              tc.note("kill -9 pull after " + std::to_string(delay) + " ms");
+              pbt::note(tc, "kill -9 pull after " + std::to_string(delay) + " ms");
               pull.kill();
             } else {
-              tc.note("SIGTERM pull after " + std::to_string(delay) + " ms");
+              pbt::note(tc, "SIGTERM pull after " + std::to_string(delay) + " ms");
               pull.stop();
             }
             pull.launch();
@@ -1381,7 +1381,7 @@ BOOST_AUTO_TEST_CASE(KilledPullResumesMySQL) {
         }
         wait_until_pull_caught_up(tc, server.sql, pull);
         pull.require_running();
-        tc.note("SIGTERM pull, compare, then fetch and compare again");
+        pbt::note(tc, "SIGTERM pull, compare, then fetch and compare again");
         pull.stop();
         require_storage_matches_server(tc, server.sql, server.info, *storage);
         fetch(tc, *storage);
@@ -1404,7 +1404,7 @@ BOOST_AUTO_TEST_CASE(SearchByGtidSetMatchesServerMySQL) {
         start_case(tc, server);
         auto options{draw_options(tc, true)};
         const auto storage{make_storage(options)};
-        tc.note("workload:");
+        pbt::note(tc, "workload:");
         apply_all(tc, server.sql,
                   {operation{.kind = op_kind::insert_rows, .count = 1}});
         apply_all(tc, server.sql, draw_workload(tc, server.info, 10U));
@@ -1431,9 +1431,9 @@ BOOST_AUTO_TEST_CASE(SearchByGtidSetMatchesServerMySQL) {
         }
         std::ranges::sort(expected);
         expected.erase(std::unique(expected.begin(), expected.end()), expected.end());
-        tc.note("search_by_gtid_set " + query.str());
+        pbt::note(tc, "search_by_gtid_set " + query.str());
         const auto result{run({"search_by_gtid_set", storage->config_path, query.str()})};
-        tc.note("output: " + result.output);
+        pbt::note(tc, "output: " + result.output);
         pbt::require(!result.signaled && result.exit_code == 0,
                      "search_by_gtid_set failed (" + result.describe() + ")");
         const auto response{json::parse(result.output).as_object()};
@@ -1469,12 +1469,12 @@ void check_rewrite_mode(hegel::TestCase &tc, bool verify_checksum) {
         options.verify_checksum = verify_checksum;
         options.rewrite_file_size = tc.draw(
             "file_size", gs::sampled_from<std::string>({"1K", "4K", "64K"}));
-        tc.note("binlog_server: " + describe(options));
+        pbt::note(tc, "binlog_server: " + describe(options));
         const auto storage{make_storage(options)};
         const auto rounds{tc.draw(
             "rounds", gs::integers<std::size_t>({.min_value = 1U, .max_value = 3U}))};
         for (std::size_t round{0U}; round < rounds; ++round) {
-          tc.note("round " + std::to_string(round + 1U) + ":");
+          pbt::note(tc, "round " + std::to_string(round + 1U) + ":");
           apply_all(tc, server.sql, draw_workload(tc, server.info, 8U));
           fetch(tc, *storage);
         }
@@ -1580,9 +1580,9 @@ BOOST_AUTO_TEST_CASE(ListenerServesServerEventsMySQL) {
         server_session server;
         start_case(tc, server);
         const auto options{draw_options(tc)};
-        tc.note("binlog_server: " + describe(options));
+        pbt::note(tc, "binlog_server: " + describe(options));
         const auto storage{make_storage(options)};
-        tc.note("workload:");
+        pbt::note(tc, "workload:");
         auto workload{draw_workload(tc, server.info, 10U)};
         // the newest binlog ends with a transaction (PBT-020)
         workload.push_back(operation{.kind = op_kind::insert_rows, .count = 1});
@@ -1602,7 +1602,7 @@ BOOST_AUTO_TEST_CASE(ListenerServesServerEventsMySQL) {
         const auto position{offsets[tc.draw(
             "event", gs::integers<std::size_t>({.max_value = offsets.size() - 1U}))]};
         const auto checksum{tc.draw("checksum", gs::booleans())};
-        tc.note("dump from " + file + ":" + std::to_string(position) +
+        pbt::note(tc, "dump from " + file + ":" + std::to_string(position) +
                 (checksum ? ", CRC32" : ", NONE"));
 
         pull_process pull{tc, *storage};
@@ -1621,7 +1621,7 @@ BOOST_AUTO_TEST_CASE(ListenerServesServerEventsMySQL) {
         pbt::require(direct.events.size() >= 2U,
                      "the server's dump starts with ROTATE and "
                      "FORMAT_DESCRIPTION");
-        tc.note("server sent " + std::to_string(direct.events.size()) +
+        pbt::note(tc, "server sent " + std::to_string(direct.events.size()) +
                 " events, the listener " + std::to_string(served.events.size()));
         pbt::require(served.error.empty(),
                      "dump from the replication source listener failed: " +
@@ -1629,7 +1629,7 @@ BOOST_AUTO_TEST_CASE(ListenerServesServerEventsMySQL) {
         const auto common{std::min(direct.events.size(), served.events.size())};
         for (std::size_t i{0U}; i < common; ++i) {
           if (direct.events[i] != served.events[i]) {
-            tc.note("event " + std::to_string(i) + ": server " +
+            pbt::note(tc, "event " + std::to_string(i) + ": server " +
                     describe_event(direct.events[i]) + "; listener " +
                     describe_event(served.events[i]) + "; " +
                     first_difference(direct.events[i], served.events[i]));
@@ -1716,7 +1716,7 @@ BOOST_AUTO_TEST_CASE(ReplicaOfListenerMatchesSourceMySQL) {
         replica_session replica;
         start_case(tc, server);
         const auto options{draw_options(tc)};
-        tc.note("binlog_server: " + describe(options));
+        pbt::note(tc, "binlog_server: " + describe(options));
         const auto storage{make_storage(options)};
         pull_process pull{tc, *storage};
         pull.wait_until_listening();
@@ -1733,9 +1733,9 @@ BOOST_AUTO_TEST_CASE(ReplicaOfListenerMatchesSourceMySQL) {
           const auto io_error{field(status, "Last_IO_Error")};
           const auto sql_error{field(status, "Last_SQL_Error")};
           if (!io_error.empty() || !sql_error.empty()) {
-            tc.note("Last_IO_Error: " + io_error);
-            tc.note("Last_SQL_Error: " + sql_error);
-            tc.note("binlog_server log:" + log_tail(*storage));
+            pbt::note(tc, "Last_IO_Error: " + io_error);
+            pbt::note(tc, "Last_SQL_Error: " + sql_error);
+            pbt::note(tc, "binlog_server log:" + log_tail(*storage));
           }
           pbt::require(io_error.empty(), "replica I/O thread error: " + io_error);
           pbt::require(sql_error.empty(), "replica SQL thread error: " + sql_error);
@@ -1758,7 +1758,7 @@ BOOST_AUTO_TEST_CASE(ReplicaOfListenerMatchesSourceMySQL) {
             wait_ms(50U);
           }
         }
-        tc.note("workload while replicating:");
+        pbt::note(tc, "workload while replicating:");
         auto workload{draw_workload(tc, server.info, 8U)};
         workload.push_back(operation{.kind = op_kind::insert_rows, .count = 1});
         apply_all(tc, server.sql, workload);
@@ -1801,7 +1801,7 @@ BOOST_AUTO_TEST_CASE(ServerRestartDuringPullMySQL) {
         auto server{std::make_unique<server_session>()};
         start_case(tc, *server);
         const auto options{draw_options(tc)};
-        tc.note("binlog_server: " + describe(options));
+        pbt::note(tc, "binlog_server: " + describe(options));
         const auto storage{make_storage(options)};
         // a crash in a binlog without transactions is PBT-035 (checked by
         // CrashInBinlogWithoutTransactionsMySQL); after a restart the new
@@ -1817,15 +1817,15 @@ BOOST_AUTO_TEST_CASE(ServerRestartDuringPullMySQL) {
               "action", gs::sampled_from<std::string>(
                             {"workload", "workload", "restart", "crash", "sleep"}))};
           if (action == "workload") {
-            tc.note("workload:");
+            pbt::note(tc, "workload:");
             apply_all(tc, server->sql, draw_workload(tc, server->info, 3U));
           } else if (action == "sleep") {
             const auto delay{tc.draw("sleep_ms", gs::sampled_from<std::uint64_t>(
                                                      {50U, 500U, 2500U}))};
-            tc.note("sleep " + std::to_string(delay) + " ms");
+            pbt::note(tc, "sleep " + std::to_string(delay) + " ms");
             wait_ms(delay);
           } else {
-            tc.note(action == "restart" ? "restart the server"
+            pbt::note(tc, action == "restart" ? "restart the server"
                                         : "kill -9 the server and restart it");
             server.reset();
             control_server(action);
@@ -1836,7 +1836,7 @@ BOOST_AUTO_TEST_CASE(ServerRestartDuringPullMySQL) {
         // reconnects every idle_time (1 s) while the server is down
         wait_until_pull_caught_up(tc, server->sql, pull);
         pull.require_running();
-        tc.note("SIGTERM pull, compare, then fetch and compare again");
+        pbt::note(tc, "SIGTERM pull, compare, then fetch and compare again");
         pull.stop();
         require_storage_matches_server(tc, server->sql, server->info, *storage);
         fetch(tc, *storage);
@@ -1856,19 +1856,19 @@ BOOST_AUTO_TEST_CASE(CrashInBinlogWithoutTransactionsMySQL) {
         auto server{std::make_unique<server_session>()};
         start_case(tc, *server);
         const auto options{draw_options(tc)};
-        tc.note("binlog_server: " + describe(options));
+        pbt::note(tc, "binlog_server: " + describe(options));
         const auto storage{make_storage(options)};
-        tc.note("workload:");
+        pbt::note(tc, "workload:");
         auto workload{draw_workload(tc, server->info, 3U)};
         if (!workload.empty()) {
           workload.push_back(operation{.kind = op_kind::flush});
         }
         apply_all(tc, server->sql, workload);
         if (tc.draw("fetch_before_crash", gs::booleans())) {
-          tc.note("fetch");
+          pbt::note(tc, "fetch");
           fetch(tc, *storage);
         }
-        tc.note("kill -9 the server and restart it");
+        pbt::note(tc, "kill -9 the server and restart it");
         server.reset();
         control_server("crash");
         server = std::make_unique<server_session>();
@@ -1896,19 +1896,19 @@ BOOST_AUTO_TEST_CASE(PurgeOnServerMySQL) {
         server_session server;
         start_case(tc, server);
         const auto options{draw_options(tc)};
-        tc.note("binlog_server: " + describe(options));
+        pbt::note(tc, "binlog_server: " + describe(options));
         const auto storage{make_storage(options)};
-        tc.note("round 1:");
+        pbt::note(tc, "round 1:");
         auto first{draw_workload(tc, server.info, 4U)};
         first.push_back(operation{.kind = op_kind::insert_rows, .count = 1});
         first.push_back(operation{.kind = op_kind::flush});
         apply_all(tc, server.sql, first);
         const auto fetch_before{tc.draw("fetch_before_purge", gs::booleans())};
         if (fetch_before) {
-          tc.note("fetch");
+          pbt::note(tc, "fetch");
           fetch(tc, *storage);
         }
-        tc.note("round 2:");
+        pbt::note(tc, "round 2:");
         auto second{draw_workload(tc, server.info, 4U)};
         second.push_back(operation{.kind = op_kind::flush});
         second.push_back(operation{.kind = op_kind::insert_rows, .count = 1});
@@ -1917,7 +1917,7 @@ BOOST_AUTO_TEST_CASE(PurgeOnServerMySQL) {
         const auto before_purge{server_binlogs(server.sql)};
         const auto keep_from{tc.draw(
             "purge_to", gs::integers<std::size_t>({.max_value = before_purge.size() - 1U}))};
-        tc.note("PURGE BINARY LOGS TO '" + before_purge[keep_from].name + "'");
+        pbt::note(tc, "PURGE BINARY LOGS TO '" + before_purge[keep_from].name + "'");
         server.sql.exec("PURGE BINARY LOGS TO '" + before_purge[keep_from].name + "'");
         const auto remaining{server_binlogs(server.sql)};
 
@@ -1951,12 +1951,12 @@ BOOST_AUTO_TEST_CASE(PurgeOnServerMySQL) {
         }
 
         const auto result{run({"fetch", storage->config_path})};
-        tc.note("fetch: " + result.describe());
+        pbt::note(tc, "fetch: " + result.describe());
         pbt::require(!result.signaled, "fetch crashed (" + result.describe() + ")");
         const bool succeeded{result.exit_code == 0};
         if (resumable.has_value()) {
           if (*resumable && !succeeded) {
-            tc.note("binlog_server log:" + log_tail(*storage));
+            pbt::note(tc, "binlog_server log:" + log_tail(*storage));
           }
           pbt::require_equal(succeeded, *resumable,
                              "fetch succeeds exactly when the server still has "
