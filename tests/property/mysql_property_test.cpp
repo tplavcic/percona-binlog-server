@@ -580,6 +580,26 @@ std::uint16_t listener_port() {
   return static_cast<std::uint16_t>(20000U + static_cast<unsigned>(::getpid()) % 20000U);
 }
 
+// one RSA key per test process for the listener (openssl genrsa)
+const fs::path &listener_rsa_key() {
+  static const fs::path key{[]() {
+    const auto path{fs::temp_directory_path() /
+                    ("pbs-pbt-rsa-" + std::to_string(::getpid()) + ".pem")};
+    std::error_code ignored;
+    if (!fs::exists(path, ignored)) {
+      const std::string command{"openssl genrsa -out '" + path.string() +
+                                "' 2048 >/dev/null 2>&1"};
+      // NOLINTNEXTLINE(concurrency-mt-unsafe,cert-env33-c)
+      if (std::system(command.c_str()) != 0) {
+        pbt::infrastructure_error(
+            "cannot generate the listener's RSA key (openssl genrsa)");
+      }
+    }
+    return path;
+  }()};
+  return key;
+}
+
 std::unique_ptr<pbs_storage> make_storage(const pbs_options &options) {
   auto result{std::make_unique<pbs_storage>()};
   result->options = options;
@@ -604,8 +624,14 @@ std::unique_ptr<pbs_storage> make_storage(const pbs_options &options) {
         {"base_file_name", "rw"}, {"file_size", *options.rewrite_file_size}};
   }
   config["replication"] = replication;
+  // README: server_id / server_uuid are what downstream replicas see (must
+  // differ from theirs: the source is 1, the replica 2); without TLS the
+  // listener's caching_sha2_password full authentication needs the RSA key
   config["replication_source"] = json::object{
       {"port", listener_port()},
+      {"server_id", 142},
+      {"server_uuid", "00000000-0000-0000-0000-00000000008e"},
+      {"auth_rsa_private_key", listener_rsa_key().string()},
       {"read_timeout", 5},
       {"write_timeout", 5},
       {"authentication", json::object{{"user", "replica"},
@@ -1838,18 +1864,22 @@ private:
 
 } // namespace
 
-// The README: "the built-in MySQL-compatible listener ... so that
-// downstream replicas can dump binary log events from it". A MySQL server
-// configured as a replica of the listener (position-based, from the first
-// binlog) while 'pull' runs and the workload continues ends up with the
-// source's gtid_executed and the same table contents.
+// The README: "real MySQL replicas (position-based ...) can dump binary
+// log events from the utility". A MySQL server configured as a
+// position-based replica of the listener (from the first binlog) while
+// 'pull' runs and the workload continues ends up with the source's
+// gtid_executed and the same table contents.
 BOOST_AUTO_TEST_CASE(ReplicaOfListenerMatchesSourceMySQL) {
   pbt::check(
       [](hegel::TestCase &tc) {
         server_session server;
         replica_session replica;
         start_case(tc, server);
-        const auto options{draw_options(tc)};
+        // the listener reports GTID_MODE from the storage's mode (README):
+        // the replica runs with gtid_mode=ON, and MySQL refuses an ON
+        // replica of an OFF source, so the storage is in GTID mode
+        // (the replication itself is position-based)
+        const auto options{draw_options(tc, true)};
         pbt::note(tc, "binlog_server: " + describe(options));
         const auto storage{make_storage(options)};
         pull_process pull{tc, *storage};
