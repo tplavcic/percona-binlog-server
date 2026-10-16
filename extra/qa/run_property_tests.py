@@ -299,6 +299,8 @@ def run_property(exe: Executable, name: str, args, env: Dict[str, str],
             proc = subprocess.Popen(cmd, cwd=exe.workdir, env=env,
                                     stdout=log, stderr=subprocess.STDOUT,
                                     start_new_session=True)
+            with ACTIVE_LOCK:
+                ACTIVE_GROUPS.add(proc.pid)
             try:
                 result.returncode = proc.wait(timeout=args.timeout)
             except subprocess.TimeoutExpired:
@@ -306,6 +308,9 @@ def run_property(exe: Executable, name: str, args, env: Dict[str, str],
                 proc.wait()
                 result.status, result.kind = "failed", "timeout"
                 result.message = f"timeout after {args.timeout}s"
+            finally:
+                with ACTIVE_LOCK:
+                    ACTIVE_GROUPS.discard(proc.pid)
         except OSError as exc:
             result.status, result.kind = "error", "infra"
             result.message = f"cannot start: {exc}"
@@ -667,6 +672,26 @@ def seaweedfs(env: Dict[str, str], workdir: Path, *command: str):
 # the MySQL properties reset the one shared server: never run two at once
 MYSQL_LOCK = threading.Lock()
 
+# process groups of the running properties (each runs in its own session):
+# killed when the runner itself is terminated (Ctrl-C, an aborted Jenkins
+# build), so that no property keeps running - e.g. restarting the MySQL
+# server - after the runner is gone
+ACTIVE_GROUPS: set = set()
+ACTIVE_LOCK = threading.Lock()
+
+
+def kill_active_properties(signum, _frame):
+    with ACTIVE_LOCK:
+        groups = list(ACTIVE_GROUPS)
+    for group in groups:
+        try:
+            os.killpg(group, signal.SIGKILL)
+        except OSError:
+            pass
+    print(f"terminated by signal {signum}: killed {len(groups)} running "
+          f"propert{'y' if len(groups) == 1 else 'ies'}", file=sys.stderr)
+    os._exit(128 + signum)
+
 
 def run_serialized(exe: Executable, name: str, args, env: Dict[str, str],
                    log_dir: Path):
@@ -684,22 +709,27 @@ def mysqld(env: Dict[str, str], workdir: Path, *command: str):
                           check=False)
 
 
-def ensure_mysqld(env: Dict[str, str], workdir: Path, log_dir: Path):
+def ensure_mysqld(env: Dict[str, str], workdir: Path, log_dir: Path,
+                  instance: str = ""):
     """Puts PBT_MYSQL_* into env, starting the private mysqld of
-    extra/qa/mysqld.sh if needed. Returns (started here, problem text or
-    ""). On failure the MySQL properties report an infrastructure error."""
+    extra/qa/mysqld.sh if needed ('--replica': the second instance).
+    Returns (started here, problem text or ""). On failure the properties
+    that need it report an infrastructure error."""
     started = False
-    if mysqld(env, workdir, "status").returncode != 0:
-        result = mysqld(env, workdir, "start")
+    prefix = [instance] if instance else []
+    if mysqld(env, workdir, *prefix, "status").returncode != 0:
+        result = mysqld(env, workdir, *prefix, "start")
         if result.returncode != 0:
             output = (result.stdout + result.stderr).strip()
             problem = "cannot start mysqld (extra/qa/mysqld.sh start): " + \
                 (output.splitlines()[-1] if output else
                  f"exit code {result.returncode}")
             log_dir.mkdir(parents=True, exist_ok=True)
-            details = log_dir / "mysqld-start.log"
-            server_log = Path(env.get("MYSQLD_DIR",
-                                      str(workdir / "mysql-pbt"))) / "run" / "mysqld.log"
+            details = log_dir / f"mysqld{instance.replace('--', '-')}-start.log"
+            server_dir = env.get("MYSQLD_REPLICA_DIR",
+                                 str(workdir / "mysql-pbt-replica")) \
+                if instance else env.get("MYSQLD_DIR", str(workdir / "mysql-pbt"))
+            server_log = Path(server_dir) / "run" / "mysqld.log"
             text = output + "\n"
             try:
                 text += f"\n--- {server_log} ---\n" + server_log.read_text(
@@ -711,8 +741,8 @@ def ensure_mysqld(env: Dict[str, str], workdir: Path, log_dir: Path):
             print(f"warning: {problem}", file=sys.stderr)
             return False, problem
         started = True
-    for line in mysqld(env, workdir, "env").stdout.splitlines():
-        match = re.match(r"export (PBT_MYSQL_\w+)='([^']*)'", line.strip())
+    for line in mysqld(env, workdir, *prefix, "env").stdout.splitlines():
+        match = re.match(r"export (PBT_MYSQLD?_\w+)='([^']*)'", line.strip())
         if match:
             env[match.group(1)] = match.group(2)
     return started, ""
@@ -908,9 +938,17 @@ def main() -> int:
                                                           log_dir)
 
     started_mysqld, mysql_problem = False, ""
+    started_replica = False
     if any("MySQL" in name for _, name in planned) and \
             "PBT_MYSQL_PORT" not in env:
         started_mysqld, mysql_problem = ensure_mysqld(env, workdir, log_dir)
+        if not mysql_problem:
+            # downstream replica for the *Replica* properties; without it
+            # only those report an infrastructure error
+            started_replica, replica_problem = ensure_mysqld(
+                env, workdir, log_dir, "--replica")
+            if replica_problem:
+                mysql_problem = "replica instance: " + replica_problem
 
     # temporary files of the properties (storage tests create binlog
     # directories) stay inside WORKDIR: <run dir>/tmp, removed at the end
@@ -918,6 +956,8 @@ def main() -> int:
     tmp_dir.mkdir()
     env["TMPDIR"] = str(tmp_dir)
 
+    for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(signum, kill_active_properties)
     print(f"running {len(planned)} properties from {len(executables)} "
           f"executable(s), {args.jobs} in parallel -> {out_dir}", flush=True)
     started = time.monotonic()
@@ -948,6 +988,8 @@ def main() -> int:
         # started for this run only; the data directory is kept so that the
         # next start skips the initialization (mysqld.sh wipe removes it)
         mysqld(env, workdir, "stop")
+    if started_replica:
+        mysqld(env, workdir, "--replica", "stop")
 
     bugs = load_known_bugs(Path(args.known_bugs))
     possibly_fixed = classify(results, bugs, variant)
