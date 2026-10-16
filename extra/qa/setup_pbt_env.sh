@@ -17,7 +17,7 @@
 # Prepares WORKDIR for the property-based tests. Idempotent: every step is
 # skipped when its result is already present.
 #
-#   extra/qa/setup_pbt_env.sh [--no-seaweedfs] [--force]
+#   extra/qa/setup_pbt_env.sh [--no-seaweedfs] [--with-mysql] [--force]
 #
 # Steps:
 #   1. checks the main build prerequisites from README.md (Boost and AWS SDK
@@ -26,6 +26,10 @@
 #   3. clones hegel-cpp v$HEGEL_CPP_VERSION, builds and installs it into
 #      $HEGEL_INSTALL_DIR
 #   4. downloads the SeaweedFS 'weed' binary (S3 endpoint for S3 tests)
+#   5. reports the mysqld the MySQL (layer D) tests will use; with
+#      --with-mysql downloads the MySQL / Percona Server binary tarball
+#      $MYSQLD_TARBALL_URL into $WORKDIR/mysql (when no mysqld is usable,
+#      e.g. /usr/sbin/mysqld confined by AppArmor)
 #
 # Nothing is written outside WORKDIR.
 
@@ -34,12 +38,14 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/pbt_env.sh"
 
 with_seaweedfs=1
+with_mysql=0
 force=0
 for arg in "$@"; do
   case "${arg}" in
     --no-seaweedfs) with_seaweedfs=0 ;;
+    --with-mysql) with_mysql=1 ;;
     --force) force=1 ;;
-    -h|--help) sed -n '17,31p' "$0"; exit 0 ;;
+    -h|--help) sed -n '17,35p' "$0"; exit 0 ;;
     *) pbt_die "unknown argument: ${arg}" ;;
   esac
 done
@@ -132,6 +138,34 @@ if [[ ${with_seaweedfs} -eq 1 ]]; then
   else
     pbt_log "SeaweedFS ${SEAWEEDFS_VERSION} already present"
   fi
+fi
+
+# --------------------------------------------------------------------------
+mysql_dir="${WORKDIR}/mysql"
+if [[ ${with_mysql} -eq 1 ]]; then
+  pbt_require_in_workdir "${mysql_dir}"
+  if [[ ${force} -eq 1 || ! -x "${mysql_dir}/bin/mysqld" ]]; then
+    mkdir -p "${WORKDIR}/mysql-download"
+    archive="${WORKDIR}/mysql-download/$(basename "${MYSQLD_TARBALL_URL}")"
+    pbt_log "downloading ${MYSQLD_TARBALL_URL}"
+    download "${MYSQLD_TARBALL_URL}" "${archive}"
+    rm -rf "${mysql_dir}" && mkdir -p "${mysql_dir}"
+    tar -xzf "${archive}" -C "${mysql_dir}" --strip-components=1
+    [[ -x "${mysql_dir}/bin/mysqld" ]] || pbt_die "no bin/mysqld in ${archive}"
+  fi
+fi
+if [[ -n "${MYSQLD_BASEDIR}" && -x "${MYSQLD_BASEDIR}/bin/mysqld" ]]; then
+  mysqld_bin="${MYSQLD_BASEDIR}/bin/mysqld"
+elif [[ -x "${mysql_dir}/bin/mysqld" ]]; then
+  mysqld_bin="${mysql_dir}/bin/mysqld"
+else
+  mysqld_bin="$(command -v mysqld 2>/dev/null || true)"
+  [[ -z "${mysqld_bin}" && -x /usr/sbin/mysqld ]] && mysqld_bin=/usr/sbin/mysqld
+fi
+if [[ -n "${mysqld_bin}" ]]; then
+  pbt_log "MySQL tests will use ${mysqld_bin} ($("${mysqld_bin}" --version 2>/dev/null | head -1))"
+else
+  pbt_log "WARNING: no mysqld found - the MySQL properties will report an infrastructure error (use --with-mysql or MYSQLD_BASEDIR, or run_property_tests.py --mysql off)"
 fi
 
 pbt_log "done. Next: extra/qa/build_property_tests.sh"
