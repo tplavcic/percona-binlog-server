@@ -165,4 +165,17 @@ if(TARGET pbs_test_binsrv)
     SOURCES units_property_test.cpp
     LIBRARIES pbs_test_binsrv
   )
+  pbs_add_property_test(config_property_test
+    SOURCES config_property_test.cpp
+    LIBRARIES pbs_test_binsrv
+  )
+  # layer C: runs the binlog_server binary on a generated storage
+  pbs_add_property_test(cli_property_test
+    SOURCES cli_property_test.cpp
+    LIBRARIES pbs_test_binsrv
+  )
+  target_compile_definitions(cli_property_test PRIVATE
+    PBS_BINLOG_SERVER_PATH="$<TARGET_FILE:binlog_server>"
+  )
+  add_dependencies(cli_property_test binlog_server)
 endif()

@@ -110,9 +110,15 @@ environment. If they are not set, it starts SeaweedFS
 stops and wipes it after the run. `--s3 off` skips these properties. To
 run one of them by hand: `eval "$(extra/qa/seaweedfs.sh env)"`.
 
-`storage_property_test` links the server sources through the
-`pbs_test_binsrv` test library (todo.md T1). It needs the same dependencies
-as `binlog_server` (MySQL client library, AWS SDK, Boost).
+`storage_property_test`, `config_property_test` and `cli_property_test`
+link the server sources through the `pbs_test_binsrv` test library (todo.md
+T1). They need the same dependencies as `binlog_server` (MySQL client
+library, AWS SDK, Boost). `cli_property_test` also runs the `binlog_server`
+binary of the same build directory (it is built as a dependency) on
+storages it generates under `$TMPDIR`.
+
+Known bugs are reported as failures in JUnit (`--known-as failure`, the
+default), so they stay visible in Jenkins; `--known-as skipped` hides them.
 
 The exit code (`--fail-on`) is set as follows. With `new` (the default) it
 is `1` when there are new issues, regressions or infrastructure errors.
