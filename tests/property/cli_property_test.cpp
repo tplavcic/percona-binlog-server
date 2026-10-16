@@ -218,7 +218,9 @@ void write_config(generated_storage &storage) {
   "replication": {"server_id": 1, "idle_time": 1, "verify_checksum": true,
                   "mode": ")"
          << (storage.gtid_mode ? "gtid" : "position") << R"("},
-  "replication_source": {"port": 3307, "read_timeout": 1, "write_timeout": 1,
+  "replication_source": {"port": 3307, "server_id": 142,
+                         "server_uuid": "00000000-0000-0000-0000-00000000008e",
+                         "read_timeout": 1, "write_timeout": 1,
                          "authentication": {"user": "u", "password": "p",
                                             "plugin": "caching_sha2_password"}},
   "storage": {"backend": "file", "uri": "file://)"
