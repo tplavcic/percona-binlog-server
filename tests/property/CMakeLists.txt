@@ -182,7 +182,7 @@ if(TARGET pbs_test_binsrv)
   # extra/qa/mysqld.sh); properties named *MySQL
   pbs_add_property_test(mysql_property_test
     SOURCES mysql_property_test.cpp
-    LIBRARIES pbs_test_binsrv MySQL::client ZLIB::ZLIB
+    LIBRARIES pbs_test_binsrv MySQL::client ZLIB::ZLIB OpenSSL::Crypto
   )
   target_compile_definitions(mysql_property_test PRIVATE
     PBS_BINLOG_SERVER_PATH="$<TARGET_FILE:binlog_server>"
