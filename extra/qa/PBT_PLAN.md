@@ -199,6 +199,7 @@ walker (magic, sizes, log_pos, CRC32, GTID order).
 | D8 | `ServerRestartDuringPullMySQL`: the server is restarted (STOP) or killed with SIGKILL and restarted (crash recovery) while `pull` runs; `pull` reconnects, never exits, and its storage matches the server | ✅ |
 | D8a | `CrashInBinlogWithoutTransactionsMySQL`: the server is killed while its newest binlog has no transaction; fetch afterwards | ✅ (PBT-035) |
 | D10 | `FetchMatchesServerBinlogsOnS3MySQL`, `RepeatedFetchResumesOnS3MySQL`, `KilledPullResumesOnS3MySQL`, `ListenerServesServerEventsOnS3MySQL`: D1, D2, D3 and D6 with the S3 storage backend (SeaweedFS); the stored objects are read back independently of PBS through the SeaweedFS filer (plain HTTP, `PBT_S3_FILER`), each case in its own prefix (removed afterwards) | ✅ |
+| D11 | encrypted storage: every MySQL property draws `storage.encryption` in a third of its cases (KEK AES-128-ECB / AES-256-CBC / AES-256-GCM / AES-192-CTR / CAMELLIA-128-CBC; data cipher AES-128/192/256-CTR, ARIA-128-CTR, CAMELLIA-256-CTR, within the README's KEK / key-length rule); the oracle decrypts every stored binlog independently (OpenSSL EVP, the test's keyring, the envelopes in `<binlog>.json`) before comparing it with the server's file. Covers fetch, resume, killed `pull`, server restarts, purge, rewrite, S3, the listener serving an encrypted storage and the real replica | ✅ |
 | D9 | `PurgeOnServerMySQL`: `PURGE BINARY LOGS TO` before / after the storage got the binlogs; fetch succeeds exactly when the server still has what the storage needs (position: its newest binlog; GTID: gtid_purged covered; empty storage), else exits 1 leaving the storage unchanged | ✅ |
 
 GTID auto-positioning: the server starts a GTID dump at the newest binlog
@@ -213,7 +214,6 @@ Not covered yet (later):
   (needs a third, differently configured instance);
 - GTID dumps (COM_BINLOG_DUMP_GTID) from the listener, once it supports
   them (PBT-034);
-- encrypted storage with MySQL (the encryption model is covered in B).
 
 ### Recommended order
 
@@ -528,6 +528,20 @@ configurations were updated (that, not a product change, caused the 28
   (`is_canonical_uuid()` uses `isxdigit`).
 - `config_property_test` covers the new keys (valid values load, malformed
   UUIDs, an empty `auth_rsa_private_key`, wrong types are rejected).
+
+### Encrypted storage with MySQL (sandbox run)
+
+No encryption-specific difference: decrypted stored binlogs are
+byte-identical to the server's in every MySQL property, and the listener
+serves exactly the server's events from an encrypted storage. Two known
+bugs showed up in MySQL properties for the first time (the new encryption
+draw changed the generated sequences):
+- [medium] PBT-026 with the real binary: `pull` killed while it creates a
+  new binlog cannot be restarted ("storage is not empty but does not
+  contain binlog index"). This was the cause of the earlier `FLAKY`
+  `KilledPullResumesMySQL` failures on QA.
+- [medium] PBT-035 through a server crash right after `FLUSH BINARY LOGS`
+  (`ServerRestartDuringPullMySQL`).
 
 ## 6. Open questions
 
