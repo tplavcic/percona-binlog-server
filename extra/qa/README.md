@@ -120,6 +120,12 @@ a dependency), on storages under `$TMPDIR`.
 Known bugs are reported as failures in JUnit (`--known-as failure`, the
 default), so they stay visible in Jenkins; `--known-as skipped` hides them.
 
+A failure that depends on timing can pass when Hegel replays it, and
+Hegel then reports only "Flaky test detected". `pbt::check` therefore
+writes the first failing test case of every property to the log right
+away (`PBT_FIRST_FAILURE:` with its `pbt::note` lines), and the report
+shows such a property as `FLAKY: <first failure>` with those notes.
+
 Every property runs in its own process group. When the runner is
 terminated (SIGTERM / SIGINT / SIGHUP, e.g. an aborted Jenkins build) it
 kills the running properties, so none keeps running (or restarting the
