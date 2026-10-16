@@ -489,6 +489,7 @@ struct pbs_options {
   std::optional<std::string> checkpoint_size;
   std::optional<std::string> checkpoint_interval;
   std::optional<std::string> rewrite_file_size;
+  bool s3{false};  // storage.backend s3 (SeaweedFS, PBT_S3_*) instead of file
 };
 
 std::string describe(const pbs_options &options) {
@@ -502,6 +503,9 @@ std::string describe(const pbs_options &options) {
   }
   if (options.rewrite_file_size) {
     result += ", rewrite file_size " + *options.rewrite_file_size;
+  }
+  if (options.s3) {
+    result += ", S3 storage";
   }
   return result;
 }
@@ -521,13 +525,54 @@ pbs_options draw_options(hegel::TestCase &tc, std::optional<bool> gtid_mode = {}
   return options;
 }
 
+// S3: the objects are read back independently of PBS, through the
+// SeaweedFS filer's plain HTTP interface (PBT_S3_FILER, unsigned; the same
+// one extra/qa/seaweedfs.sh uses for its readiness check):
+// <filer>/buckets/<bucket>/<prefix>/<object>
+struct s3_location {
+  std::string uri;     // storage.uri (README: http://key:secret@host:port/bucket/path)
+  std::string filer;   // <filer>/buckets/<bucket>/<prefix>
+};
+
+s3_location s3_location_for(const std::string &prefix) {
+  const auto endpoint{pbt::detail::env("PBT_S3_ENDPOINT")};
+  const auto access_key{pbt::detail::env("PBT_S3_ACCESS_KEY")};
+  const auto secret_key{pbt::detail::env("PBT_S3_SECRET_KEY")};
+  const auto bucket{pbt::detail::env("PBT_S3_BUCKET")};
+  const auto filer{pbt::detail::env("PBT_S3_FILER")};
+  if (!endpoint || !access_key || !secret_key || !bucket || !filer) {
+    pbt::infrastructure_error(
+        "S3 endpoint not configured: set PBT_S3_ENDPOINT / _ACCESS_KEY / "
+        "_SECRET_KEY / _BUCKET / _FILER (extra/qa/seaweedfs.sh env; "
+        "run_property_tests.py starts SeaweedFS)");
+  }
+  const auto scheme_end{endpoint->find("://")};
+  if (scheme_end == std::string::npos) {
+    pbt::infrastructure_error("PBT_S3_ENDPOINT must be http[s]://host:port");
+  }
+  return {endpoint->substr(0U, scheme_end + 3U) + *access_key + ":" +
+              *secret_key + "@" + endpoint->substr(scheme_end + 3U) + "/" +
+              *bucket + "/" + prefix,
+          *filer + "/buckets/" + *bucket + "/" + prefix};
+}
+
 struct pbs_storage {
   temporary_directory directory{"pbs-pbt-mysql"};
   pbs_options options;
   std::string config_path;
+  std::optional<s3_location> s3;
+
+  pbs_storage() = default;
+  pbs_storage(const pbs_storage &) = delete;
+  pbs_storage &operator=(const pbs_storage &) = delete;
+  pbs_storage(pbs_storage &&) = delete;
+  pbs_storage &operator=(pbs_storage &&) = delete;
+  ~pbs_storage();
 
   [[nodiscard]] fs::path vault() const { return directory.path() / "vault"; }
   [[nodiscard]] fs::path log() const { return directory.path() / "binsrv.log"; }
+  // the stored binlog file / object
+  [[nodiscard]] std::string stored(const std::string &name) const;
 };
 
 std::uint16_t listener_port() {
@@ -568,6 +613,15 @@ std::unique_ptr<pbs_storage> make_storage(const pbs_options &options) {
                                       {"plugin", "caching_sha2_password"}}}};
   json::object storage{{"backend", "file"},
                        {"uri", "file://" + result->vault().generic_string()}};
+  if (options.s3) {
+    result->s3 = s3_location_for(result->directory.path().filename().string());
+    storage["backend"] = "s3";
+    storage["uri"] = result->s3->uri;
+    // partially uploaded binlogs: inside the test's directory ($TMPDIR)
+    fs::create_directories(result->directory.path() / "s3-buffer");
+    storage["fs_buffer_directory"] =
+        (result->directory.path() / "s3-buffer").string();
+  }
   if (options.checkpoint_size) {
     storage["checkpoint_size"] = *options.checkpoint_size;
   }
@@ -634,6 +688,38 @@ std::string read_file(const fs::path &path) {
 std::string read_file_if_exists(const fs::path &path) {
   std::error_code error;
   return fs::exists(path, error) ? read_file(path) : std::string{};
+}
+
+// curl, as extra/qa/seaweedfs.sh uses it
+int run_curl(const std::string &arguments) {
+  const std::string command{"curl --silent --show-error --max-time 60 " +
+                            arguments + " >/dev/null 2>&1"};
+  // NOLINTNEXTLINE(concurrency-mt-unsafe,cert-env33-c)
+  return std::system(command.c_str());
+}
+
+std::string pbs_storage::stored(const std::string &name) const {
+  if (!s3) {
+    return read_file(vault() / name);
+  }
+  const auto target{directory.path() / ("downloaded." + name)};
+  std::error_code ignored;
+  fs::remove(target, ignored);
+  if (run_curl("--fail --output '" + target.string() + "' '" + s3->filer +
+               "/" + name + "'") != 0) {
+    throw std::runtime_error{"cannot read the S3 object " + name +
+                             " through the SeaweedFS filer"};
+  }
+  auto content{read_file(target)};
+  fs::remove(target, ignored);
+  return content;
+}
+
+pbs_storage::~pbs_storage() {
+  if (s3) {
+    // every case uses its own prefix: remove it, the bucket is shared
+    std::ignore = run_curl("-X DELETE '" + s3->filer + "/?recursive=true'");
+  }
 }
 
 // the server's binlog file as the dump thread sends it: in-use flag of the
@@ -898,7 +984,7 @@ void require_storage_matches_server(
         continue;
       }
       const auto expected{server_file(info, name)};
-      const auto actual{read_file(storage.vault() / name)};
+      const auto actual{storage.stored(name)};
       const auto events{walk(expected, "server " + name)};
       if (actual.size() < expected.size() && !events.types.empty() &&
           (events.types.back() == rotate_event ||
@@ -941,7 +1027,7 @@ void require_storage_matches_server(
     if (std::ranges::find(without_rotate, name) != without_rotate.end()) {
       expected.resize(binlogs[i].size);
     }
-    const auto actual{read_file(storage.vault() / name)};
+    const auto actual{storage.stored(name)};
     pbt::require(actual == expected, "stored " + name +
                                          " differs from the server's file: " +
                                          first_difference(expected, actual));
@@ -1236,20 +1322,32 @@ void control_server(const std::string &command) {
 // After any workload one 'fetch' leaves the storage byte-identical to the
 // server's binlog files (position and GTID mode, any checkpointing,
 // verify_checksum on and off), and 'list' describes them.
-BOOST_AUTO_TEST_CASE(FetchMatchesServerBinlogsMySQL) {
-  pbt::check(
-      [](hegel::TestCase &tc) {
+namespace {
+
+void fetch_matches_server(hegel::TestCase &tc, bool s3) {
         server_session server;
         start_case(tc, server);
-        const auto options{draw_options(tc)};
+        auto options{draw_options(tc)};
+        options.s3 = s3;
         pbt::note(tc, "binlog_server: " + describe(options));
         const auto storage{make_storage(options)};
         pbt::note(tc, "workload:");
         apply_all(tc, server.sql, draw_workload(tc, server.info, 12U));
         fetch(tc, *storage);
         require_storage_matches_server(tc, server.sql, server.info, *storage);
-      },
-      {.test_cases = 100U, .slow = true});
+}
+
+} // namespace
+
+BOOST_AUTO_TEST_CASE(FetchMatchesServerBinlogsMySQL) {
+  pbt::check([](hegel::TestCase &tc) { fetch_matches_server(tc, false); },
+             {.test_cases = 100U, .slow = true});
+}
+
+// The same with the S3 storage backend (SeaweedFS).
+BOOST_AUTO_TEST_CASE(FetchMatchesServerBinlogsOnS3MySQL) {
+  pbt::check([](hegel::TestCase &tc) { fetch_matches_server(tc, true); },
+             {.test_cases = 30U, .slow = true});
 }
 
 // The server's newest binlog may have no transaction yet (right after
@@ -1281,12 +1379,13 @@ BOOST_AUTO_TEST_CASE(FetchStoresBinlogWithoutTransactionsMySQL) {
 // Workload and 'fetch' alternate on the same storage (resume from the last
 // stored position / GTID set, also in the middle of an open binlog and after
 // rotations); after every fetch the storage matches the server.
-BOOST_AUTO_TEST_CASE(RepeatedFetchResumesMySQL) {
-  pbt::check(
-      [](hegel::TestCase &tc) {
+namespace {
+
+void repeated_fetch_resumes(hegel::TestCase &tc, bool s3) {
         server_session server;
         start_case(tc, server);
-        const auto options{draw_options(tc)};
+        auto options{draw_options(tc)};
+        options.s3 = s3;
         pbt::note(tc, "binlog_server: " + describe(options));
         const auto storage{make_storage(options)};
         const auto rounds{tc.draw(
@@ -1297,8 +1396,19 @@ BOOST_AUTO_TEST_CASE(RepeatedFetchResumesMySQL) {
           fetch(tc, *storage);
           require_storage_matches_server(tc, server.sql, server.info, *storage);
         }
-      },
-      {.test_cases = 60U, .slow = true});
+}
+
+} // namespace
+
+BOOST_AUTO_TEST_CASE(RepeatedFetchResumesMySQL) {
+  pbt::check([](hegel::TestCase &tc) { repeated_fetch_resumes(tc, false); },
+             {.test_cases = 60U, .slow = true});
+}
+
+// The same with the S3 storage backend (SeaweedFS).
+BOOST_AUTO_TEST_CASE(RepeatedFetchResumesOnS3MySQL) {
+  pbt::check([](hegel::TestCase &tc) { repeated_fetch_resumes(tc, true); },
+             {.test_cases = 20U, .slow = true});
 }
 
 // GTID mode: the storage has a binlog up to its last transaction, then the
@@ -1341,12 +1451,13 @@ BOOST_AUTO_TEST_CASE(GtidResumeStoresRotateEventMySQL) {
 // the last 'pull' leaves matches the server (also after a 'fetch'): a kill
 // never leaves a storage that cannot be resumed or that has lost /
 // duplicated transactions.
-BOOST_AUTO_TEST_CASE(KilledPullResumesMySQL) {
-  pbt::check(
-      [](hegel::TestCase &tc) {
+namespace {
+
+void killed_pull_resumes(hegel::TestCase &tc, bool s3) {
         server_session server;
         start_case(tc, server);
-        const auto options{draw_options(tc)};
+        auto options{draw_options(tc)};
+        options.s3 = s3;
         pbt::note(tc, "binlog_server: " + describe(options));
         const auto storage{make_storage(options)};
         pull_process pull{tc, *storage};
@@ -1386,8 +1497,19 @@ BOOST_AUTO_TEST_CASE(KilledPullResumesMySQL) {
         require_storage_matches_server(tc, server.sql, server.info, *storage);
         fetch(tc, *storage);
         require_storage_matches_server(tc, server.sql, server.info, *storage);
-      },
-      {.test_cases = 20U, .slow = true});
+}
+
+} // namespace
+
+BOOST_AUTO_TEST_CASE(KilledPullResumesMySQL) {
+  pbt::check([](hegel::TestCase &tc) { killed_pull_resumes(tc, false); },
+             {.test_cases = 20U, .slow = true});
+}
+
+// The same with the S3 storage backend (SeaweedFS).
+BOOST_AUTO_TEST_CASE(KilledPullResumesOnS3MySQL) {
+  pbt::check([](hegel::TestCase &tc) { killed_pull_resumes(tc, true); },
+             {.test_cases = 20U, .slow = true});
 }
 
 // ===========================================================================
@@ -1509,7 +1631,7 @@ void check_rewrite_mode(hegel::TestCase &tc, bool verify_checksum) {
           expected_name.insert(0U, "rw.");
           pbt::require_equal(name, expected_name,
                              "rewritten binlog names are consecutive");
-          const auto data{read_file(storage->vault() / name)};
+          const auto data{storage->stored(name)};
           pbt::require_equal(std::uint64_t{data.size()},
                              item.at("size").to_number<std::uint64_t>(),
                              "list: size of " + name);
@@ -1574,12 +1696,13 @@ BOOST_AUTO_TEST_CASE(RewriteModeWithoutChecksumVerificationMySQL) {
 // receives exactly the events a dump from the MySQL server itself
 // receives from the same position, including the artificial ROTATE /
 // FORMAT_DESCRIPTION at the start and the ROTATEs between binlogs.
-BOOST_AUTO_TEST_CASE(ListenerServesServerEventsMySQL) {
-  pbt::check(
-      [](hegel::TestCase &tc) {
+namespace {
+
+void listener_serves_server_events(hegel::TestCase &tc, bool s3) {
         server_session server;
         start_case(tc, server);
-        const auto options{draw_options(tc)};
+        auto options{draw_options(tc)};
+        options.s3 = s3;
         pbt::note(tc, "binlog_server: " + describe(options));
         const auto storage{make_storage(options)};
         pbt::note(tc, "workload:");
@@ -1640,8 +1763,19 @@ BOOST_AUTO_TEST_CASE(ListenerServesServerEventsMySQL) {
         }
         pbt::require_equal(served.events.size(), direct.events.size(),
                            "number of events");
-      },
-      {.test_cases = 40U, .slow = true});
+}
+
+} // namespace
+
+BOOST_AUTO_TEST_CASE(ListenerServesServerEventsMySQL) {
+  pbt::check([](hegel::TestCase &tc) { listener_serves_server_events(tc, false); },
+             {.test_cases = 40U, .slow = true});
+}
+
+// The same with the S3 storage backend (SeaweedFS).
+BOOST_AUTO_TEST_CASE(ListenerServesServerEventsOnS3MySQL) {
+  pbt::check([](hegel::TestCase &tc) { listener_serves_server_events(tc, true); },
+             {.test_cases = 20U, .slow = true});
 }
 // ===========================================================================
 // D7: a MySQL replica of the replication source listener
@@ -1927,7 +2061,7 @@ BOOST_AUTO_TEST_CASE(PurgeOnServerMySQL) {
         const auto listing{list(tc, *storage)};
         for (const auto &item : listing.at("result").as_array()) {
           const std::string name{item.at("name").as_string()};
-          snapshot.emplace_back(name, read_file(storage->vault() / name));
+          snapshot.emplace_back(name, storage->stored(name));
           if (options.gtid_mode) {
             stored_gtids += gtids::gtid_set{std::string_view{item.at("previous_gtids").as_string()}};
             stored_gtids += gtids::gtid_set{std::string_view{item.at("added_gtids").as_string()}};
@@ -1966,7 +2100,7 @@ BOOST_AUTO_TEST_CASE(PurgeOnServerMySQL) {
         for (const auto &[name, content] : snapshot) {
           if (!on_server(name)) {
             only_in_storage.push_back(name);
-            pbt::require(read_file(storage->vault() / name) == content,
+            pbt::require(storage->stored(name) == content,
                          "fetch changed " + name +
                              ", which the server has purged");
           }
@@ -1980,7 +2114,7 @@ BOOST_AUTO_TEST_CASE(PurgeOnServerMySQL) {
           pbt::require_equal(count, snapshot.size(),
                              "a failed fetch adds no binlog");
           for (const auto &[name, content] : snapshot) {
-            pbt::require(read_file(storage->vault() / name) == content,
+            pbt::require(storage->stored(name) == content,
                          "a failed fetch changed " + name);
           }
         }
