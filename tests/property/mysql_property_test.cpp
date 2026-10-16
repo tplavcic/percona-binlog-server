@@ -27,14 +27,22 @@
 //  - 'list' reports the server's binlogs, sizes and (GTID mode) per-file
 //    previous / added GTIDs (from SHOW BINLOG EVENTS and gtid_executed);
 //  - 'search_by_gtid_set' returns the binlogs holding the GTIDs;
-//  - rewrite mode keeps every transaction, in order, in well-formed files.
+//  - rewrite mode keeps every transaction, in order, in well-formed files;
+//  - the replication source listener of 'pull' sends exactly the events
+//    the server sends from the same position, and a MySQL replica of the
+//    listener catches up with the source;
+//  - server restarts / crashes during 'pull' and PURGE BINARY LOGS on the
+//    server leave a storage that matches the server (or a fetch that fails
+//    cleanly when the server no longer has what the storage needs).
 //
 // The server: PBT_MYSQL_HOST / _PORT / _USER / _PASSWORD (set by
 // run_property_tests.py, which starts a private server with
 // extra/qa/mysqld.sh). It must run with log_bin, gtid_mode=ON and
 // binlog_checksum=CRC32, and its binlog files must be readable by this
 // process. Its binary logs and GTIDs are reset - never point these tests
-// at a server whose data matters.
+// at a server whose data matters. The replica properties use a second
+// server (PBT_MYSQL_REPLICA_PORT, mysqld.sh --replica), the restart
+// properties restart the server with PBT_MYSQLD_CTL (mysqld.sh).
 
 #define BOOST_TEST_MODULE MySqlPropertyTests
 
@@ -44,6 +52,8 @@
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <ctime>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -58,6 +68,9 @@
 #include <utility>
 #include <vector>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include <mysql/mysql.h>
@@ -66,6 +79,7 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <boost/json/array.hpp>
 #include <boost/json/object.hpp>
 #include <boost/json/parse.hpp>
 #include <boost/json/serialize.hpp>
@@ -116,11 +130,18 @@ using row = std::vector<std::optional<std::string>>;
 
 class sql_connection {
 public:
-  sql_connection() : handle_{::mysql_init(nullptr)} {
+  sql_connection() : sql_connection(std::nullopt) {}
+  // 'port': another server on the same host with the same account (the
+  // replica instance)
+  explicit sql_connection(std::optional<std::uint16_t> port)
+      : handle_{::mysql_init(nullptr)} {
     if (handle_ == nullptr) {
       throw std::runtime_error{"mysql_init failed"};
     }
-    const auto server{settings()};
+    auto server{settings()};
+    if (port) {
+      server.port = *port;
+    }
     const unsigned timeout{10U};
     ::mysql_options(handle_, MYSQL_OPT_CONNECT_TIMEOUT, &timeout);
     if (::mysql_real_connect(handle_, server.host.c_str(), server.user.c_str(),
@@ -178,6 +199,33 @@ public:
   }
 
   void exec(std::string_view statement) { std::ignore = query(statement); }
+
+  // the first row as column name -> value (empty if no row)
+  std::vector<std::pair<std::string, std::string>>
+  first_row_named(std::string_view statement) {
+    if (::mysql_real_query(handle_, statement.data(), statement.size()) != 0) {
+      throw std::runtime_error{"SQL error: " + std::string{statement} + ": " +
+                               ::mysql_error(handle_)};
+    }
+    std::vector<std::pair<std::string, std::string>> result;
+    MYSQL_RES *rows{::mysql_store_result(handle_)};
+    if (rows == nullptr) {
+      return result;
+    }
+    const auto fields{::mysql_num_fields(rows)};
+    const MYSQL_FIELD *names{::mysql_fetch_fields(rows)};
+    if (MYSQL_ROW values = ::mysql_fetch_row(rows)) {
+      const auto *lengths{::mysql_fetch_lengths(rows)};
+      for (unsigned i{0U}; i < fields; ++i) {
+        result.emplace_back(names[i].name,
+                            values[i] == nullptr
+                                ? std::string{}
+                                : std::string{values[i], lengths[i]});
+      }
+    }
+    ::mysql_free_result(rows);
+    return result;
+  }
 
   std::string scalar(std::string_view statement) {
     const auto rows{query(statement)};
@@ -656,6 +704,7 @@ std::string uuid_text(const std::string &data, std::size_t offset) {
   return result;
 }
 
+constexpr std::uint8_t stop_event{3U};
 constexpr std::uint8_t rotate_event{4U};
 constexpr std::uint8_t format_description_event{15U};
 constexpr std::uint8_t previous_gtids_event{35U};
@@ -668,6 +717,9 @@ struct walked_file {
   std::vector<std::string> untagged_gtids;  // "uuid:gno", in file order
   std::size_t transactions{};               // GTID / tagged / anonymous events
   std::size_t last_event_size{};
+  std::vector<std::size_t> offsets;  // start of every event
+  std::uint32_t min_timestamp{};     // over every event (0: no event)
+  std::uint32_t max_timestamp{};
 };
 
 // Walks the events of a binlog file with an independent reader: magic,
@@ -700,6 +752,12 @@ walked_file walk(const std::string &data, const std::string &what) {
                            std::to_string(offset) + " (type " +
                            std::to_string(type) + ")");
     result.types.push_back(type);
+    result.offsets.push_back(offset);
+    const auto timestamp{le32(data, offset)};
+    result.min_timestamp = result.types.size() == 1U
+                               ? timestamp
+                               : std::min(result.min_timestamp, timestamp);
+    result.max_timestamp = std::max(result.max_timestamp, timestamp);
     result.last_event_size = size;
     if (type == gtid_event) {
       // post header: flags (1), uuid (16), gno (8)
@@ -749,8 +807,9 @@ std::string first_difference(const std::string &expected,
 // are not dominated by it.
 //
 // PBT-033: in GTID mode a binlog that the storage has up to its last
-// transaction never gets the server's final ROTATE event: when the server
-// rotates, the next dump starts at the new binlog (auto-positioning).
+// transaction never gets the server's final ROTATE (rotation) or STOP
+// (server shutdown) event: the next dump starts at the new binlog
+// (auto-positioning).
 // Checked strictly by GtidResumeStoresRotateEventMySQL.
 struct tolerances {
   bool pbt_020{true};
@@ -758,19 +817,31 @@ struct tolerances {
 };
 
 // the storage holds exactly the server's binlogs, byte for byte, and 'list'
-// reports them (GTID mode: per-file previous / added GTIDs)
+// reports them (GTID mode: per-file previous / added GTIDs). Stored binlogs
+// named in 'ignore_stored' (purged on the server) are left out.
 void require_storage_matches_server(
     hegel::TestCase &tc, sql_connection &sql, const server_info &info,
-    const pbs_storage &storage, tolerances tolerate = {}) {
+    const pbs_storage &storage, tolerances tolerate = {},
+    const std::vector<std::string> &ignore_stored = {}) {
   auto binlogs{server_binlogs(sql)};
   const auto response{list(tc, storage)};
+  pbt::require_equal(std::string{response.at("status").as_string()},
+                     std::string{"success"}, "list status");
+  json::array stored_items;
+  for (const auto &item : response.at("result").as_array()) {
+    if (std::ranges::find(ignore_stored,
+                          std::string{item.at("name").as_string()}) ==
+        ignore_stored.end()) {
+      stored_items.push_back(item);
+    }
+  }
   // GTID auto-positioning: the server starts the dump at the newest binlog
   // whose PREVIOUS_GTIDS is a subset of the client's GTID set, so binlogs
   // without any transaction before that point are legitimately not sent.
   // Keep those the storage does not have only if they hold no transaction.
   if (storage.options.gtid_mode) {
     std::vector<std::string> stored_list;
-    for (const auto &item : response.at("result").as_array()) {
+    for (const auto &item : stored_items) {
       stored_list.emplace_back(item.at("name").as_string());
     }
     std::erase_if(binlogs, [&](const server_binlog &binlog) {
@@ -786,9 +857,7 @@ void require_storage_matches_server(
       return true;
     });
   }
-  pbt::require_equal(std::string{response.at("status").as_string()},
-                     std::string{"success"}, "list status");
-  const auto &stored{response.at("result").as_array()};
+  const auto &stored{stored_items};
   // stored binlogs (by name) that PBT-020 left as the 4-byte magic
   std::vector<std::string> preamble_only;
   if (tolerate.pbt_020) {
@@ -796,9 +865,15 @@ void require_storage_matches_server(
       const auto &item{stored[i]};
       const std::string name{item.at("name").as_string()};
       // position mode resumes in that binlog: only the newest can be left
-      // so; GTID mode can leave it behind (see above)
+      // so, or one the server left without ROTATE / STOP (killed: the dump
+      // re-sends its preamble and moves on to the next binlog); GTID mode
+      // can leave any behind (see above)
       if (!storage.options.gtid_mode && i + 1U != stored.size()) {
-        continue;
+        const auto events{walk(server_file(info, name), "server " + name)};
+        if (!events.types.empty() && (events.types.back() == rotate_event ||
+                                      events.types.back() == stop_event)) {
+          continue;
+        }
       }
       const auto server_binlog_it{std::ranges::find(
           binlogs, name, [](const server_binlog &binlog) { return binlog.name; })};
@@ -826,13 +901,14 @@ void require_storage_matches_server(
       const auto actual{read_file(storage.vault() / name)};
       const auto events{walk(expected, "server " + name)};
       if (actual.size() < expected.size() && !events.types.empty() &&
-          events.types.back() == rotate_event &&
+          (events.types.back() == rotate_event ||
+           events.types.back() == stop_event) &&
           expected.size() - actual.size() == events.last_event_size &&
           expected.compare(0U, actual.size(), actual) == 0) {
         without_rotate.push_back(name);
         server_binlog_it->size = actual.size();
         tc.note("(PBT-033 tolerated: " + name +
-                " stored without the server's final ROTATE)");
+                " stored without the server's final ROTATE / STOP)");
       }
     }
   }
@@ -869,6 +945,28 @@ void require_storage_matches_server(
     pbt::require(actual == expected, "stored " + name +
                                          " differs from the server's file: " +
                                          first_difference(expected, actual));
+    // list: the timestamps of the events the stored binlog holds
+    {
+      const auto events{walk(actual, "stored " + name)};
+      const auto iso_of{[](std::uint32_t value) {
+        const auto seconds{static_cast<std::time_t>(value)};
+        std::tm parts{};
+        ::gmtime_r(&seconds, &parts);
+        std::array<char, 32> text{};
+        const auto length{std::strftime(text.data(), text.size(),
+                                        "%Y-%m-%dT%H:%M:%S", &parts)};
+        return std::string{text.data(), length};
+      }};
+      const auto &item{stored[i].as_object()};
+      pbt::require_equal(std::string{item.at("min_timestamp").as_string()},
+                         iso_of(events.min_timestamp),
+                         "list: min_timestamp of " + name +
+                             " (earliest event in the stored file)");
+      pbt::require_equal(std::string{item.at("max_timestamp").as_string()},
+                         iso_of(events.max_timestamp),
+                         "list: max_timestamp of " + name +
+                             " (latest event in the stored file)");
+    }
     if (storage.options.gtid_mode) {
       const auto &item{stored[i].as_object()};
       pbt::require_equal(
@@ -897,6 +995,236 @@ void start_case(hegel::TestCase &tc, server_session &server) {
 
 void wait_ms(std::uint64_t milliseconds) {
   std::this_thread::sleep_for(std::chrono::milliseconds{milliseconds});
+}
+
+bool port_accepts_connections(std::uint16_t port) {
+  const int fd{::socket(AF_INET, SOCK_STREAM, 0)};
+  if (fd < 0) {
+    return false;
+  }
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_port = htons(port);
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+  const bool connected{::connect(fd, reinterpret_cast<sockaddr *>(&address),
+                                 sizeof address) == 0};
+  ::close(fd);
+  return connected;
+}
+
+// 'binlog_server pull' in the background, restartable. binlog_server
+// truncates its log when it starts: the logs of earlier runs are kept as
+// binsrv.log.<n>.
+class pull_process {
+public:
+  pull_process(hegel::TestCase &tc, const pbs_storage &storage)
+      : tc_{tc}, storage_{storage} {
+    launch();
+  }
+
+  void launch() {
+    std::error_code ignored;
+    if (fs::exists(storage_.log(), ignored)) {
+      fs::rename(storage_.log(),
+                 storage_.log().string() + "." + std::to_string(++runs_),
+                 ignored);
+    }
+    process_ = std::make_unique<background_run>(
+        std::vector<std::string>{"pull", storage_.config_path});
+  }
+
+  void require_running() {
+    if (const auto exited{process_->poll()}; exited) {
+      tc_.note("binlog_server log:" + log_tail(storage_));
+      pbt::fail("binlog_server pull exited on its own (" + exited->describe() +
+                ")");
+    }
+  }
+
+  void kill() {
+    process_->send(SIGKILL);
+    std::ignore = process_->wait();
+  }
+
+  // SIGTERM: stops within 20 s with exit code 0. A SIGTERM before the
+  // handlers are installed terminates any program, so wait for 'pull' to
+  // log that it has them.
+  void stop() {
+    wait_for_log("set custom handlers for SIGINT and SIGTERM",
+                 "pull did not install its signal handlers in 20 s");
+    process_->send(SIGTERM);
+    const auto [result, in_time]{process_->wait_for(std::chrono::seconds{20})};
+    if (!in_time || result.signaled || result.exit_code != 0) {
+      tc_.note("binlog_server log:" + log_tail(storage_));
+    }
+    pbt::require(in_time, "pull did not stop within 20 s of SIGTERM");
+    pbt::require(!result.signaled && result.exit_code == 0,
+                 "pull stopped by SIGTERM with " + result.describe());
+  }
+
+  // the replication source listener accepts connections
+  void wait_until_listening() {
+    const auto deadline{std::chrono::steady_clock::now() +
+                        std::chrono::seconds{20}};
+    while (!port_accepts_connections(listener_port())) {
+      require_running();
+      pbt::require(std::chrono::steady_clock::now() < deadline,
+                   "the replication source listener did not accept "
+                   "connections in 20 s");
+      wait_ms(20U);
+    }
+  }
+
+private:
+  void wait_for_log(std::string_view text, const std::string &timeout_message) {
+    const auto deadline{std::chrono::steady_clock::now() +
+                        std::chrono::seconds{20}};
+    while (read_file_if_exists(storage_.log()).find(text) == std::string::npos) {
+      require_running();
+      pbt::require(std::chrono::steady_clock::now() < deadline, timeout_message);
+      wait_ms(10U);
+    }
+  }
+
+  hegel::TestCase &tc_;
+  const pbs_storage &storage_;
+  std::size_t runs_{0U};
+  std::unique_ptr<background_run> process_;
+};
+
+// 'pull' has everything: the server's dump thread for it reports that it
+// has sent the whole binary log (seen twice 300 ms apart, then 500 ms for
+// PBS to process the last events). Without checkpointing the storage is
+// written only when pull stops, so the server's view is the only one.
+void wait_until_pull_caught_up(hegel::TestCase &tc, sql_connection &sql,
+                               pull_process &pull) {
+  const auto deadline{std::chrono::steady_clock::now() +
+                      std::chrono::seconds{60}};
+  const auto all_sent{[&sql]() {
+    return !sql.query("SELECT id FROM information_schema.processlist "
+                      "WHERE command LIKE 'Binlog Dump%' AND state LIKE "
+                      "'%has sent all binlog%'")
+                .empty();
+  }};
+  std::size_t seen{0U};
+  while (seen < 2U) {
+    pull.require_running();
+    if (std::chrono::steady_clock::now() >= deadline) {
+      tc.note("(pull did not report catching up in 60 s)");
+      break;
+    }
+    seen = all_sent() ? seen + 1U : 0U;
+    wait_ms(300U);
+  }
+  wait_ms(500U);
+}
+
+// ---------------------------------------------------------------------------
+// a binlog dump client (libmysqlclient MYSQL_RPL, as PBS itself uses it):
+// the events a replica receives, non-blocking (ends at the last event)
+// ---------------------------------------------------------------------------
+struct dump_result {
+  std::vector<std::string> events;  // without the 0x00 packet prefix
+  std::string error;                // empty: the dump reached the end
+};
+
+dump_result dump_binlog(std::uint16_t port, const std::string &user,
+                        const std::string &password, const std::string &file,
+                        std::uint64_t position, bool checksum) {
+  dump_result result;
+  MYSQL *handle{::mysql_init(nullptr)};
+  if (handle == nullptr) {
+    throw std::runtime_error{"mysql_init failed"};
+  }
+  const unsigned timeout{10U};
+  ::mysql_options(handle, MYSQL_OPT_CONNECT_TIMEOUT, &timeout);
+  ::mysql_options(handle, MYSQL_OPT_READ_TIMEOUT, &timeout);
+  const bool get_public_key{true};
+  ::mysql_options(handle, MYSQL_OPT_GET_SERVER_PUBLIC_KEY, &get_public_key);
+  ::mysql_options(handle, MYSQL_DEFAULT_AUTH, "caching_sha2_password");
+  const auto fail{[&](const std::string &what) {
+    result.error = what + ": " + ::mysql_error(handle);
+    ::mysql_close(handle);
+    return result;
+  }};
+  if (::mysql_real_connect(handle, "127.0.0.1", user.c_str(), password.c_str(),
+                           nullptr, port, nullptr, 0) == nullptr) {
+    return fail("connect");
+  }
+  // the statement PBS's own client sends (easymysql::connection)
+  const std::string label{checksum ? "CRC32" : "NONE"};
+  const std::string statement{"SET @source_binlog_checksum = '" + label +
+                              "', @master_binlog_checksum = '" + label + "'"};
+  if (::mysql_real_query(handle, statement.data(), statement.size()) != 0) {
+    return fail("SET @source_binlog_checksum");
+  }
+  constexpr unsigned binlog_dump_non_block{1U};
+  MYSQL_RPL rpl{.file_name_length = file.size(),
+                .file_name = file.c_str(),
+                .start_position = position,
+                .server_id = 6161U,
+                .flags = MYSQL_RPL_SKIP_HEARTBEAT | binlog_dump_non_block,
+                .gtid_set_encoded_size = 0U,
+                .fix_gtid_set = nullptr,
+                .gtid_set_arg = nullptr,
+                .size = 0U,
+                .buffer = nullptr};
+  if (::mysql_binlog_open(handle, &rpl) != 0) {
+    return fail("mysql_binlog_open");
+  }
+  for (;;) {
+    if (::mysql_binlog_fetch(handle, &rpl) != 0) {
+      result.error = std::string{"mysql_binlog_fetch: "} + ::mysql_error(handle);
+      break;
+    }
+    if (rpl.size == 0U) {
+      break;  // end of the non-blocking dump
+    }
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    const auto *bytes{reinterpret_cast<const char *>(rpl.buffer)};
+    if (bytes[0] != 0) {
+      result.error = "event packet without the 0x00 prefix";
+      break;
+    }
+    result.events.emplace_back(bytes + 1, rpl.size - 1U);
+  }
+  ::mysql_binlog_close(handle, &rpl);
+  ::mysql_close(handle);
+  return result;
+}
+
+std::string describe_event(const std::string &event) {
+  if (event.size() < 19U) {
+    return "(" + std::to_string(event.size()) + " bytes)";
+  }
+  return "type " +
+         std::to_string(static_cast<unsigned>(static_cast<unsigned char>(event[4]))) +
+         ", size " + std::to_string(event.size()) + ", log_pos " +
+         std::to_string(le32(event, 13U)) + ", flags " +
+         std::to_string(static_cast<unsigned>(static_cast<unsigned char>(event[17])) |
+                        (static_cast<unsigned>(static_cast<unsigned char>(event[18])) << 8U));
+}
+
+// ---------------------------------------------------------------------------
+// restarting / crashing the server (extra/qa/mysqld.sh, PBT_MYSQLD_CTL)
+// ---------------------------------------------------------------------------
+void control_server(const std::string &command) {
+  const auto script{pbt::detail::env("PBT_MYSQLD_CTL")};
+  if (!script) {
+    pbt::infrastructure_error(
+        "server restarts need PBT_MYSQLD_CTL (the private server of "
+        "extra/qa/mysqld.sh, started by run_property_tests.py)");
+  }
+  std::string shell_command;
+  if (const auto workdir{pbt::detail::env("PBT_MYSQLD_WORKDIR")}; workdir) {
+    shell_command += "WORKDIR='" + *workdir + "' ";
+  }
+  shell_command += "'" + *script + "' " + command + " >/dev/null 2>&1";
+  // NOLINTNEXTLINE(concurrency-mt-unsafe,cert-env33-c)
+  if (std::system(shell_command.c_str()) != 0) {
+    pbt::infrastructure_error("extra/qa/mysqld.sh " + command + " failed");
+  }
 }
 
 } // namespace
@@ -1021,55 +1349,7 @@ BOOST_AUTO_TEST_CASE(KilledPullResumesMySQL) {
         const auto options{draw_options(tc)};
         tc.note("binlog_server: " + describe(options));
         const auto storage{make_storage(options)};
-        const std::vector<std::string> pull_arguments{"pull", storage->config_path};
-        // binlog_server truncates its log when it starts: keep the logs
-        // of earlier runs as binsrv.log.<n>
-        std::size_t runs{0U};
-        const auto launch{[&]() {
-          std::error_code ignored;
-          if (fs::exists(storage->log(), ignored)) {
-            fs::rename(storage->log(),
-                       storage->log().string() + "." + std::to_string(++runs),
-                       ignored);
-          }
-          return std::make_unique<background_run>(pull_arguments);
-        }};
-        auto pull{launch()};
-        const auto restart{[&]() { pull = launch(); }};
-
-        const auto require_still_running{[&]() {
-          if (const auto exited{pull->poll()}; exited) {
-            tc.note("binlog_server log:" + log_tail(*storage));
-            pbt::fail("binlog_server pull exited on its own (" +
-                      exited->describe() + ")");
-          }
-        }};
-        const auto stop_gracefully{[&]() {
-          // a SIGTERM before the handlers are installed terminates any
-          // program: wait until 'pull' has logged that it has them
-          const auto deadline{std::chrono::steady_clock::now() +
-                              std::chrono::seconds{20}};
-          const auto handlers_installed{[&]() {
-            return read_file_if_exists(storage->log())
-                       .find("set custom handlers for SIGINT and SIGTERM") !=
-                   std::string::npos;
-          }};
-          while (!handlers_installed()) {
-            require_still_running();
-            pbt::require(std::chrono::steady_clock::now() < deadline,
-                         "pull did not install its signal handlers in 20 s");
-            wait_ms(10U);
-          }
-          pull->send(SIGTERM);
-          const auto [result, in_time]{pull->wait_for(std::chrono::seconds{20})};
-          if (!in_time || result.signaled || result.exit_code != 0) {
-            tc.note("binlog_server log:" + log_tail(*storage));
-          }
-          pbt::require(in_time, "pull did not stop within 20 s of SIGTERM");
-          pbt::require(!result.signaled && result.exit_code == 0,
-                       "pull stopped by SIGTERM with " + result.describe());
-        }};
-
+        pull_process pull{tc, *storage};
         const auto steps{tc.draw(
             "steps", gs::integers<std::size_t>({.min_value = 1U, .max_value = 8U}))};
         for (std::size_t step{0U}; step < steps; ++step) {
@@ -1088,24 +1368,21 @@ BOOST_AUTO_TEST_CASE(KilledPullResumesMySQL) {
             const auto delay{tc.draw(
                 "delay_ms", gs::sampled_from<std::uint64_t>({0U, 5U, 50U, 300U}))};
             wait_ms(delay);
-            require_still_running();
+            pull.require_running();
             if (action == "kill") {
               tc.note("kill -9 pull after " + std::to_string(delay) + " ms");
-              pull->send(SIGKILL);
-              std::ignore = pull->wait();
+              pull.kill();
             } else {
               tc.note("SIGTERM pull after " + std::to_string(delay) + " ms");
-              stop_gracefully();
+              pull.stop();
             }
-            restart();
+            pull.launch();
           }
         }
-        // pull receives events as they are written; read_timeout and
-        // idle_time are 1 s, so 3 s is enough to catch up after a reconnect
-        wait_ms(3000U);
-        require_still_running();
+        wait_until_pull_caught_up(tc, server.sql, pull);
+        pull.require_running();
         tc.note("SIGTERM pull, compare, then fetch and compare again");
-        stop_gracefully();
+        pull.stop();
         require_storage_matches_server(tc, server.sql, server.info, *storage);
         fetch(tc, *storage);
         require_storage_matches_server(tc, server.sql, server.info, *storage);
@@ -1285,4 +1562,428 @@ BOOST_AUTO_TEST_CASE(RewriteModeKeepsTransactionsMySQL) {
 BOOST_AUTO_TEST_CASE(RewriteModeWithoutChecksumVerificationMySQL) {
   pbt::check([](hegel::TestCase &tc) { check_rewrite_mode(tc, false); },
              {.test_cases = 10U, .slow = true});
+}
+
+// ===========================================================================
+// D6: the replication source listener serves the server's events
+// ===========================================================================
+
+// After a fetch, 'pull' serves the storage on its replication source
+// listener. A binlog dump from the listener (libmysqlclient MYSQL_RPL,
+// COM_BINLOG_DUMP, non-blocking) starting at any event of any stored binlog
+// receives exactly the events a dump from the MySQL server itself
+// receives from the same position, including the artificial ROTATE /
+// FORMAT_DESCRIPTION at the start and the ROTATEs between binlogs.
+BOOST_AUTO_TEST_CASE(ListenerServesServerEventsMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        start_case(tc, server);
+        const auto options{draw_options(tc)};
+        tc.note("binlog_server: " + describe(options));
+        const auto storage{make_storage(options)};
+        tc.note("workload:");
+        auto workload{draw_workload(tc, server.info, 10U)};
+        // the newest binlog ends with a transaction (PBT-020)
+        workload.push_back(operation{.kind = op_kind::insert_rows, .count = 1});
+        apply_all(tc, server.sql, workload);
+        fetch(tc, *storage);
+        require_storage_matches_server(tc, server.sql, server.info, *storage);
+
+        // a stored binlog and one of its event boundaries
+        std::vector<std::string> names;
+        const auto stored_listing{list(tc, *storage)};
+        for (const auto &item : stored_listing.at("result").as_array()) {
+          names.emplace_back(item.at("name").as_string());
+        }
+        const auto file{names[tc.draw(
+            "file", gs::integers<std::size_t>({.max_value = names.size() - 1U}))]};
+        const auto offsets{walk(server_file(server.info, file), "server " + file).offsets};
+        const auto position{offsets[tc.draw(
+            "event", gs::integers<std::size_t>({.max_value = offsets.size() - 1U}))]};
+        const auto checksum{tc.draw("checksum", gs::booleans())};
+        tc.note("dump from " + file + ":" + std::to_string(position) +
+                (checksum ? ", CRC32" : ", NONE"));
+
+        pull_process pull{tc, *storage};
+        pull.wait_until_listening();
+        const auto server_settings_value{settings()};
+        const auto direct{dump_binlog(static_cast<std::uint16_t>(server_settings_value.port),
+                                      server_settings_value.user,
+                                      server_settings_value.password, file,
+                                      position, checksum)};
+        const auto served{dump_binlog(listener_port(), "replica",
+                                      "replica-password", file, position,
+                                      checksum)};
+        pull.stop();
+        pbt::require(direct.error.empty(),
+                     "dump from the MySQL server failed: " + direct.error);
+        pbt::require(direct.events.size() >= 2U,
+                     "the server's dump starts with ROTATE and "
+                     "FORMAT_DESCRIPTION");
+        tc.note("server sent " + std::to_string(direct.events.size()) +
+                " events, the listener " + std::to_string(served.events.size()));
+        pbt::require(served.error.empty(),
+                     "dump from the replication source listener failed: " +
+                         served.error);
+        const auto common{std::min(direct.events.size(), served.events.size())};
+        for (std::size_t i{0U}; i < common; ++i) {
+          if (direct.events[i] != served.events[i]) {
+            tc.note("event " + std::to_string(i) + ": server " +
+                    describe_event(direct.events[i]) + "; listener " +
+                    describe_event(served.events[i]) + "; " +
+                    first_difference(direct.events[i], served.events[i]));
+          }
+          pbt::require(direct.events[i] == served.events[i],
+                       "the listener sent an event that differs from the "
+                       "server's");
+        }
+        pbt::require_equal(served.events.size(), direct.events.size(),
+                           "number of events");
+      },
+      {.test_cases = 40U, .slow = true});
+}
+// ===========================================================================
+// D7: a MySQL replica of the replication source listener
+// ===========================================================================
+
+namespace {
+
+std::string field(const std::vector<std::pair<std::string, std::string>> &columns,
+                  std::string_view name) {
+  for (const auto &[key, value] : columns) {
+    if (key == name) {
+      return value;
+    }
+  }
+  return {};
+}
+
+// the second private server (mysqld.sh --replica), reset to an empty
+// replica with the test schema
+class replica_session {
+public:
+  replica_session()
+      : sql_{[]() -> std::uint16_t {
+          const auto port{pbt::detail::env("PBT_MYSQL_REPLICA_PORT")};
+          if (!port) {
+            pbt::infrastructure_error(
+                "replica server not configured: PBT_MYSQL_REPLICA_PORT "
+                "(extra/qa/mysqld.sh --replica start; run_property_tests.py "
+                "does this)");
+          }
+          return static_cast<std::uint16_t>(std::stoul(*port));
+        }()} {
+    sql_.exec("STOP REPLICA");
+    sql_.exec("RESET REPLICA ALL");
+    const server_info info{inspect(sql_)};
+    sql_.exec(info.reset_statement());
+    sql_.exec("SET SESSION sql_log_bin = 0");
+    sql_.exec("DROP DATABASE IF EXISTS pbt");
+    sql_.exec("CREATE DATABASE pbt");
+    sql_.exec("CREATE TABLE pbt.t1 (id INT NOT NULL AUTO_INCREMENT PRIMARY "
+              "KEY, v INT NOT NULL, b LONGBLOB) ENGINE=InnoDB");
+    sql_.exec("SET SESSION sql_log_bin = 1");
+  }
+  replica_session(const replica_session &) = delete;
+  replica_session &operator=(const replica_session &) = delete;
+  replica_session(replica_session &&) = delete;
+  replica_session &operator=(replica_session &&) = delete;
+  ~replica_session() {
+    try {
+      sql_.exec("STOP REPLICA");
+    } catch (const std::exception &) {
+    }
+  }
+
+  sql_connection &sql() { return sql_; }
+
+private:
+  sql_connection sql_;
+};
+
+} // namespace
+
+// The README: "the built-in MySQL-compatible listener ... so that
+// downstream replicas can dump binary log events from it". A MySQL server
+// configured as a replica of the listener (position-based, from the first
+// binlog) while 'pull' runs and the workload continues ends up with the
+// source's gtid_executed and the same table contents.
+BOOST_AUTO_TEST_CASE(ReplicaOfListenerMatchesSourceMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        replica_session replica;
+        start_case(tc, server);
+        const auto options{draw_options(tc)};
+        tc.note("binlog_server: " + describe(options));
+        const auto storage{make_storage(options)};
+        pull_process pull{tc, *storage};
+        pull.wait_until_listening();
+        const auto first{server_binlogs(server.sql).front().name};
+        replica.sql().exec(
+            "CHANGE REPLICATION SOURCE TO SOURCE_HOST = '127.0.0.1', "
+            "SOURCE_PORT = " + std::to_string(listener_port()) +
+            ", SOURCE_USER = 'replica', SOURCE_PASSWORD = 'replica-password', "
+            "SOURCE_LOG_FILE = '" + first + "', SOURCE_LOG_POS = 4, "
+            "GET_SOURCE_PUBLIC_KEY = 1, SOURCE_CONNECT_RETRY = 1");
+        replica.sql().exec("START REPLICA");
+        const auto require_no_replica_error{[&]() {
+          const auto status{replica.sql().first_row_named("SHOW REPLICA STATUS")};
+          const auto io_error{field(status, "Last_IO_Error")};
+          const auto sql_error{field(status, "Last_SQL_Error")};
+          if (!io_error.empty() || !sql_error.empty()) {
+            tc.note("Last_IO_Error: " + io_error);
+            tc.note("Last_SQL_Error: " + sql_error);
+            tc.note("binlog_server log:" + log_tail(*storage));
+          }
+          pbt::require(io_error.empty(), "replica I/O thread error: " + io_error);
+          pbt::require(sql_error.empty(), "replica SQL thread error: " + sql_error);
+          return status;
+        }};
+        // the replica connects and waits for events (checked before any
+        // workload: a connection failure does not depend on it)
+        {
+          const auto deadline{std::chrono::steady_clock::now() +
+                              std::chrono::seconds{15}};
+          for (;;) {
+            const auto status{require_no_replica_error()};
+            if (field(status, "Replica_IO_State").find("Waiting for") !=
+                    std::string::npos &&
+                field(status, "Replica_IO_Running") == "Yes") {
+              break;
+            }
+            pbt::require(std::chrono::steady_clock::now() < deadline,
+                         "the replica did not connect to the listener in 15 s");
+            wait_ms(50U);
+          }
+        }
+        tc.note("workload while replicating:");
+        auto workload{draw_workload(tc, server.info, 8U)};
+        workload.push_back(operation{.kind = op_kind::insert_rows, .count = 1});
+        apply_all(tc, server.sql, workload);
+
+        const auto expected{server_executed(server.sql)};
+        const auto deadline{std::chrono::steady_clock::now() +
+                            std::chrono::seconds{30}};
+        for (;;) {
+          std::ignore = require_no_replica_error();
+          if (server_executed(replica.sql()) == expected) {
+            break;
+          }
+          pull.require_running();
+          pbt::require(std::chrono::steady_clock::now() < deadline,
+                       "the replica did not catch up with the source in 30 s");
+          wait_ms(100U);
+        }
+        const auto checksum_of{[](sql_connection &sql) {
+          return sql.query("CHECKSUM TABLE pbt.t1").at(0).at(1).value_or("NULL");
+        }};
+        pbt::require_equal(checksum_of(replica.sql()), checksum_of(server.sql),
+                           "CHECKSUM TABLE pbt.t1 on the replica and the source");
+        pull.stop();
+      },
+      {.test_cases = 20U, .slow = true});
+}
+
+// ===========================================================================
+// D8: the server restarts / crashes while pull runs
+// ===========================================================================
+
+// The MySQL server is restarted (graceful shutdown: the binlog ends with
+// STOP) or killed with SIGKILL and restarted (crash recovery: the binlog
+// ends without STOP / ROTATE) at random points while 'pull' runs. 'pull'
+// treats it as a network error, reconnects and never exits; afterwards the
+// storage matches the server, also after a 'fetch'.
+BOOST_AUTO_TEST_CASE(ServerRestartDuringPullMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        auto server{std::make_unique<server_session>()};
+        start_case(tc, *server);
+        const auto options{draw_options(tc)};
+        tc.note("binlog_server: " + describe(options));
+        const auto storage{make_storage(options)};
+        // a crash in a binlog without transactions is PBT-035 (checked by
+        // CrashInBinlogWithoutTransactionsMySQL); after a restart the new
+        // binlog starts with the account statements of mysqld.sh's
+        // init file
+        apply_all(tc, server->sql,
+                  {operation{.kind = op_kind::insert_rows, .count = 1}});
+        pull_process pull{tc, *storage};
+        const auto steps{tc.draw(
+            "steps", gs::integers<std::size_t>({.min_value = 1U, .max_value = 5U}))};
+        for (std::size_t step{0U}; step < steps; ++step) {
+          const auto action{tc.draw(
+              "action", gs::sampled_from<std::string>(
+                            {"workload", "workload", "restart", "crash", "sleep"}))};
+          if (action == "workload") {
+            tc.note("workload:");
+            apply_all(tc, server->sql, draw_workload(tc, server->info, 3U));
+          } else if (action == "sleep") {
+            const auto delay{tc.draw("sleep_ms", gs::sampled_from<std::uint64_t>(
+                                                     {50U, 500U, 2500U}))};
+            tc.note("sleep " + std::to_string(delay) + " ms");
+            wait_ms(delay);
+          } else {
+            tc.note(action == "restart" ? "restart the server"
+                                        : "kill -9 the server and restart it");
+            server.reset();
+            control_server(action);
+            server = std::make_unique<server_session>();
+            pull.require_running();
+          }
+        }
+        // reconnects every idle_time (1 s) while the server is down
+        wait_until_pull_caught_up(tc, server->sql, pull);
+        pull.require_running();
+        tc.note("SIGTERM pull, compare, then fetch and compare again");
+        pull.stop();
+        require_storage_matches_server(tc, server->sql, server->info, *storage);
+        fetch(tc, *storage);
+        require_storage_matches_server(tc, server->sql, server->info, *storage);
+      },
+      {.test_cases = 12U, .slow = true});
+}
+
+// The server is killed while its newest binlog has no transaction yet
+// (right after a reset or FLUSH BINARY LOGS), so after crash recovery that
+// binlog ends without ROTATE / STOP and the server continues in a new one.
+// A fetch then succeeds and the storage (contents, list timestamps)
+// matches the server.
+BOOST_AUTO_TEST_CASE(CrashInBinlogWithoutTransactionsMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        auto server{std::make_unique<server_session>()};
+        start_case(tc, *server);
+        const auto options{draw_options(tc)};
+        tc.note("binlog_server: " + describe(options));
+        const auto storage{make_storage(options)};
+        tc.note("workload:");
+        auto workload{draw_workload(tc, server->info, 3U)};
+        if (!workload.empty()) {
+          workload.push_back(operation{.kind = op_kind::flush});
+        }
+        apply_all(tc, server->sql, workload);
+        if (tc.draw("fetch_before_crash", gs::booleans())) {
+          tc.note("fetch");
+          fetch(tc, *storage);
+        }
+        tc.note("kill -9 the server and restart it");
+        server.reset();
+        control_server("crash");
+        server = std::make_unique<server_session>();
+        fetch(tc, *storage);
+        require_storage_matches_server(tc, server->sql, server->info, *storage);
+      },
+      {.test_cases = 10U, .slow = true});
+}
+
+// ===========================================================================
+// D9: PURGE BINARY LOGS on the server
+// ===========================================================================
+
+// The server purges binlogs (PURGE BINARY LOGS TO) before / after the
+// storage got them. When everything the storage still needs is on the
+// server (position mode: its newest binlog; GTID mode: gtid_purged is
+// covered by the stored GTIDs; an empty storage starts at the oldest
+// binlog / from gtid_purged) the next fetch succeeds and the storage
+// matches the server's remaining binlogs, with the binlogs only the
+// storage has left unchanged. Otherwise fetch fails (exit code 1, no
+// crash) and leaves the storage unchanged.
+BOOST_AUTO_TEST_CASE(PurgeOnServerMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        start_case(tc, server);
+        const auto options{draw_options(tc)};
+        tc.note("binlog_server: " + describe(options));
+        const auto storage{make_storage(options)};
+        tc.note("round 1:");
+        auto first{draw_workload(tc, server.info, 4U)};
+        first.push_back(operation{.kind = op_kind::insert_rows, .count = 1});
+        first.push_back(operation{.kind = op_kind::flush});
+        apply_all(tc, server.sql, first);
+        const auto fetch_before{tc.draw("fetch_before_purge", gs::booleans())};
+        if (fetch_before) {
+          tc.note("fetch");
+          fetch(tc, *storage);
+        }
+        tc.note("round 2:");
+        auto second{draw_workload(tc, server.info, 4U)};
+        second.push_back(operation{.kind = op_kind::flush});
+        second.push_back(operation{.kind = op_kind::insert_rows, .count = 1});
+        apply_all(tc, server.sql, second);
+
+        const auto before_purge{server_binlogs(server.sql)};
+        const auto keep_from{tc.draw(
+            "purge_to", gs::integers<std::size_t>({.max_value = before_purge.size() - 1U}))};
+        tc.note("PURGE BINARY LOGS TO '" + before_purge[keep_from].name + "'");
+        server.sql.exec("PURGE BINARY LOGS TO '" + before_purge[keep_from].name + "'");
+        const auto remaining{server_binlogs(server.sql)};
+
+        // the storage before the second fetch
+        std::vector<std::pair<std::string, std::string>> snapshot;
+        gtids::gtid_set stored_gtids;
+        const auto listing{list(tc, *storage)};
+        for (const auto &item : listing.at("result").as_array()) {
+          const std::string name{item.at("name").as_string()};
+          snapshot.emplace_back(name, read_file(storage->vault() / name));
+          if (options.gtid_mode) {
+            stored_gtids += gtids::gtid_set{std::string_view{item.at("previous_gtids").as_string()}};
+            stored_gtids += gtids::gtid_set{std::string_view{item.at("added_gtids").as_string()}};
+          }
+        }
+        const auto on_server{[&](const std::string &name) {
+          return std::ranges::any_of(remaining, [&](const server_binlog &binlog) {
+            return binlog.name == name;
+          });
+        }};
+        // true: must succeed; false: must fail; nullopt: either
+        std::optional<bool> resumable;
+        if (snapshot.empty()) {
+          resumable = true;
+        } else if (options.gtid_mode) {
+          const gtids::gtid_set purged{strip_spaces(
+              server.sql.scalar("SELECT @@GLOBAL.gtid_purged"))};
+          resumable = (purged - stored_gtids).is_empty();
+        } else if (on_server(snapshot.back().first)) {
+          resumable = true;
+        }
+
+        const auto result{run({"fetch", storage->config_path})};
+        tc.note("fetch: " + result.describe());
+        pbt::require(!result.signaled, "fetch crashed (" + result.describe() + ")");
+        const bool succeeded{result.exit_code == 0};
+        if (resumable.has_value()) {
+          if (*resumable && !succeeded) {
+            tc.note("binlog_server log:" + log_tail(*storage));
+          }
+          pbt::require_equal(succeeded, *resumable,
+                             "fetch succeeds exactly when the server still has "
+                             "what the storage needs");
+        }
+        std::vector<std::string> only_in_storage;
+        for (const auto &[name, content] : snapshot) {
+          if (!on_server(name)) {
+            only_in_storage.push_back(name);
+            pbt::require(read_file(storage->vault() / name) == content,
+                         "fetch changed " + name +
+                             ", which the server has purged");
+          }
+        }
+        if (succeeded) {
+          require_storage_matches_server(tc, server.sql, server.info, *storage,
+                                         {}, only_in_storage);
+        } else {
+          const auto after{list(tc, *storage)};
+          const auto count{after.at("result").as_array().size()};
+          pbt::require_equal(count, snapshot.size(),
+                             "a failed fetch adds no binlog");
+          for (const auto &[name, content] : snapshot) {
+            pbt::require(read_file(storage->vault() / name) == content,
+                         "a failed fetch changed " + name);
+          }
+        }
+      },
+      {.test_cases = 40U, .slow = true});
 }
