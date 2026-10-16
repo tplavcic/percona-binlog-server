@@ -78,6 +78,9 @@ PBT_REPO_DIR="$(cd "${PBT_QA_DIR}/../.." && pwd)"
 : "${MYSQLD_USER:=pbt}"
 : "${MYSQLD_PASSWORD:=pbt-password}"
 : "${MYSQLD_START_TIMEOUT:=120}"
+# second instance: downstream replica of the Binlog Server listener
+: "${MYSQLD_REPLICA_DIR:=${WORKDIR}/mysql-pbt-replica}"
+: "${MYSQLD_REPLICA_PORT:=13307}"
 # optional binary tarball setup_pbt_env.sh --with-mysql unpacks into
 # $WORKDIR/mysql (Percona Server 8.4 LTS, minimal build for glibc 2.35 =
 # Ubuntu 22.04); check https://www.percona.com/downloads for the current one
