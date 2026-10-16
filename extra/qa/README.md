@@ -120,6 +120,11 @@ a dependency), on storages under `$TMPDIR`.
 Known bugs are reported as failures in JUnit (`--known-as failure`, the
 default), so they stay visible in Jenkins; `--known-as skipped` hides them.
 
+Every property runs in its own process group. When the runner is
+terminated (SIGTERM / SIGINT / SIGHUP, e.g. an aborted Jenkins build) it
+kills the running properties, so none keeps running (or restarting the
+MySQL server) on its own; servers it started are left running then.
+
 The exit code (`--fail-on`) is set as follows. With `new` (the default) it
 is `1` when there are new issues, regressions or infrastructure errors.
 With `any` it is `1` on any failure. With `never` it is always `0`.
@@ -158,11 +163,17 @@ GTIDs, so they use a private, throw-away server: by default
 `PBT_MYSQL_PORT` is not set, and stops it after the run (its data
 directory `$WORKDIR/mysql-pbt` is kept, so the next start is quick).
 `--mysql off` skips these properties. The MySQL properties never run in
-parallel with each other (`--jobs`).
+parallel with each other (`--jobs`). A second instance (`mysqld.sh
+--replica`, port 13307, `$WORKDIR/mysql-pbt-replica`) is started as well:
+it acts as a MySQL replica of the Binlog Server's replication source
+listener. Properties that restart or crash the server use
+`PBT_MYSQLD_CTL` (= this script), so they need the private server.
 
 ```bash
 extra/qa/mysqld.sh start            # mysqld on 127.0.0.1:13306, data in $WORKDIR/mysql-pbt
 eval "$(extra/qa/mysqld.sh env)"    # PBT_MYSQL_HOST / _PORT / _USER / _PASSWORD
+extra/qa/mysqld.sh restart          # graceful restart / 'crash': kill -9 and start
+extra/qa/mysqld.sh --replica start  # the replica instance (same commands)
 extra/qa/mysqld.sh stop
 extra/qa/mysqld.sh wipe             # stop and delete the instance
 ```

@@ -19,11 +19,17 @@
 # WORKDIR), it listens on 127.0.0.1:$MYSQLD_PORT only, and the tests reset
 # its binary logs and GTIDs. A system MySQL server is never touched.
 #
-#   extra/qa/mysqld.sh start   # initialize (first time) and start
-#   extra/qa/mysqld.sh stop    # stop
-#   extra/qa/mysqld.sh status  # exit 0 if the server accepts connections
-#   extra/qa/mysqld.sh env     # print PBT_MYSQL_* variables to 'eval'
-#   extra/qa/mysqld.sh wipe    # stop and delete the instance
+#   extra/qa/mysqld.sh [--replica] start    # initialize (first time) and start
+#   extra/qa/mysqld.sh [--replica] stop     # stop
+#   extra/qa/mysqld.sh [--replica] restart  # stop (graceful) and start
+#   extra/qa/mysqld.sh [--replica] crash    # kill -9 and start (crash recovery)
+#   extra/qa/mysqld.sh [--replica] status   # exit 0 if it accepts connections
+#   extra/qa/mysqld.sh [--replica] env      # print PBT_MYSQL_* variables to 'eval'
+#   extra/qa/mysqld.sh [--replica] wipe     # stop and delete the instance
+#
+# --replica: the second instance ($MYSQLD_REPLICA_DIR, port
+# $MYSQLD_REPLICA_PORT, server_id 2) used as a downstream replica of the
+# Binlog Server's replication source listener.
 #
 # mysqld: $MYSQLD_BASEDIR/bin/mysqld, else $WORKDIR/mysql/bin/mysqld, else
 # mysqld from PATH or /usr/sbin/mysqld. Settings: MYSQLD_* in pbt_env.sh.
@@ -31,6 +37,16 @@
 set -euo pipefail
 # shellcheck source=extra/qa/pbt_env.sh
 source "$(dirname "${BASH_SOURCE[0]}")/pbt_env.sh"
+
+instance=source
+server_id=1
+if [[ "${1:-}" == "--replica" ]]; then
+  shift
+  instance=replica
+  server_id=2
+  MYSQLD_DIR="${MYSQLD_REPLICA_DIR}"
+  MYSQLD_PORT="${MYSQLD_REPLICA_PORT}"
+fi
 
 data_dir="${MYSQLD_DIR}/data"
 run_dir="${MYSQLD_DIR}/run"
@@ -91,7 +107,7 @@ server_options() {
     "--port=${MYSQLD_PORT}" \
     --bind-address=127.0.0.1 \
     --mysqlx=OFF \
-    --server-id=1 \
+    "--server-id=${server_id}" \
     --log-bin=binlog \
     --gtid-mode=ON \
     --enforce-gtid-consistency=ON \
@@ -151,6 +167,21 @@ EOF
   fail_start "mysqld did not accept connections on 127.0.0.1:${MYSQLD_PORT} in ${MYSQLD_START_TIMEOUT}s"
 }
 
+# kill -9: the next start runs InnoDB and binlog crash recovery
+crash() {
+  if is_running; then
+    local pid
+    pid="$(cat "${pid_file}")"
+    pbt_log "killing mysqld (pid ${pid}) with SIGKILL"
+    kill -9 "${pid}" 2>/dev/null || true
+    for _ in $(seq 1 30); do
+      kill -0 "${pid}" 2>/dev/null || break
+      sleep 1
+    done
+  fi
+  rm -f "${pid_file}"
+}
+
 stop() {
   if is_running; then
     local pid
@@ -169,6 +200,8 @@ stop() {
 case "${1:-}" in
   start) start ;;
   stop) stop ;;
+  restart) stop; start ;;
+  crash) crash; start ;;
   status)
     if is_running && accepts_connections; then
       echo "running (pid $(cat "${pid_file}")) 127.0.0.1:${MYSQLD_PORT}"
@@ -176,17 +209,26 @@ case "${1:-}" in
       echo "not running"; exit 1
     fi ;;
   env)
-    cat <<EOF
+    if [[ "${instance}" == replica ]]; then
+      cat <<EOF
+export PBT_MYSQL_REPLICA_PORT='${MYSQLD_PORT}'
+EOF
+    else
+      # PBT_MYSQLD_CTL: how a property restarts / crashes this server
+      cat <<EOF
 export PBT_MYSQL_HOST='127.0.0.1'
 export PBT_MYSQL_PORT='${MYSQLD_PORT}'
 export PBT_MYSQL_USER='${MYSQLD_USER}'
 export PBT_MYSQL_PASSWORD='${MYSQLD_PASSWORD}'
+export PBT_MYSQLD_CTL='$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/mysqld.sh'
+export PBT_MYSQLD_WORKDIR='${WORKDIR}'
 EOF
+    fi
     ;;
   wipe)
     stop
     pbt_require_in_workdir "${MYSQLD_DIR}"
     rm -rf "${MYSQLD_DIR}"
     pbt_log "mysqld instance removed" ;;
-  *) sed -n '17,29p' "$0"; exit 2 ;;
+  *) sed -n '17,36p' "$0"; exit 2 ;;
 esac

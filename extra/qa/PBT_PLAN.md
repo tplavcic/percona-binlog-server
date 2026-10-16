@@ -179,8 +179,9 @@ mode, `verify_checksum`, `checkpoint_size`, `checkpoint_interval`.
 The oracle is the server itself: the stored binlogs must be byte-identical
 to the server's binlog files (with the in-use flag of the open binlog
 cleared, as in the MTR test `binsrv`), and `list` must report the server's
-binlogs, sizes and per-file previous / added GTIDs (`SHOW BINLOG EVENTS`,
-`gtid_executed`). Rewritten binlogs are checked with an independent event
+binlogs, sizes, per-file previous / added GTIDs (`SHOW BINLOG EVENTS`,
+`gtid_executed`) and min / max timestamps (those of the events in the
+stored file). Rewritten binlogs are checked with an independent event
 walker (magic, sizes, log_pos, CRC32, GTID order).
 
 | # | Property | State |
@@ -193,6 +194,11 @@ walker (magic, sizes, log_pos, CRC32, GTID order).
 | D4 | `SearchByGtidSetMatchesServerMySQL`: the binlogs holding the queried GTIDs (from the server's GTID_LOG events) | ✅ |
 | D5 | `RewriteModeKeepsTransactionsMySQL`: rewritten binlogs are well-formed, reach file_size, hold every transaction in the server's order | ✅ |
 | D5a | `RewriteModeWithoutChecksumVerificationMySQL`: the same with verify_checksum = false | ✅ (PBT-022 confirmed) |
+| D6 | `ListenerServesServerEventsMySQL`: a binlog dump (libmysqlclient MYSQL_RPL, COM_BINLOG_DUMP, CRC32 / NONE) from the `pull` listener at any event of any stored binlog receives exactly the events the MySQL server sends from there | ✅ |
+| D7 | `ReplicaOfListenerMatchesSourceMySQL`: a MySQL replica (`mysqld.sh --replica`) of the listener catches up with the source (gtid_executed, CHECKSUM TABLE) | ✅ (PBT-034) |
+| D8 | `ServerRestartDuringPullMySQL`: the server is restarted (STOP) or killed with SIGKILL and restarted (crash recovery) while `pull` runs; `pull` reconnects, never exits, and its storage matches the server | ✅ |
+| D8a | `CrashInBinlogWithoutTransactionsMySQL`: the server is killed while its newest binlog has no transaction; fetch afterwards | ✅ (PBT-035) |
+| D9 | `PurgeOnServerMySQL`: `PURGE BINARY LOGS TO` before / after the storage got the binlogs; fetch succeeds exactly when the server still has what the storage needs (position: its newest binlog; GTID: gtid_purged covered; empty storage), else exits 1 leaving the storage unchanged | ✅ |
 
 GTID auto-positioning: the server starts a GTID dump at the newest binlog
 whose PREVIOUS_GTIDS is a subset of the client's set, so binlogs without
@@ -202,12 +208,12 @@ those shapes, noted in the counterexample) and checked strictly by D1a /
 D2a, so they do not hide other findings.
 
 Not covered yet (later):
-- server restarts / crashes during `pull` (STOP events, a binlog without
-  STOP or ROTATE);
-- `PURGE BINARY LOGS` on the server while PBS is behind;
-- PBS as replication source (`replication_source`) for a real replica;
-- a server with gtid_mode=OFF (anonymous transactions) in position mode;
-- S3 backend with MySQL (the S3 storage model is covered in B).
+- a server with gtid_mode=OFF (anonymous transactions) in position mode
+  (needs a third, differently configured instance);
+- S3 backend with MySQL (the S3 storage model is covered in B);
+- GTID dumps (COM_BINLOG_DUMP_GTID) from the listener, once it supports
+  them (PBT-034);
+- encrypted storage with MySQL (the encryption model is covered in B).
 
 ### Recommended order
 
@@ -227,7 +233,7 @@ there is authoritative):
 | Severity | Issues |
 |---|---|
 | high | PBT-015, PBT-017, PBT-022 |
-| medium | PBT-001, PBT-002, PBT-004, PBT-012, PBT-013, PBT-016, PBT-019, PBT-026, PBT-029, PBT-030, PBT-031, PBT-032, PBT-033 |
+| medium | PBT-001, PBT-002, PBT-004, PBT-012, PBT-013, PBT-016, PBT-019, PBT-026, PBT-029, PBT-030, PBT-031, PBT-032, PBT-033, PBT-034, PBT-035 |
 | low | PBT-003, PBT-005, PBT-006, PBT-007, PBT-008, PBT-009, PBT-010, PBT-011, PBT-014, PBT-018, PBT-020, PBT-021, PBT-023, PBT-024, PBT-025, PBT-027, PBT-028 |
 
 ### GTID sets (prototype run)
@@ -485,9 +491,24 @@ All layer D properties pass apart from three known shapes:
   so the stored file is 44 bytes shorter than the server's. MTR
   `resume_streaming` runs this sequence but does not compare files.
 
+- [medium] PBT-033 also with a server shutdown: the old binlog's final
+  STOP is never stored in GTID mode (D8).
+- [medium] PBT-034 (new): a MySQL replica cannot replicate from the
+  listener: its I/O thread stops at "get the value of SERVER_ID variable
+  from source ... Syntax error" (the listener answers only a few fixed
+  statements, no COM_REGISTER_SLAVE / COM_BINLOG_DUMP_GTID).
+  `mysqlbinlog`-style dumps work, and D6 shows they are exact.
+- [medium] PBT-035 (new): the server is killed while its newest binlog has
+  no transaction; fetch / pull from it then opens the next binlog with the
+  old preamble still pending: Debug builds abort (assertion
+  `incomplete_transaction_timestamps_.is_empty()`, `storage.cpp:138`),
+  Release builds give the next binlog the old binlog's `min_timestamp`.
+
 Byte-for-byte copies otherwise hold in position and GTID mode with every
 checkpoint setting, through rotations, large and compressed transactions,
-repeated fetches and `pull` killed with SIGKILL at random points.
+repeated fetches, `pull` killed with SIGKILL at random points, server
+restarts and crashes during `pull`, and binlogs purged on the server. The
+listener serves exactly the server's event stream from any position.
 
 ## 6. Open questions
 
