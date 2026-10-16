@@ -74,6 +74,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import threading
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -424,6 +425,9 @@ def classify(results: List[Result], bugs: List[KnownBug], variant: str):
 # ---------------------------------------------------------------------------
 def reproduce_command(res: Result, build_dir: Path) -> str:
     cmd = f"cd {shlex.quote(str(build_dir))} && "
+    if "MySQL" in res.name:
+        script = shlex.quote(str(QA_DIR / "mysqld.sh"))
+        cmd += f"{script} start && eval \"$({script} env)\" && "
     if res.blob:
         cmd += f"PBT_REPRODUCE={shlex.quote(res.blob)} "
     return cmd + res.command
@@ -583,6 +587,9 @@ def write_markdown(path: Path, summary: Dict, results: List[Result],
     if info.get("s3_problem"):
         lines.extend([f"S3 endpoint for the S3 properties: not available - "
                       f"{info['s3_problem']}", ""])
+    if info.get("mysql_problem"):
+        lines.extend([f"MySQL server for the MySQL properties: not available - "
+                      f"{info['mysql_problem']}", ""])
     errors = [r for r in results if r.status == "error"]
     if errors:
         lines.extend(["## Errors (the test could not run)", ""])
@@ -655,6 +662,60 @@ def seaweedfs(env: Dict[str, str], workdir: Path, *command: str):
     return subprocess.run([str(QA_DIR / "seaweedfs.sh"), *command],
                           env=script_env, capture_output=True, text=True,
                           check=False)
+
+
+# the MySQL properties reset the one shared server: never run two at once
+MYSQL_LOCK = threading.Lock()
+
+
+def run_serialized(exe: Executable, name: str, args, env: Dict[str, str],
+                   log_dir: Path):
+    if "MySQL" in name:
+        with MYSQL_LOCK:
+            return run_property(exe, name, args, env, log_dir)
+    return run_property(exe, name, args, env, log_dir)
+
+
+def mysqld(env: Dict[str, str], workdir: Path, *command: str):
+    script_env = dict(env)
+    script_env["WORKDIR"] = str(workdir)
+    return subprocess.run([str(QA_DIR / "mysqld.sh"), *command],
+                          env=script_env, capture_output=True, text=True,
+                          check=False)
+
+
+def ensure_mysqld(env: Dict[str, str], workdir: Path, log_dir: Path):
+    """Puts PBT_MYSQL_* into env, starting the private mysqld of
+    extra/qa/mysqld.sh if needed. Returns (started here, problem text or
+    ""). On failure the MySQL properties report an infrastructure error."""
+    started = False
+    if mysqld(env, workdir, "status").returncode != 0:
+        result = mysqld(env, workdir, "start")
+        if result.returncode != 0:
+            output = (result.stdout + result.stderr).strip()
+            problem = "cannot start mysqld (extra/qa/mysqld.sh start): " + \
+                (output.splitlines()[-1] if output else
+                 f"exit code {result.returncode}")
+            log_dir.mkdir(parents=True, exist_ok=True)
+            details = log_dir / "mysqld-start.log"
+            server_log = Path(env.get("MYSQLD_DIR",
+                                      str(workdir / "mysql-pbt"))) / "run" / "mysqld.log"
+            text = output + "\n"
+            try:
+                text += f"\n--- {server_log} ---\n" + server_log.read_text(
+                    encoding="utf-8", errors="replace")[-20000:]
+            except OSError:
+                pass
+            details.write_text(text, encoding="utf-8")
+            problem += f" (details: {details})"
+            print(f"warning: {problem}", file=sys.stderr)
+            return False, problem
+        started = True
+    for line in mysqld(env, workdir, "env").stdout.splitlines():
+        match = re.match(r"export (PBT_MYSQL_\w+)='([^']*)'", line.strip())
+        if match:
+            env[match.group(1)] = match.group(2)
+    return started, ""
 
 
 def ensure_seaweedfs(env: Dict[str, str], workdir: Path, log_dir: Path):
@@ -745,6 +806,13 @@ def main() -> int:
                              "or starts SeaweedFS with extra/qa/seaweedfs.sh "
                              "(and stops it afterwards); 'off' skips them "
                              "(default: %(default)s)")
+    parser.add_argument("--mysql", choices=["auto", "off"], default="auto",
+                        help="properties that need a MySQL server (names "
+                             "containing 'MySQL'): 'auto' uses PBT_MYSQL_* "
+                             "from the environment or starts the private "
+                             "server of extra/qa/mysqld.sh (and stops it "
+                             "afterwards); 'off' skips them "
+                             "(default: %(default)s)")
     parser.add_argument("--list", action="store_true",
                         help="only list the properties that would run")
     args = parser.parse_args()
@@ -782,6 +850,8 @@ def main() -> int:
             if any(re.search(f, test_id) for f in args.exclude):
                 continue
             if args.s3 == "off" and "S3" in name:
+                continue
+            if args.mysql == "off" and "MySQL" in name:
                 continue
             planned.append((exe, name))
     if args.list:
@@ -837,6 +907,11 @@ def main() -> int:
         started_seaweedfs, s3_problem = ensure_seaweedfs(env, workdir,
                                                           log_dir)
 
+    started_mysqld, mysql_problem = False, ""
+    if any("MySQL" in name for _, name in planned) and \
+            "PBT_MYSQL_PORT" not in env:
+        started_mysqld, mysql_problem = ensure_mysqld(env, workdir, log_dir)
+
     # temporary files of the properties (storage tests create binlog
     # directories) stay inside WORKDIR: <run dir>/tmp, removed at the end
     tmp_dir = out_dir / "tmp"
@@ -849,7 +924,7 @@ def main() -> int:
     started_at = datetime.datetime.now().isoformat(timespec="seconds")
     results: List[Result] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        futures = {pool.submit(run_property, exe, name, args, env, log_dir):
+        futures = {pool.submit(run_serialized, exe, name, args, env, log_dir):
                    (exe, name) for exe, name in planned}
         for future in concurrent.futures.as_completed(futures):
             res = future.result()
@@ -869,6 +944,10 @@ def main() -> int:
     if started_seaweedfs:
         # started for this run only: stop it and drop the test objects
         seaweedfs(env, workdir, "wipe")
+    if started_mysqld:
+        # started for this run only; the data directory is kept so that the
+        # next start skips the initialization (mysqld.sh wipe removes it)
+        mysqld(env, workdir, "stop")
 
     bugs = load_known_bugs(Path(args.known_bugs))
     possibly_fixed = classify(results, bugs, variant)
@@ -886,6 +965,7 @@ def main() -> int:
         "known_bugs_file": args.known_bugs,
         "knobs": knobs,
         "s3_problem": s3_problem,
+        "mysql_problem": mysql_problem,
         "command_line": sys.argv,
         **git_info(),
     }

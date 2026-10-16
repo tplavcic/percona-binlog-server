@@ -164,20 +164,50 @@ run must print one JSON object, never crash, and exit 0 iff `status` is
 | C4 | `purge_binlogs` | README "≤ sequence number" semantics vs exact-name behaviour; the tail file is never purged; `list` afterwards equals the survivors | ✅ |
 | C5 | CLI argument rejection | malformed timestamps, GTID sets and binlog names give `status: error` and never crash | ✅ (PBT-032) |
 
-### Layer D: system-level with MySQL (MySQL is available on the QA host)
+### Layer D: system-level with MySQL
 
-Hegel stateful tests drive a real server with random workloads:
-- DML/DDL with GTID and tagged GTID on 8.4
-- `FLUSH BINARY LOGS`, `PURGE BINARY LOGS`
-- server restarts
+`tests/property/mysql_property_test.cpp` runs against a private MySQL
+server (`extra/qa/mysqld.sh`: log_bin, gtid_mode=ON, CRC32, under
+WORKDIR). Every case resets the binary logs and runs a random workload:
+multi-row inserts, multi-statement and rolled back transactions, updates,
+deletes, rows up to 300 KB, CREATE / DROP TABLE, `FLUSH BINARY LOGS`,
+`max_binlog_size` 4 KB / 16 KB / 1 GB (rotations inside the workload),
+compressed transactions (`binlog_transaction_compression`), tagged GTIDs
+(8.3+). `binlog_server` runs with a random configuration: position / GTID
+mode, `verify_checksum`, `checkpoint_size`, `checkpoint_interval`.
 
-During the workload `binlog_server pull`/`fetch` runs, and it is killed
-with `kill -9` at random points and restarted. Properties:
-- the stored binlog events equal the server's events (modulo rewrite)
-- no duplicated or lost transactions across restarts
-- `search_by_gtid_set` agrees with `@@gtid_executed`
+The oracle is the server itself: the stored binlogs must be byte-identical
+to the server's binlog files (with the in-use flag of the open binlog
+cleared, as in the MTR test `binsrv`), and `list` must report the server's
+binlogs, sizes and per-file previous / added GTIDs (`SHOW BINLOG EVENTS`,
+`gtid_executed`). Rewritten binlogs are checked with an independent event
+walker (magic, sizes, log_pos, CRC32, GTID order).
 
-These complement the existing MTR suite rather than replacing it.
+| # | Property | State |
+|---|---|---|
+| D1 | `FetchMatchesServerBinlogsMySQL`: one `fetch` copies the server's binlogs | ✅ |
+| D1a | `FetchStoresBinlogWithoutTransactionsMySQL`: also a newest binlog without transactions | ✅ (PBT-020) |
+| D2 | `RepeatedFetchResumesMySQL`: workload and `fetch` alternate; the storage matches after each fetch | ✅ |
+| D2a | `GtidResumeStoresRotateEventMySQL`: GTID-mode resume after a rotation keeps the ROTATE | ✅ (PBT-033) |
+| D3 | `KilledPullResumesMySQL`: `pull` killed (SIGKILL) / stopped (SIGTERM) and restarted during the workload; never exits on its own, stops on SIGTERM with exit code 0, its storage matches the server, also after a `fetch` | ✅ |
+| D4 | `SearchByGtidSetMatchesServerMySQL`: the binlogs holding the queried GTIDs (from the server's GTID_LOG events) | ✅ |
+| D5 | `RewriteModeKeepsTransactionsMySQL`: rewritten binlogs are well-formed, reach file_size, hold every transaction in the server's order | ✅ |
+| D5a | `RewriteModeWithoutChecksumVerificationMySQL`: the same with verify_checksum = false | ✅ (PBT-022 confirmed) |
+
+GTID auto-positioning: the server starts a GTID dump at the newest binlog
+whose PREVIOUS_GTIDS is a subset of the client's set, so binlogs without
+transactions before that point are not sent. That is MySQL behaviour and
+accepted by the oracle. PBT-020 / PBT-033 are tolerated in D1-D5 (exactly
+those shapes, noted in the counterexample) and checked strictly by D1a /
+D2a, so they do not hide other findings.
+
+Not covered yet (later):
+- server restarts / crashes during `pull` (STOP events, a binlog without
+  STOP or ROTATE);
+- `PURGE BINARY LOGS` on the server while PBS is behind;
+- PBS as replication source (`replication_source`) for a real replica;
+- a server with gtid_mode=OFF (anonymous transactions) in position mode;
+- S3 backend with MySQL (the S3 storage model is covered in B).
 
 ### Recommended order
 
@@ -187,7 +217,7 @@ These complement the existing MTR suite rather than replacing it.
 3. T1 workaround in place (`pbs_test_binsrv`): B1 ✅, then B4, B3, B2,
    A9/A10.
 4. Layer C, which reuses B1's generators. ✅
-5. Layer D (MySQL is available on the QA host).
+5. Layer D ✅ (first set; see the list of what is not covered yet).
 
 ## 5. Results
 
@@ -197,7 +227,7 @@ there is authoritative):
 | Severity | Issues |
 |---|---|
 | high | PBT-015, PBT-017, PBT-022 |
-| medium | PBT-001, PBT-002, PBT-004, PBT-012, PBT-013, PBT-016, PBT-019, PBT-026, PBT-029, PBT-030, PBT-031, PBT-032 |
+| medium | PBT-001, PBT-002, PBT-004, PBT-012, PBT-013, PBT-016, PBT-019, PBT-026, PBT-029, PBT-030, PBT-031, PBT-032, PBT-033 |
 | low | PBT-003, PBT-005, PBT-006, PBT-007, PBT-008, PBT-009, PBT-010, PBT-011, PBT-014, PBT-018, PBT-020, PBT-021, PBT-023, PBT-024, PBT-025, PBT-027, PBT-028 |
 
 ### GTID sets (prototype run)
@@ -438,6 +468,26 @@ with `status: error`. Two findings:
 - [medium] PBT-032: invalid ISO timestamps are normalised instead of
   rejected (`T25:00:00` is the next day 01:00, `T14:60:00`, date only, `/`
   separators).
+
+### MySQL server (sandbox run, MySQL 8.0.46)
+
+All layer D properties pass apart from three known shapes:
+- [low] PBT-020 seen for real: a `fetch` that ends before the first
+  transaction of the newest binlog stores it as the 4-byte magic. In GTID
+  mode this binlog is never completed (the next dump starts at a newer
+  binlog after a rotation).
+- [high] PBT-022 confirmed: rewrite mode with `verify_checksum = false`
+  stops at the first transaction ("extra bytes in the gtid_log event
+  body").
+- [medium] PBT-033 (new): GTID mode, the storage has a binlog up to its
+  last transaction, the server rotates: the next `fetch` / `pull` never
+  stores that binlog's ROTATE (auto-positioning starts at the new binlog),
+  so the stored file is 44 bytes shorter than the server's. MTR
+  `resume_streaming` runs this sequence but does not compare files.
+
+Byte-for-byte copies otherwise hold in position and GTID mode with every
+checkpoint setting, through rotations, large and compressed transactions,
+repeated fetches and `pull` killed with SIGKILL at random points.
 
 ## 6. Open questions
 
