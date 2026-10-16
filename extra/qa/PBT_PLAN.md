@@ -92,7 +92,10 @@ non-zero only for new issues, regressions or infrastructure errors
 Proposed Jenkins wiring (later):
 `setup_pbt_env.sh && build_property_tests.sh && run_property_tests.py --cases-scale 1`,
 followed by `junit 'testruns/latest/junit.xml'` and archiving
-`testruns/latest/**`.
+`testruns/latest/**`. Decision: known bugs show as failures in Jenkins
+(`--known-as failure`, the default); the build result is still decided by
+the exit code (`--fail-on new`), so a run with only known issues is
+"unstable" (red test cases) but not "failed".
 
 ### Build variants
 
@@ -131,7 +134,7 @@ Legend:
 | A7 | `util`: semantic_version, hex_value, ctime_timestamp(+range), flag_set, composite_name, crc32 | roundtrips; range is a monoid; crc32 matches zlib and `crc32_combine` | docs and zlib | 🟢 |
 | A8 | `util::nv_tuple` JSON + `models::*` | `from_json(to_json(x)) == x`; unknown keys are ignored; type mismatch throws and names the JSON path | — | 🟢 |
 | A9 | `size_unit`, `time_unit` | `"N<suffix>"` value equals N × multiplier; `to_string` roundtrip; overflow rejected; malformed suffixes rejected | README grammar | ✅ (`units_property_test`) |
-| A10 | `main_config` + keyring + `storage_config` URIs | generated valid configs load; every single-rule mutation is rejected; `get_masked_uri()` never contains the secret | README config reference | 🟡 (T1) |
+| A10 | `main_config` + keyring + `storage_config` URIs | generated valid configs load; every single-rule mutation is rejected; `get_masked_uri()` never contains the secret | README config reference | ✅ |
 
 ### Layer B: in-process storage (filesystem and S3)
 
@@ -145,19 +148,23 @@ Legend:
 
 ### Layer C: `binlog_server` binary on generated storage (no MySQL)
 
-The storage directory is generated in-process (B1 machinery) or by a
-standalone generator. The binary is then run and its JSON output is checked
-against a model built from README semantics.
+The storage directory is generated in-process with `binsrv::storage`
+(`tests/property/cli_property_test.cpp`: 0-4 binlogs, some without events,
+GTIDs unique across the storage, optional purged GTIDs, non-decreasing
+timestamps). The real `binlog_server` binary is then run (fork/exec) and its
+JSON output is checked against a model built from README semantics. Every
+run must print one JSON object, never crash, and exit 0 iff `status` is
+`success`.
 
 | # | Mode | Property | State |
 |---|---|---|---|
-| C1 | `list` | the result is exactly the index order with sizes and GTIDs; empty storage gives `success` with an empty result | 🟡 (T1 for the generator) |
-| C2 | `search_by_gtid_set` | the result is the minimal file set covering the query (README); an error iff the query is not a subset; an empty query gives an empty result | 🟡 |
-| C3 | `search_by_timestamp` | README: "files that have at least one event with timestamp <= T"; the "too old" and "empty" errors | 🟡 |
-| C4 | `purge_binlogs` | README "≤ sequence number" semantics vs exact-name behaviour; the tail file is never purged; `list` afterwards equals the survivors | 🟡 |
-| C5 | CLI argument rejection | malformed timestamps, GTID sets and binlog names give `status: error` and never crash | 🟢 (text-only arguments) |
+| C1 | `list` | the result is exactly the index order with sizes and GTIDs; empty storage gives `success` with an empty result | ✅ |
+| C2 | `search_by_gtid_set` | the result is the minimal file set covering the query (README); an error iff the query is not a subset; an empty query gives an empty result | ✅ |
+| C3 | `search_by_timestamp` | README: "files that have at least one event with timestamp <= T"; the "too old" and "empty" errors | ✅ (PBT-031) |
+| C4 | `purge_binlogs` | README "≤ sequence number" semantics vs exact-name behaviour; the tail file is never purged; `list` afterwards equals the survivors | ✅ |
+| C5 | CLI argument rejection | malformed timestamps, GTID sets and binlog names give `status: error` and never crash | ✅ (PBT-032) |
 
-### Layer D: system-level with MySQL (later; needs a MySQL on the QA host)
+### Layer D: system-level with MySQL (MySQL is available on the QA host)
 
 Hegel stateful tests drive a real server with random workloads:
 - DML/DDL with GTID and tagged GTID on 8.4
@@ -179,8 +186,8 @@ These complement the existing MTR suite rather than replacing it.
    (hand-written codecs, crypto offsets) and are cheap.
 3. T1 workaround in place (`pbs_test_binsrv`): B1 ✅, then B4, B3, B2,
    A9/A10.
-4. Layer C, which reuses B1's generators.
-5. Layer D, once a MySQL is available on the QA host.
+4. Layer C, which reuses B1's generators. ✅
+5. Layer D (MySQL is available on the QA host).
 
 ## 5. Results
 
@@ -190,7 +197,7 @@ there is authoritative):
 | Severity | Issues |
 |---|---|
 | high | PBT-015, PBT-017, PBT-022 |
-| medium | PBT-001, PBT-002, PBT-004, PBT-012, PBT-013, PBT-016, PBT-019, PBT-026 |
+| medium | PBT-001, PBT-002, PBT-004, PBT-012, PBT-013, PBT-016, PBT-019, PBT-026, PBT-029, PBT-030, PBT-031, PBT-032 |
 | low | PBT-003, PBT-005, PBT-006, PBT-007, PBT-008, PBT-009, PBT-010, PBT-011, PBT-014, PBT-018, PBT-020, PBT-021, PBT-023, PBT-024, PBT-025, PBT-027, PBT-028 |
 
 ### GTID sets (prototype run)
@@ -404,6 +411,33 @@ Not modelled, so for later:
 - Transactions larger than 4 GiB are rejected ("too large"). MySQL itself
   recommends `max_binlog_cache_size` ≤ 4 GiB, so this is documented, not
   tested.
+
+### Configuration and command line (sandbox run)
+
+`config_property_test` (A10) builds valid configurations from the README
+reference (every section, optional keys present or absent, file and S3
+backends, rewrite and encryption) and applies one rule violation at a time
+(missing required key, wrong JSON type, number out of range, unknown enum,
+host / port / DNS combinations, rewrite in position mode, `file_size`
+< 1024, malformed checkpoint values, non-CTR ciphers). All valid
+configurations load and all 5000 single violations are rejected, and
+`get_masked_uri()` never contains the key id or secret. Two gaps:
+- [medium] PBT-029: `rewrite.base_file_name` is not validated on load
+  (`""`, `a/b`, `/abs`); the collector fails only at the first transaction.
+- [medium] PBT-030: unknown / misspelled keys are silently ignored, so
+  `storage.encrypton` means plaintext binlogs.
+
+`cli_property_test` (layer C) runs the real binary on generated storages.
+`list`, `search_by_gtid_set` and `purge_binlogs` agree with the README
+model (minimal covering set in storage order, "cannot be covered" for
+purged / unknown GTIDs, purge up to but not including the given binlog, the
+last binlog kept). Malformed GTID sets and binlog names are always rejected
+with `status: error`. Two findings:
+- [medium] PBT-031: `search_by_timestamp` returns binlogs without events
+  (min timestamp 1970-01-01) for every query.
+- [medium] PBT-032: invalid ISO timestamps are normalised instead of
+  rejected (`T25:00:00` is the next day 01:00, `T14:60:00`, date only, `/`
+  separators).
 
 ## 6. Open questions
 
