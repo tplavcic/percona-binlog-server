@@ -513,6 +513,25 @@ def build_summary(results, possibly_fixed, run_info) -> Dict:
     }
 
 
+def md_table(header: List[str], rows: List[List], right: str = "") -> List[str]:
+    """Markdown table whose columns are padded to the same width, so it
+    also reads well as plain text. `right` holds one character per column:
+    'r' right-aligns that column, anything else left-aligns it."""
+    cells = [[str(c) for c in header]] + [[str(c) for c in row] for row in rows]
+    widths = [max(3, *(len(row[i]) for row in cells))
+              for i in range(len(header))]
+    align = [(right[i:i + 1] == "r") for i in range(len(header))]
+
+    def line(row):
+        return "| " + " | ".join(
+            c.rjust(w) if r else c.ljust(w)
+            for c, w, r in zip(row, widths, align)) + " |"
+
+    rule = "|" + "|".join(("-" * (w + 1) + ":") if r else ("-" * (w + 2))
+                          for w, r in zip(widths, align)) + "|"
+    return [line(cells[0]), rule] + [line(row) for row in cells[1:]]
+
+
 def write_markdown(path: Path, summary: Dict, results: List[Result],
                    possibly_fixed: List[KnownBug], build_dir: Path) -> str:
     t = summary["totals"]
@@ -528,11 +547,11 @@ def write_markdown(path: Path, summary: Dict, results: List[Result],
         f"- host: {info['host']}, duration: {info['duration_s']:.1f}s, "
         f"test cases scale: {info['knobs'].get('PBT_CASES_SCALE', '1')}",
         "",
-        "| total | passed | failed | errors | new issues | known issues | regressions | possibly fixed |",
-        "|---:|---:|---:|---:|---:|---:|---:|---:|",
-        f"| {t['total']} | {t['passed']} | {t['failed']} | {t['errors']} | "
-        f"{t['new_issues']} | {t['known_issues']} | {t['regressions']} | "
-        f"{t['possibly_fixed']} |",
+        *md_table(["total", "passed", "failed", "errors", "new issues",
+                   "known issues", "regressions", "possibly fixed"],
+                  [[t["total"], t["passed"], t["failed"], t["errors"],
+                    t["new_issues"], t["known_issues"], t["regressions"],
+                    t["possibly_fixed"]]], right="rrrrrrrr"),
         "",
         "Known issues by severity: " + ", ".join(
             f"{name} {t['known_by_severity'][name]}"
@@ -566,11 +585,11 @@ def write_markdown(path: Path, summary: Dict, results: List[Result],
                       f"{info['s3_problem']}", ""])
     errors = [r for r in results if r.status == "error"]
     if errors:
-        lines.extend(["## Errors (the test could not run)", "",
-                      "| test | message |", "|---|---|"])
-        for res in errors:
-            lines.append(f"| `{res.test_id}` | "
-                         f"{res.message.replace('|', '/')} |")
+        lines.extend(["## Errors (the test could not run)", ""])
+        lines.extend(md_table(
+            ["test", "message"],
+            [[f"`{res.test_id}`", res.message.replace("|", "/")]
+             for res in errors]))
         lines.append("")
     section("New issues", [r for r in results if r.classification == "new"])
     section("Regressions (known bug marked fixed fails again)",
@@ -579,30 +598,29 @@ def write_markdown(path: Path, summary: Dict, results: List[Result],
     known = sorted((r for r in results if r.classification == "known"),
                    key=lambda r: (severity_key(r.severity), r.issue))
     if known:
-        lines.extend(["## Known issues", "",
-                      "| severity | issue | test | message |",
-                      "|---|---|---|---|"])
-        for res in known:
-            msg = res.message.replace("|", "\\|").splitlines()[0][:160]
-            lines.append(f"| {res.severity} | {res.issue} | `{res.test_id}` "
-                         f"| {msg} |")
+        lines.extend(["## Known issues", ""])
+        lines.extend(md_table(
+            ["severity", "issue", "test", "message"],
+            [[res.severity, res.issue, f"`{res.test_id}`",
+              (res.message.replace("|", "\\|").splitlines() or [""])[0][:160]]
+             for res in known]))
         lines.append("")
     if possibly_fixed:
-        lines.extend(["## Possibly fixed (open known bug, test passed)", "",
-                      "| severity | issue | test | description |",
-                      "|---|---|---|---|"])
-        for bug in sorted(possibly_fixed,
-                          key=lambda b: severity_key(b.severity)):
-            lines.append(f"| {bug.severity} | {bug.issue} | `{bug.test}` "
-                         f"| {bug.description} |")
+        lines.extend(["## Possibly fixed (open known bug, test passed)", ""])
+        lines.extend(md_table(
+            ["severity", "issue", "test", "description"],
+            [[bug.severity, bug.issue, f"`{bug.test}`", bug.description]
+             for bug in sorted(possibly_fixed,
+                               key=lambda b: severity_key(b.severity))]))
         lines.append("")
-    lines.extend(["## All results", "", "| test | status | time [s] |",
-                  "|---|---|---:|"])
+    lines.extend(["## All results", ""])
+    rows = []
     for res in results:
         status = res.status if res.status == "passed" else \
             f"{res.status} ({res.classification or res.kind}" + \
             (f", {res.severity})" if res.severity else ")")
-        lines.append(f"| `{res.test_id}` | {status} | {res.duration:.1f} |")
+        rows.append([f"`{res.test_id}`", status, f"{res.duration:.1f}"])
+    lines.extend(md_table(["test", "status", "time [s]"], rows, right="llr"))
     text = "\n".join(lines) + "\n"
     path.write_text(text, encoding="utf-8")
     return text
