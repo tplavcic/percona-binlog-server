@@ -382,6 +382,17 @@ def run_property(exe: Executable, name: str, args, env: Dict[str, str],
                               f"{terminate.group(2).strip()}")
         if crash_message:
             result.message = f"{crash_message}: {result.message}"
+        # a timing-dependent failure that Hegel's replay did not reproduce:
+        # report the first failing case pbt::check recorded instead
+        first = FIRST_FAILURE_RE.search(log_text)
+        if "Flaky test detected" in result.message and first is not None:
+            notes = "\n".join(m.group(1) for m in FIRST_NOTE_RE.finditer(
+                log_text, first.end()))
+            result.message = "FLAKY: " + first.group(1).strip()
+            result.report = ("first failing test case (Hegel's replay "
+                             "passed, so the failure depends on timing):\n"
+                             + notes + (f"\n\n{result.report}"
+                                        if result.report else ""))
         # Boost.Test's execution monitor turns SIGSEGV/SIGABRT/... into a
         # regular test failure; report those as crashes
         if result.kind == "violation" and re.search(
@@ -393,6 +404,10 @@ def run_property(exe: Executable, name: str, args, env: Dict[str, str],
             result.report += ("\n\n(LeakSanitizer also reported leaks, "
                               "expected after an abort; see the log)")
     return result
+
+
+FIRST_FAILURE_RE = re.compile(r"^PBT_FIRST_FAILURE: (.*)$", re.MULTILINE)
+FIRST_NOTE_RE = re.compile(r"^PBT_FIRST_FAILURE_NOTE: (.*)$", re.MULTILINE)
 
 
 def classify(results: List[Result], bugs: List[KnownBug], variant: str):
