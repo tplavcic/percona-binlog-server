@@ -193,6 +193,11 @@ directory outside `/var/lib/mysql`; use a tarball then. Tagged GTIDs are
 part of the workload only with MySQL 8.3 or newer. Settings: `MYSQLD_*` in
 `pbt_env.sh`.
 
+Properties named `*OnS3MySQL` need both servers: they store the binlogs
+on SeaweedFS and read the objects back through its filer
+(`PBT_S3_FILER`, printed by `seaweedfs.sh env`), so they need SeaweedFS
+rather than another S3 service.
+
 To point the tests at another server, set `PBT_MYSQL_*` yourself. Its
 binlog files must be readable by the test process, and its binary logs
 are reset.
