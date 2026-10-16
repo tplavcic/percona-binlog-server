@@ -198,6 +198,7 @@ walker (magic, sizes, log_pos, CRC32, GTID order).
 | D7 | `ReplicaOfListenerMatchesSourceMySQL`: a MySQL replica (`mysqld.sh --replica`) of the listener catches up with the source (gtid_executed, CHECKSUM TABLE) | ✅ (PBT-034) |
 | D8 | `ServerRestartDuringPullMySQL`: the server is restarted (STOP) or killed with SIGKILL and restarted (crash recovery) while `pull` runs; `pull` reconnects, never exits, and its storage matches the server | ✅ |
 | D8a | `CrashInBinlogWithoutTransactionsMySQL`: the server is killed while its newest binlog has no transaction; fetch afterwards | ✅ (PBT-035) |
+| D10 | `FetchMatchesServerBinlogsOnS3MySQL`, `RepeatedFetchResumesOnS3MySQL`, `KilledPullResumesOnS3MySQL`, `ListenerServesServerEventsOnS3MySQL`: D1, D2, D3 and D6 with the S3 storage backend (SeaweedFS); the stored objects are read back independently of PBS through the SeaweedFS filer (plain HTTP, `PBT_S3_FILER`), each case in its own prefix (removed afterwards) | ✅ |
 | D9 | `PurgeOnServerMySQL`: `PURGE BINARY LOGS TO` before / after the storage got the binlogs; fetch succeeds exactly when the server still has what the storage needs (position: its newest binlog; GTID: gtid_purged covered; empty storage), else exits 1 leaving the storage unchanged | ✅ |
 
 GTID auto-positioning: the server starts a GTID dump at the newest binlog
@@ -210,7 +211,6 @@ D2a, so they do not hide other findings.
 Not covered yet (later):
 - a server with gtid_mode=OFF (anonymous transactions) in position mode
   (needs a third, differently configured instance);
-- S3 backend with MySQL (the S3 storage model is covered in B);
 - GTID dumps (COM_BINLOG_DUMP_GTID) from the listener, once it supports
   them (PBT-034);
 - encrypted storage with MySQL (the encryption model is covered in B).
@@ -508,7 +508,9 @@ Byte-for-byte copies otherwise hold in position and GTID mode with every
 checkpoint setting, through rotations, large and compressed transactions,
 repeated fetches, `pull` killed with SIGKILL at random points, server
 restarts and crashes during `pull`, and binlogs purged on the server. The
-listener serves exactly the server's event stream from any position.
+listener serves exactly the server's event stream from any position. The
+same holds with the S3 backend (fetch, repeated fetch, `pull` killed and
+restarted, the listener serving from S3): no S3-specific difference found.
 
 ## 6. Open questions
 
