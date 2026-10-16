@@ -297,7 +297,9 @@ check(const std::function<void(hegel::TestCase &)> &body,
     try {
       body(tc);
     } catch (const hegel::internal::HegelStopTest &) {
-      throw;
+      throw;  // Hegel control flow, not a failure
+    } catch (const hegel::internal::HegelReject &) {
+      throw;  // tc.assume() / a rejected draw, not a failure
     } catch (const std::exception &e) {
       if (!first_failure_written) {
         first_failure_written = true;
