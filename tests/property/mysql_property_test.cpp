@@ -77,6 +77,8 @@
 
 #include <zlib.h>
 
+#include <openssl/evp.h>
+
 #include <boost/test/unit_test.hpp>
 
 #include <boost/json/array.hpp>
@@ -490,6 +492,13 @@ struct pbs_options {
   std::optional<std::string> checkpoint_interval;
   std::optional<std::string> rewrite_file_size;
   bool s3{false};  // storage.backend s3 (SeaweedFS, PBT_S3_*) instead of file
+  // storage.encryption: KEK (keyring) and data cipher
+  struct encryption_options {
+    std::string kek_cipher;
+    std::string kek_hex;
+    std::string data_cipher;
+  };
+  std::optional<encryption_options> encryption;
 };
 
 std::string describe(const pbs_options &options) {
@@ -507,6 +516,10 @@ std::string describe(const pbs_options &options) {
   if (options.s3) {
     result += ", S3 storage";
   }
+  if (options.encryption) {
+    result += ", encrypted (KEK " + options.encryption->kek_cipher + ", data " +
+              options.encryption->data_cipher + ")";
+  }
   return result;
 }
 
@@ -521,6 +534,33 @@ pbs_options draw_options(hegel::TestCase &tc, std::optional<bool> gtid_mode = {}
   }
   if (tc.draw("has_checkpoint_interval", gs::booleans())) {
     options.checkpoint_interval = "1s";
+  }
+  // README "storage.encryption": the data cipher must be in CTR mode; the
+  // KEK's mode one of ECB / CBC / CTR / GCM; an ECB / CBC KEK can only
+  // encrypt file keys whose length is a multiple of 16 bytes. Exact
+  // OpenSSL names (PBT-012 / PBT-013 are covered elsewhere).
+  if (tc.draw("encrypted", gs::integers<int>({.min_value = 0, .max_value = 2})) == 0) {
+    const auto kek_cipher{tc.draw(
+        "kek_cipher", gs::sampled_from<std::string>(
+                          {"AES-128-ECB", "AES-256-CBC", "AES-256-GCM",
+                           "AES-192-CTR", "CAMELLIA-128-CBC"}))};
+    const bool block_kek{kek_cipher.ends_with("ECB") || kek_cipher.ends_with("CBC")};
+    std::vector<std::string> data_ciphers{"AES-128-CTR", "AES-256-CTR",
+                                          "ARIA-128-CTR", "CAMELLIA-256-CTR"};
+    if (!block_kek) {
+      data_ciphers.emplace_back("AES-192-CTR");
+    }
+    const auto key_bytes{kek_cipher.find("-128-") != std::string::npos ? 16U
+                         : kek_cipher.find("-192-") != std::string::npos ? 24U
+                                                                         : 32U};
+    std::string kek_hex;
+    static constexpr std::string_view digits{"0123456789abcdef"};
+    for (std::size_t i{0U}; i < key_bytes * 2U; ++i) {
+      kek_hex += digits[(i * 7U + key_bytes) % 16U];
+    }
+    options.encryption = pbs_options::encryption_options{
+        kek_cipher, kek_hex,
+        tc.draw("data_cipher", gs::sampled_from(data_ciphers))};
   }
   return options;
 }
@@ -573,6 +613,10 @@ struct pbs_storage {
   [[nodiscard]] fs::path log() const { return directory.path() / "binsrv.log"; }
   // the stored binlog file / object
   [[nodiscard]] std::string stored(const std::string &name) const;
+  // its plaintext: decrypted independently of PBS (OpenSSL EVP, the KEK of
+  // the test's keyring and the envelopes in <binlog>.json) when the storage
+  // is encrypted, else the stored bytes
+  [[nodiscard]] std::string plaintext(const std::string &name) const;
 };
 
 std::uint16_t listener_port() {
@@ -653,6 +697,18 @@ std::unique_ptr<pbs_storage> make_storage(const pbs_options &options) {
   }
   if (options.checkpoint_interval) {
     storage["checkpoint_interval"] = *options.checkpoint_interval;
+  }
+  if (options.encryption) {
+    const auto keyring_path{result->directory.path() / "keyring.json"};
+    std::ofstream{keyring_path} << json::serialize(json::object{
+        {"version", 1},
+        {"keys", json::array{json::object{{"id", "pbt-kek"},
+                                          {"cipher", options.encryption->kek_cipher},
+                                          {"data_hex", options.encryption->kek_hex}}}}});
+    config["keyring"] = json::object{{"uri", "file://" + keyring_path.string()}};
+    storage["encryption"] = json::object{{"format", "generic"},
+                                         {"kek_id", "pbt-kek"},
+                                         {"cipher", options.encryption->data_cipher}};
   }
   config["storage"] = storage;
   result->config_path = (result->directory.path() / "config.json").string();
@@ -739,6 +795,108 @@ std::string pbs_storage::stored(const std::string &name) const {
   auto content{read_file(target)};
   fs::remove(target, ignored);
   return content;
+}
+
+namespace {
+
+std::string from_hex(std::string_view text) {
+  const auto digit{[](char value) -> int {
+    if (value >= '0' && value <= '9') {
+      return value - '0';
+    }
+    if (value >= 'a' && value <= 'f') {
+      return value - 'a' + 10;
+    }
+    if (value >= 'A' && value <= 'F') {
+      return value - 'A' + 10;
+    }
+    throw std::invalid_argument{"invalid hex digit"};
+  }};
+  std::string result;
+  for (std::size_t i{0U}; i + 1U < text.size(); i += 2U) {
+    result += static_cast<char>((digit(text[i]) << 4) | digit(text[i + 1U]));
+  }
+  return result;
+}
+
+std::string evp_decrypt(const std::string &cipher_name, const std::string &key,
+                        const std::string &iv, const std::string &tag,
+                        const std::string &input) {
+  const EVP_CIPHER *cipher{EVP_get_cipherbyname(cipher_name.c_str())};
+  pbt::require(cipher != nullptr, "oracle: unknown cipher " + cipher_name);
+  const std::unique_ptr<EVP_CIPHER_CTX, decltype(&EVP_CIPHER_CTX_free)> ctx{
+      EVP_CIPHER_CTX_new(), &EVP_CIPHER_CTX_free};
+  // NOLINTBEGIN(cppcoreguidelines-pro-type-reinterpret-cast)
+  const auto *key_bytes{reinterpret_cast<const unsigned char *>(key.data())};
+  const auto *iv_bytes{iv.empty() ? nullptr
+                                  : reinterpret_cast<const unsigned char *>(iv.data())};
+  pbt::require(EVP_DecryptInit_ex(ctx.get(), cipher, nullptr, key_bytes,
+                                  iv_bytes) == 1,
+               "oracle: EVP_DecryptInit_ex");
+  EVP_CIPHER_CTX_set_padding(ctx.get(), 0);
+  std::string output(input.size() + 32U, '\0');
+  int length{0};
+  pbt::require(EVP_DecryptUpdate(ctx.get(),
+                                 reinterpret_cast<unsigned char *>(output.data()),
+                                 &length,
+                                 reinterpret_cast<const unsigned char *>(input.data()),
+                                 static_cast<int>(input.size())) == 1,
+               "oracle: EVP_DecryptUpdate");
+  auto total{static_cast<std::size_t>(length)};
+  if (!tag.empty()) {
+    std::string tag_copy{tag};
+    pbt::require(EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_AEAD_SET_TAG,
+                                     static_cast<int>(tag_copy.size()),
+                                     tag_copy.data()) == 1,
+                 "oracle: set tag");
+  }
+  pbt::require(EVP_DecryptFinal_ex(
+                   ctx.get(),
+                   reinterpret_cast<unsigned char *>(output.data()) + total,
+                   &length) == 1,
+               "oracle: EVP_DecryptFinal_ex (file key authentication)");
+  // NOLINTEND(cppcoreguidelines-pro-type-reinterpret-cast)
+  total += static_cast<std::size_t>(length);
+  output.resize(total);
+  return output;
+}
+
+std::string optional_hex(const json::object &object, std::string_view key) {
+  const auto *value{object.if_contains(key)};
+  if (value == nullptr || value->is_null()) {
+    return {};
+  }
+  return from_hex(value->as_string());
+}
+
+} // namespace
+
+// README: file key = KEK-decrypt(file_key_envelope), data =
+// <file_data_envelope.cipher>-decrypt(file key, iv) from offset 0
+std::string pbs_storage::plaintext(const std::string &name) const {
+  auto data{stored(name)};
+  if (!options.encryption) {
+    return data;
+  }
+  const auto metadata{json::parse(stored(name + ".json")).as_object()};
+  const auto *encryption{metadata.if_contains("encryption")};
+  pbt::require(encryption != nullptr && encryption->is_object(),
+               "binlog " + name + " of an encrypted storage has no "
+               "encryption envelopes in its metadata");
+  const auto &key_envelope{encryption->as_object().at("file_key_envelope").as_object()};
+  const auto &data_envelope{encryption->as_object().at("file_data_envelope").as_object()};
+  pbt::require_equal(std::string{key_envelope.at("kek_id").as_string()},
+                     std::string{"pbt-kek"}, "file_key_envelope.kek_id of " + name);
+  pbt::require_equal(std::string{data_envelope.at("cipher").as_string()},
+                     options.encryption->data_cipher,
+                     "file_data_envelope.cipher of " + name);
+  const auto file_key{evp_decrypt(options.encryption->kek_cipher,
+                                  from_hex(options.encryption->kek_hex),
+                                  optional_hex(key_envelope, "iv_hex"),
+                                  optional_hex(key_envelope, "tag_hex"),
+                                  from_hex(key_envelope.at("data_hex").as_string()))};
+  return evp_decrypt(options.encryption->data_cipher, file_key,
+                     from_hex(data_envelope.at("iv_hex").as_string()), {}, data);
 }
 
 pbs_storage::~pbs_storage() {
@@ -1010,7 +1168,7 @@ void require_storage_matches_server(
         continue;
       }
       const auto expected{server_file(info, name)};
-      const auto actual{storage.stored(name)};
+      const auto actual{storage.plaintext(name)};
       const auto events{walk(expected, "server " + name)};
       if (actual.size() < expected.size() && !events.types.empty() &&
           (events.types.back() == rotate_event ||
@@ -1053,7 +1211,7 @@ void require_storage_matches_server(
     if (std::ranges::find(without_rotate, name) != without_rotate.end()) {
       expected.resize(binlogs[i].size);
     }
-    const auto actual{storage.stored(name)};
+    const auto actual{storage.plaintext(name)};
     pbt::require(actual == expected, "stored " + name +
                                          " differs from the server's file: " +
                                          first_difference(expected, actual));
@@ -1657,7 +1815,7 @@ void check_rewrite_mode(hegel::TestCase &tc, bool verify_checksum) {
           expected_name.insert(0U, "rw.");
           pbt::require_equal(name, expected_name,
                              "rewritten binlog names are consecutive");
-          const auto data{storage->stored(name)};
+          const auto data{storage->plaintext(name)};
           pbt::require_equal(std::uint64_t{data.size()},
                              item.at("size").to_number<std::uint64_t>(),
                              "list: size of " + name);

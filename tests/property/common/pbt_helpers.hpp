@@ -306,8 +306,13 @@ check(const std::function<void(hegel::TestCase &)> &body,
         std::string message{e.what()};
         std::ranges::replace(message, '\n', ' ');
         std::cerr << "PBT_FIRST_FAILURE: " << message << '\n';
-        for (const auto &line : detail::current_case_notes()) {
-          std::cerr << "PBT_FIRST_FAILURE_NOTE: " << line << '\n';
+        // every line of a multi-line note gets the prefix (the runner
+        // collects the prefixed lines)
+        for (const auto &note_text : detail::current_case_notes()) {
+          std::istringstream lines{note_text};
+          for (std::string line; std::getline(lines, line);) {
+            std::cerr << "PBT_FIRST_FAILURE_NOTE: " << line << '\n';
+          }
         }
         std::cerr.flush();
       }
