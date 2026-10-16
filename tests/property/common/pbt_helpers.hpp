@@ -51,6 +51,7 @@
 #include <cstdlib>
 #include <exception>
 #include <functional>
+#include <iostream>
 #include <optional>
 #include <source_location>
 #include <sstream>
@@ -244,10 +245,34 @@ struct check_options {
   bool slow{false};
 };
 
+namespace detail {
+
+// the notes of the test case being run (pbt::note), for the first-failure
+// record below
+inline std::vector<std::string> &current_case_notes() {
+  thread_local std::vector<std::string> notes;
+  return notes;
+}
+
+} // namespace detail
+
+// tc.note() that is also kept for the first-failure record of pbt::check
+// (Hegel prints notes only when it replays the final counterexample)
+inline void note(hegel::TestCase &tc, const std::string &text) {
+  detail::current_case_notes().push_back(text);
+  tc.note(text);
+}
+
 // Runs a Hegel property inside the current Boost.Test test case. The Hegel
 // failure report (minimal counterexample + reproduction blob) goes to
 // stderr; the exception that falsified the property is rethrown so that
 // Boost.Test marks the test case as failed with that message.
+//
+// The first test case that fails is also written to stderr right away
+// ("PBT_FIRST_FAILURE: <message>" and its pbt::note lines as
+// "PBT_FIRST_FAILURE_NOTE: ..."): when the failure depends on timing and
+// Hegel's replay passes ("Flaky test detected"), this is the only record of
+// what failed. run_property_tests.py reports it for flaky properties.
 inline void
 check(const std::function<void(hegel::TestCase &)> &body,
       check_options options = {},
@@ -266,7 +291,28 @@ check(const std::function<void(hegel::TestCase &)> &body,
   if (const auto blob{detail::env("PBT_REPRODUCE")}; blob) {
     failure_blobs.push_back(*blob);
   }
-  hegel::test(body,
+  bool first_failure_written{false};
+  const auto recorded_body{[&body, &first_failure_written](hegel::TestCase &tc) {
+    detail::current_case_notes().clear();
+    try {
+      body(tc);
+    } catch (const hegel::internal::HegelStopTest &) {
+      throw;
+    } catch (const std::exception &e) {
+      if (!first_failure_written) {
+        first_failure_written = true;
+        std::string message{e.what()};
+        std::ranges::replace(message, '\n', ' ');
+        std::cerr << "PBT_FIRST_FAILURE: " << message << '\n';
+        for (const auto &line : detail::current_case_notes()) {
+          std::cerr << "PBT_FIRST_FAILURE_NOTE: " << line << '\n';
+        }
+        std::cerr.flush();
+      }
+      throw;
+    }
+  }};
+  hegel::test(recorded_body,
               hegel::TestLocation{test_name, location.file_name(),
                                   static_cast<int>(location.line())},
               settings, failure_blobs);
