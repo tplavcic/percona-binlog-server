@@ -195,7 +195,7 @@ walker (magic, sizes, log_pos, CRC32, GTID order).
 | D5 | `RewriteModeKeepsTransactionsMySQL`: rewritten binlogs are well-formed, reach file_size, hold every transaction in the server's order | ✅ |
 | D5a | `RewriteModeWithoutChecksumVerificationMySQL`: the same with verify_checksum = false | ✅ (PBT-022 confirmed) |
 | D6 | `ListenerServesServerEventsMySQL`: a binlog dump (libmysqlclient MYSQL_RPL, COM_BINLOG_DUMP, CRC32 / NONE) from the `pull` listener at any event of any stored binlog receives exactly the events the MySQL server sends from there | ✅ |
-| D7 | `ReplicaOfListenerMatchesSourceMySQL`: a MySQL replica (`mysqld.sh --replica`) of the listener catches up with the source (gtid_executed, CHECKSUM TABLE) | ✅ (PBT-034) |
+| D7 | `ReplicaOfListenerMatchesSourceMySQL`: a position-based MySQL replica (`mysqld.sh --replica`, gtid_mode=ON, so the storage is in GTID mode: the listener reports GTID_MODE from it) of the listener catches up with the source (gtid_executed, CHECKSUM TABLE) | ✅ (PBT-034 fixed upstream) |
 | D8 | `ServerRestartDuringPullMySQL`: the server is restarted (STOP) or killed with SIGKILL and restarted (crash recovery) while `pull` runs; `pull` reconnects, never exits, and its storage matches the server | ✅ |
 | D8a | `CrashInBinlogWithoutTransactionsMySQL`: the server is killed while its newest binlog has no transaction; fetch afterwards | ✅ (PBT-035) |
 | D10 | `FetchMatchesServerBinlogsOnS3MySQL`, `RepeatedFetchResumesOnS3MySQL`, `KilledPullResumesOnS3MySQL`, `ListenerServesServerEventsOnS3MySQL`: D1, D2, D3 and D6 with the S3 storage backend (SeaweedFS); the stored objects are read back independently of PBS through the SeaweedFS filer (plain HTTP, `PBT_S3_FILER`), each case in its own prefix (removed afterwards) | ✅ |
@@ -233,7 +233,8 @@ there is authoritative):
 | Severity | Issues |
 |---|---|
 | high | PBT-015, PBT-017, PBT-022 |
-| medium | PBT-001, PBT-002, PBT-004, PBT-012, PBT-013, PBT-016, PBT-019, PBT-026, PBT-029, PBT-030, PBT-031, PBT-032, PBT-033, PBT-034, PBT-035 |
+| medium | PBT-001, PBT-002, PBT-004, PBT-012, PBT-013, PBT-016, PBT-019, PBT-026, PBT-029, PBT-030, PBT-031, PBT-032, PBT-033, PBT-035, PBT-036 |
+| fixed | PBT-034 (upstream PBS-10) |
 | low | PBT-003, PBT-005, PBT-006, PBT-007, PBT-008, PBT-009, PBT-010, PBT-011, PBT-014, PBT-018, PBT-020, PBT-021, PBT-023, PBT-024, PBT-025, PBT-027, PBT-028 |
 
 ### GTID sets (prototype run)
@@ -511,6 +512,22 @@ restarts and crashes during `pull`, and binlogs purged on the server. The
 listener serves exactly the server's event stream from any position. The
 same holds with the S3 backend (fetch, repeated fetch, `pull` killed and
 restarted, the listener serving from S3): no S3-specific difference found.
+
+### After the rebase on upstream main (PBS-10: replica support in the listener)
+
+Upstream added the required `replication_source.server_id` /
+`server_uuid` keys and the optional `auth_rsa_private_key`, and the
+listener now always runs `caching_sha2_password` full authentication (its
+auth cache is a stub), so clients without TLS need the RSA key. The tests'
+configurations were updated (that, not a product change, caused the 28
+"new issues" of the first run after the rebase).
+- [fixed] PBT-034: a position-based MySQL replica now replicates from the
+  listener (D7 passes). GTID replicas are documented as not supported yet.
+- [medium] PBT-036 (new): `server_uuid` with upper-case hex digits is
+  accepted, although the README says only the lowercase form is
+  (`is_canonical_uuid()` uses `isxdigit`).
+- `config_property_test` covers the new keys (valid values load, malformed
+  UUIDs, an empty `auth_rsa_private_key`, wrong types are rejected).
 
 ## 6. Open questions
 
