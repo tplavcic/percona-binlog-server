@@ -184,18 +184,31 @@ json::object response_of(hegel::TestCase &tc, const run_result &result) {
   return object;
 }
 
+std::string response_message(const json::object &response) {
+  const auto *message{response.if_contains("message")};
+  return message != nullptr && message->is_string()
+             ? std::string{message->as_string()}
+             : std::string{};
+}
+
 void require_error(const json::object &response, std::string_view message) {
-  pbt::require_equal(std::string{response.at("status").as_string()},
-                     std::string{"error"}, "status");
+  pbt::require_equal(
+      std::string{response.at("status").as_string()}, std::string{"error"},
+      message.empty()
+          ? std::string{"malformed argument accepted (status must be error)"}
+          : "status must be error with message '" + std::string{message} +
+                "'");
   if (!message.empty()) {
-    pbt::require_equal(std::string{response.at("message").as_string()},
-                       std::string{message}, "error message");
+    pbt::require_equal(response_message(response), std::string{message},
+                       "error message");
   }
 }
 
 std::vector<std::string> result_names(const json::object &response) {
   pbt::require_equal(std::string{response.at("status").as_string()},
-                     std::string{"success"}, "status");
+                     std::string{"success"},
+                     "status must be success (message: '" +
+                         response_message(response) + "')");
   std::vector<std::string> names;
   for (const auto &item : response.at("result").as_array()) {
     names.emplace_back(item.as_object().at("name").as_string());
