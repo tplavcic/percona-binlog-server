@@ -24,6 +24,8 @@
 #   $WORKDIR/hegel-cpp, hegel-build, hegel-install    - setup_pbt_env.sh
 #   $WORKDIR/libhegel                                 - setup_pbt_env.sh
 #   $WORKDIR/seaweedfs                                - setup_pbt_env.sh
+#   $WORKDIR/mysql                                    - optional MySQL tarball (setup_pbt_env.sh --with-mysql)
+#   $WORKDIR/mysql-pbt                                - private mysqld instance (mysqld.sh)
 #   $WORKDIR/percona-binlog-server-build-<variant>-pbt
 #                                                     - build_property_tests.sh
 #     <variant> = $BUILD_PRESET plus extra sanitizers, e.g. release_gcc14,
@@ -63,6 +65,23 @@ PBT_REPO_DIR="$(cd "${PBT_QA_DIR}/../.." && pwd)"
 # (QA host: 4 GiB free -> "Free Volumes: 0", bucket never accessible)
 : "${SEAWEEDFS_VOLUME_SIZE_MB:=64}"
 : "${SEAWEEDFS_VOLUME_MAX:=8}"
+
+# Private MySQL server for the layer D (MySQL) property tests
+# (extra/qa/mysqld.sh). MYSQLD_BASEDIR: a MySQL / Percona Server binary
+# tarball directory (bin/mysqld); empty = $WORKDIR/mysql if it exists, else
+# mysqld from PATH / /usr/sbin. The instance (data, socket, logs) lives in
+# MYSQLD_DIR, listens on 127.0.0.1:MYSQLD_PORT only and is reset by the
+# tests - never point the tests at a server whose data matters.
+: "${MYSQLD_BASEDIR:=}"
+: "${MYSQLD_DIR:=${WORKDIR}/mysql-pbt}"
+: "${MYSQLD_PORT:=13306}"
+: "${MYSQLD_USER:=pbt}"
+: "${MYSQLD_PASSWORD:=pbt-password}"
+: "${MYSQLD_START_TIMEOUT:=120}"
+# optional binary tarball setup_pbt_env.sh --with-mysql unpacks into
+# $WORKDIR/mysql (Percona Server 8.4 LTS, minimal build for glibc 2.35 =
+# Ubuntu 22.04); check https://www.percona.com/downloads for the current one
+: "${MYSQLD_TARBALL_URL:=https://downloads.percona.com/downloads/Percona-Server-8.4/Percona-Server-8.4.5-5/binary/tarball/Percona-Server-8.4.5-5-Linux.x86_64.glibc2.35-minimal.tar.gz}"
 
 # compiler used to build hegel-cpp (must be ABI compatible with BUILD_PRESET)
 case "${BUILD_PRESET}" in

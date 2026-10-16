@@ -110,12 +110,12 @@ environment. If they are not set, it starts SeaweedFS
 stops and wipes it after the run. `--s3 off` skips these properties. To
 run one of them by hand: `eval "$(extra/qa/seaweedfs.sh env)"`.
 
-`storage_property_test`, `config_property_test` and `cli_property_test`
-link the server sources through the `pbs_test_binsrv` test library (todo.md
-T1). They need the same dependencies as `binlog_server` (MySQL client
-library, AWS SDK, Boost). `cli_property_test` also runs the `binlog_server`
-binary of the same build directory (it is built as a dependency) on
-storages it generates under `$TMPDIR`.
+`storage_property_test`, `config_property_test`, `cli_property_test` and
+`mysql_property_test` link the server sources through the
+`pbs_test_binsrv` test library (todo.md T1). They need the same dependencies as `binlog_server` (MySQL client
+library, AWS SDK, Boost). `cli_property_test` and `mysql_property_test` also
+run the `binlog_server` binary of the same build directory (it is built as
+a dependency), on storages under `$TMPDIR`.
 
 Known bugs are reported as failures in JUnit (`--known-as failure`, the
 default), so they stay visible in Jenkins; `--known-as skipped` hides them.
@@ -147,6 +147,38 @@ extra/qa/seaweedfs.sh stop
 ```
 
 Ports and credentials are set in `pbt_env.sh` (`SEAWEEDFS_*`).
+
+## MySQL server (layer D)
+
+Properties whose name contains `MySQL` (`mysql_property_test`) run the
+`binlog_server` binary against a real MySQL server and compare the storage
+with the server's binlog files. They reset the server's binary logs and
+GTIDs, so they use a private, throw-away server: by default
+(`--mysql auto`) the runner starts it with `extra/qa/mysqld.sh` when
+`PBT_MYSQL_PORT` is not set, and stops it after the run (its data
+directory `$WORKDIR/mysql-pbt` is kept, so the next start is quick).
+`--mysql off` skips these properties. The MySQL properties never run in
+parallel with each other (`--jobs`).
+
+```bash
+extra/qa/mysqld.sh start            # mysqld on 127.0.0.1:13306, data in $WORKDIR/mysql-pbt
+eval "$(extra/qa/mysqld.sh env)"    # PBT_MYSQL_HOST / _PORT / _USER / _PASSWORD
+extra/qa/mysqld.sh stop
+extra/qa/mysqld.sh wipe             # stop and delete the instance
+```
+
+The server runs with `log_bin`, `gtid_mode=ON`, `binlog_checksum=CRC32`
+and binds to 127.0.0.1 only. `mysqld` is taken from `$MYSQLD_BASEDIR/bin`,
+`$WORKDIR/mysql/bin` (`setup_pbt_env.sh --with-mysql` unpacks a Percona
+Server tarball there, `MYSQLD_TARBALL_URL`), `PATH` or `/usr/sbin`. On
+Ubuntu the AppArmor profile of `/usr/sbin/mysqld` may refuse a data
+directory outside `/var/lib/mysql`; use a tarball then. Tagged GTIDs are
+part of the workload only with MySQL 8.3 or newer. Settings: `MYSQLD_*` in
+`pbt_env.sh`.
+
+To point the tests at another server, set `PBT_MYSQL_*` yourself. Its
+binlog files must be readable by the test process, and its binary logs
+are reset.
 
 ## Adding a property test
 
