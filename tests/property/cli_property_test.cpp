@@ -36,7 +36,6 @@
 
 #include <algorithm>
 #include <array>
-#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <ctime>
@@ -46,16 +45,11 @@
 #include <memory>
 #include <optional>
 #include <sstream>
-#include <stdexcept>
 #include <string>
 #include <string_view>
-#include <system_error>
 #include <tuple>
-#include <unistd.h>
 #include <utility>
 #include <vector>
-
-#include <sys/wait.h>
 
 #include <boost/test/unit_test.hpp>
 
@@ -78,11 +72,8 @@
 #include "util/byte_span_fwd.hpp"
 #include "util/ctime_timestamp.hpp"
 
+#include "common/binlog_server_process.hpp"
 #include "common/pbt_helpers.hpp"
-
-#ifndef PBS_BINLOG_SERVER_PATH
-#define PBS_BINLOG_SERVER_PATH ""
-#endif
 
 namespace {
 
@@ -94,74 +85,9 @@ namespace gtids = binsrv::gtids;
 // ---------------------------------------------------------------------------
 // running the binary
 // ---------------------------------------------------------------------------
-std::string binlog_server_path() {
-  if (const auto value{pbt::detail::env("PBT_BINLOG_SERVER")}; value) {
-    return *value;
-  }
-  const std::string built{PBS_BINLOG_SERVER_PATH};
-  if (built.empty() || !fs::exists(built)) {
-    pbt::infrastructure_error("binlog_server binary not found (build the "
-                              "binlog_server target or set PBT_BINLOG_SERVER)");
-  }
-  return built;
-}
-
-struct run_result {
-  bool signaled{false};
-  int signal_number{0};
-  int exit_code{0};
-  std::string output;
-};
-
-// runs binlog_server with the arguments (no shell), stdout captured,
-// stderr discarded
-run_result run(const std::vector<std::string> &arguments) {
-  const auto program{binlog_server_path()};
-  std::array<int, 2> pipe_ends{};
-  if (::pipe(pipe_ends.data()) != 0) {
-    throw std::runtime_error{"pipe failed"};
-  }
-  std::vector<std::string> argv_storage{program};
-  argv_storage.insert(argv_storage.end(), arguments.begin(), arguments.end());
-  std::vector<char *> argv;
-  for (auto &item : argv_storage) {
-    argv.push_back(item.data());
-  }
-  argv.push_back(nullptr);
-
-  const pid_t child{::fork()};
-  if (child == 0) {
-    ::dup2(pipe_ends[1], STDOUT_FILENO);
-    ::close(pipe_ends[0]);
-    ::close(pipe_ends[1]);
-    std::ignore = std::freopen("/dev/null", "w", stderr);
-    ::execv(program.c_str(), argv.data());
-    ::_exit(127);
-  }
-  ::close(pipe_ends[1]);
-  run_result result;
-  std::array<char, 4096> buffer{};
-  for (;;) {
-    const auto count{::read(pipe_ends[0], buffer.data(), buffer.size())};
-    if (count < 0 && errno == EINTR) {
-      continue;
-    }
-    if (count <= 0) {
-      break;
-    }
-    result.output.append(buffer.data(), static_cast<std::size_t>(count));
-  }
-  ::close(pipe_ends[0]);
-  int status{0};
-  ::waitpid(child, &status, 0);
-  if (WIFSIGNALED(status)) {
-    result.signaled = true;
-    result.signal_number = WTERMSIG(status);
-  } else {
-    result.exit_code = WEXITSTATUS(status);
-  }
-  return result;
-}
+using pbt::process::run;
+using pbt::process::run_result;
+using pbt::process::temporary_directory;
 
 // the JSON response; the process must not crash
 json::object response_of(hegel::TestCase &tc, const run_result &result) {
@@ -219,31 +145,6 @@ std::vector<std::string> result_names(const json::object &response) {
 // ---------------------------------------------------------------------------
 // generated storage
 // ---------------------------------------------------------------------------
-class temporary_directory {
-public:
-  temporary_directory() {
-    std::string pattern{
-        (fs::temp_directory_path() / "pbs-pbt-cli-XXXXXX").string()};
-    // NOLINTNEXTLINE(concurrency-mt-unsafe)
-    if (::mkdtemp(std::data(pattern)) == nullptr) {
-      throw std::runtime_error{"mkdtemp failed"};
-    }
-    path_ = pattern;
-  }
-  temporary_directory(const temporary_directory &) = delete;
-  temporary_directory &operator=(const temporary_directory &) = delete;
-  temporary_directory(temporary_directory &&) = delete;
-  temporary_directory &operator=(temporary_directory &&) = delete;
-  ~temporary_directory() {
-    std::error_code ignored;
-    fs::remove_all(path_, ignored);
-  }
-  [[nodiscard]] const fs::path &path() const noexcept { return path_; }
-
-private:
-  fs::path path_;
-};
-
 struct stored_transaction {
   gtids::gtid gtid;
   std::time_t timestamp{};
@@ -272,7 +173,7 @@ struct stored_file {
 };
 
 struct generated_storage {
-  temporary_directory directory;
+  temporary_directory directory{"pbs-pbt-cli"};
   bool gtid_mode{};
   gtids::gtid_set purged;
   std::vector<stored_file> files;
