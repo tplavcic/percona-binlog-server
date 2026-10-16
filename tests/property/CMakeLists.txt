@@ -178,4 +178,14 @@ if(TARGET pbs_test_binsrv)
     PBS_BINLOG_SERVER_PATH="$<TARGET_FILE:binlog_server>"
   )
   add_dependencies(cli_property_test binlog_server)
+  # layer D: binlog_server against a real MySQL server (PBT_MYSQL_*,
+  # extra/qa/mysqld.sh); properties named *MySQL
+  pbs_add_property_test(mysql_property_test
+    SOURCES mysql_property_test.cpp
+    LIBRARIES pbs_test_binsrv MySQL::client ZLIB::ZLIB
+  )
+  target_compile_definitions(mysql_property_test PRIVATE
+    PBS_BINLOG_SERVER_PATH="$<TARGET_FILE:binlog_server>"
+  )
+  add_dependencies(mysql_property_test binlog_server)
 endif()
