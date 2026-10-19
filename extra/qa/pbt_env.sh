@@ -86,6 +86,13 @@ PBT_REPO_DIR="$(cd "${PBT_QA_DIR}/../.." && pwd)"
 # Ubuntu 22.04); check https://www.percona.com/downloads for the current one
 : "${MYSQLD_TARBALL_URL:=https://downloads.percona.com/downloads/Percona-Server-8.4/Percona-Server-8.4.5-5/binary/tarball/Percona-Server-8.4.5-5-Linux.x86_64.glibc2.35-minimal.tar.gz}"
 
+# MySQL client library (headers + libmysqlclient) build_property_tests.sh
+# builds against: a MySQL / Percona Server binary tarball directory
+# (include/mysql.h, lib/libmysqlclient.so) instead of the system
+# libmysqlclient-dev. Empty = the system one if /usr/include/mysql/mysql.h
+# exists, else MYSQLD_BASEDIR, else $WORKDIR/mysql.
+: "${MYSQL_CLIENT_ROOT:=}"
+
 # compiler used to build hegel-cpp (must be ABI compatible with BUILD_PRESET)
 case "${BUILD_PRESET}" in
   *clang20) : "${PBT_CXX:=clang++-20}" ;;

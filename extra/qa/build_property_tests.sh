@@ -21,9 +21,17 @@
 # $PBT_BUILD_DIR), so the regular preset build directory is left untouched.
 #
 #   extra/qa/build_property_tests.sh [--preset P] [--sanitize LIST] [--clean]
-#                                    [--all] [-- <extra cmake args>]
+#                                    [--all] [--mysql-client-root DIR]
+#                                    [-- <extra cmake args>]
 #
 #   --preset P       CMake preset (default: $BUILD_PRESET or release_gcc14)
+#   --mysql-client-root DIR
+#                    build against the MySQL client of a binary tarball
+#                    (DIR/include/mysql.h, DIR/lib/libmysqlclient.so)
+#                    instead of the system libmysqlclient-dev (default:
+#                    $MYSQL_CLIENT_ROOT; without it and without
+#                    /usr/include/mysql/mysql.h: $MYSQLD_BASEDIR, then
+#                    $WORKDIR/mysql)
 #   --sanitize LIST  extra -fsanitize= checks on top of the preset, comma
 #                    separated (default: $PBT_SANITIZE), e.g. "undefined";
 #                    the variant name gets a suffix (undefined -> -ubsan)
@@ -51,10 +59,12 @@ while [[ $# -gt 0 ]]; do
     --preset=*) BUILD_PRESET="${1#*=}" ;;
     --sanitize) PBT_SANITIZE="$2"; shift ;;
     --sanitize=*) PBT_SANITIZE="${1#*=}" ;;
+    --mysql-client-root) MYSQL_CLIENT_ROOT="$2"; shift ;;
+    --mysql-client-root=*) MYSQL_CLIENT_ROOT="${1#*=}" ;;
     --clean) clean=1 ;;
     --all) build_all=1 ;;
     --) shift; extra_args=("$@"); break ;;
-    -h|--help) sed -n '17,38p' "$0"; exit 0 ;;
+    -h|--help) sed -n '/^# Configures/,/^# which run_property/p' "$0"; exit 0 ;;
     *) pbt_die "unknown argument: $1" ;;
   esac
   shift
@@ -95,6 +105,48 @@ if [[ -n "${PBT_SANITIZE}" ]]; then
   )
 fi
 
+# MySQL client from a binary tarball (MYSQL_CLIENT_ROOT): the tarball has
+# include/mysql.h, the sources include <mysql/mysql.h>, so a directory with
+# a 'mysql' link to the tarball's include/ becomes the include directory.
+# Both cache entries are passed on every configure, so a value cached
+# earlier (e.g. a removed /usr/include/mysql) does not survive.
+mysql_args=()
+mysql_client_root="${MYSQL_CLIENT_ROOT}"
+if [[ -z "${mysql_client_root}" && ! -f /usr/include/mysql/mysql.h ]]; then
+  for candidate in "${MYSQLD_BASEDIR}" "${WORKDIR}/mysql"; do
+    if [[ -n "${candidate}" && -f "${candidate}/include/mysql.h" ]]; then
+      mysql_client_root="${candidate}"
+      break
+    fi
+  done
+  [[ -n "${mysql_client_root}" ]] \
+    || pbt_die "no MySQL client headers: /usr/include/mysql/mysql.h is missing; set MYSQL_CLIENT_ROOT (or --mysql-client-root) to a MySQL / Percona Server tarball directory"
+fi
+if [[ -n "${mysql_client_root}" ]]; then
+  mysql_client_root="$(cd "${mysql_client_root}" && pwd)"
+  [[ -f "${mysql_client_root}/include/mysql.h" ]] \
+    || pbt_die "${mysql_client_root}/include/mysql.h not found (MYSQL_CLIENT_ROOT)"
+  mysql_library=""
+  for candidate in "${mysql_client_root}/lib/libmysqlclient.so" \
+                   "${mysql_client_root}/lib/libmysqlclient.a"; do
+    if [[ -e "${candidate}" ]]; then
+      mysql_library="${candidate}"
+      break
+    fi
+  done
+  [[ -n "${mysql_library}" ]] \
+    || pbt_die "no libmysqlclient.so / .a in ${mysql_client_root}/lib (MYSQL_CLIENT_ROOT)"
+  mysql_include_dir="${WORKDIR}/mysql-client-include"
+  pbt_require_in_workdir "${mysql_include_dir}"
+  mkdir -p "${mysql_include_dir}"
+  ln -sfn "${mysql_client_root}/include" "${mysql_include_dir}/mysql"
+  pbt_log "MySQL client: ${mysql_library} (headers ${mysql_client_root}/include)"
+  mysql_args=(
+    "-DMYSQL_INCLUDE_DIR=${mysql_include_dir}"
+    "-DMYSQL_LIBRARY=${mysql_library}"
+  )
+fi
+
 pbt_require_in_workdir "${PBT_BUILD_DIR}"
 if [[ ${clean} -eq 1 ]]; then
   pbt_log "removing ${PBT_BUILD_DIR}"
@@ -107,6 +159,7 @@ cmake -S "${PBT_REPO_DIR}" -B "${PBT_BUILD_DIR}" --preset "${BUILD_PRESET}" \
   -DPBS_HEGEL_FETCH=OFF \
   -Dhegel_DIR="${hegel_dir}" \
   "${sanitizer_args[@]}" \
+  "${mysql_args[@]}" \
   "${extra_args[@]}"
 
 # label used by run_property_tests.py for reports / junit suite names
