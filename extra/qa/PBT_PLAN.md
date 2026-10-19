@@ -200,6 +200,8 @@ walker (magic, sizes, log_pos, CRC32, GTID order).
 | D8a | `CrashInBinlogWithoutTransactionsMySQL`: the server is killed while its newest binlog has no transaction; fetch afterwards | ✅ (PBT-035) |
 | D10 | `FetchMatchesServerBinlogsOnS3MySQL`, `RepeatedFetchResumesOnS3MySQL`, `KilledPullResumesOnS3MySQL`, `ListenerServesServerEventsOnS3MySQL`: D1, D2, D3 and D6 with the S3 storage backend (SeaweedFS); the stored objects are read back independently of PBS through the SeaweedFS filer (plain HTTP, `PBT_S3_FILER`), each case in its own prefix (removed afterwards) | ✅ |
 | D11 | encrypted storage: every MySQL property draws `storage.encryption` in a third of its cases (KEK AES-128-ECB / AES-256-CBC / AES-256-GCM / AES-192-CTR / CAMELLIA-128-CBC; data cipher AES-128/192/256-CTR, ARIA-128-CTR, CAMELLIA-256-CTR, within the README's KEK / key-length rule); the oracle decrypts every stored binlog independently (OpenSSL EVP, the test's keyring, the envelopes in `<binlog>.json`) before comparing it with the server's file. Covers fetch, resume, killed `pull`, server restarts, purge, rewrite, S3, the listener serving an encrypted storage and the real replica | ✅ |
+| D12 | S3 outages (TCP proxy in the test between PBS and SeaweedFS, switched off / on): `S3OutageWhileCollectingStopsPullMySQL` (pull writing to S3 exits on its own with a failure exit code, no crash / hang; afterwards fetch resumes and the storage matches), `S3OutageAtStartupFailsMySQL` (fetch / pull / list fail cleanly, storage unchanged), `S3OutageWhileServingKeepsPullRunningMySQL` (a dump that needs S3 fails, pull keeps running, a new dump after the outage is exact). Expected behaviour: see "S3 outages" below | ✅ |
+| D13 | `ListenerRejectsInvalidDumpRequestsMySQL`: a dump of a binlog the storage does not have, from a position beyond the end of a binlog or inside an event gets an error packet like from MySQL (1236), not a dropped connection or an empty successful dump | ✅ (PBT-037) |
 | D9 | `PurgeOnServerMySQL`: `PURGE BINARY LOGS TO` before / after the storage got the binlogs; fetch succeeds exactly when the server still has what the storage needs (position: its newest binlog; GTID: gtid_purged covered; empty storage), else exits 1 leaving the storage unchanged | ✅ |
 
 GTID auto-positioning: the server starts a GTID dump at the newest binlog
@@ -233,7 +235,7 @@ there is authoritative):
 | Severity | Issues |
 |---|---|
 | high | PBT-015, PBT-017, PBT-022 |
-| medium | PBT-001, PBT-002, PBT-004, PBT-012, PBT-013, PBT-016, PBT-019, PBT-026, PBT-029, PBT-030, PBT-031, PBT-032, PBT-033, PBT-035, PBT-036 |
+| medium | PBT-001, PBT-002, PBT-004, PBT-012, PBT-013, PBT-016, PBT-019, PBT-026, PBT-029, PBT-030, PBT-031, PBT-032, PBT-033, PBT-035, PBT-036, PBT-037 |
 | fixed | PBT-034 (upstream PBS-10) |
 | low | PBT-003, PBT-005, PBT-006, PBT-007, PBT-008, PBT-009, PBT-010, PBT-011, PBT-014, PBT-018, PBT-020, PBT-021, PBT-023, PBT-024, PBT-025, PBT-027, PBT-028 |
 
@@ -542,6 +544,34 @@ draw changed the generated sequences):
   `KilledPullResumesMySQL` failures on QA.
 - [medium] PBT-035 through a server crash right after `FLUSH BINARY LOGS`
   (`ServerRestartDuringPullMySQL`).
+
+### S3 outages (expected behaviour, agreed with the project)
+
+PBS relies on the AWS SDK's retries; there is no application-level loop
+that waits for S3 to come back. After the SDK gives up (about 20-25 s in
+the sandbox):
+
+| Where S3 fails | What happens |
+|---|---|
+| Reading binlogs from S3 to serve a replication client | The exception is logged and that client's session is closed. The process keeps running (if the collector does not fail too); the client must reconnect. |
+| Collecting binlogs from MySQL and writing them to S3 | The error is logged, the process stops and exits with a failure exit code. |
+| Reading S3 during startup | Startup fails, the process exits with a failure exit code. |
+
+D12 checks exactly this, plus that the storage stays consistent (a fetch
+after the outage resumes and matches the server). All three properties
+pass (sandbox). The README does not describe it yet (todo.md T8).
+
+Observation (not filed as a bug, within the agreed behaviour): the
+listener runs every session on the one `io_context` thread of `pull` and
+reads S3 synchronously, so while the SDK retries one session's read (an
+outage), every other replication client waits too; new sessions work again
+once the SDK gives up on that read. The D12 serving property therefore
+retries its dump after the outage (up to the SDK give-up time).
+
+- [medium] PBT-037 (new, found while writing D12): the listener answers
+  invalid dump requests (unknown binlog, position beyond the end, position
+  inside an event) with a dropped connection or an empty successful dump
+  instead of MySQL's error 1236 (D13).
 
 ## 6. Open questions
 

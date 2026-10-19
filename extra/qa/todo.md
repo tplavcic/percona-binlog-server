@@ -116,3 +116,15 @@ for it. When a change lands, move the tests into `PBT_PLAN.md` as
   live MySQL source. The T1 workaround makes the code linkable but not
   callable. Without this change the real flow can only be tested at layer
   D (with MySQL) or layer C (with another PBS as the source).
+
+## T8 - document the behaviour on S3 outages in README.md
+
+- **Tests that need it:** none (the D12 properties check the behaviour
+  agreed with the project, see `PBT_PLAN.md` "S3 outages").
+- **Change:** a README paragraph (e.g. under "'pull' operation mode"):
+  PBS relies on the AWS SDK's retries; when they give up, a failed write
+  while collecting stops the process with a failure exit code, a failed
+  read during startup fails the start, and a failed read while serving a
+  replication client closes only that client's session.
+- **Why:** the README says network errors towards MySQL are retried in
+  `pull` mode, which a reader may assume for S3 as well.
