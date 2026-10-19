@@ -22,6 +22,15 @@ extra/qa/run_property_tests.py          # -> ~/ws/testruns/<timestamp>-<variant>
 Boost and the AWS SDK must already be installed in `WORKDIR` for the chosen
 preset, as described in the top-level `README.md`.
 
+The MySQL client library is the system `libmysqlclient-dev` when
+`/usr/include/mysql/mysql.h` exists. Without it (or to use another one) the
+build takes the client from a MySQL / Percona Server binary tarball
+directory: `--mysql-client-root DIR` / `MYSQL_CLIENT_ROOT=DIR`
+(`DIR/include/mysql.h`, `DIR/lib/libmysqlclient.so`), defaulting to
+`MYSQLD_BASEDIR`, then `~/ws/mysql`. The headers are linked as
+`~/ws/mysql-client-include/mysql` and both CMake cache entries are set on
+every configure, so a stale cached `/usr/include` is replaced.
+
 ## Build variants
 
 A build variant is a CMake preset, optionally with extra sanitizers. Each
