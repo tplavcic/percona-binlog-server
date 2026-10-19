@@ -48,6 +48,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cstddef>
@@ -58,6 +59,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -69,6 +71,7 @@
 #include <vector>
 
 #include <arpa/inet.h>
+#include <poll.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -492,6 +495,9 @@ struct pbs_options {
   std::optional<std::string> checkpoint_interval;
   std::optional<std::string> rewrite_file_size;
   bool s3{false};  // storage.backend s3 (SeaweedFS, PBT_S3_*) instead of file
+  // S3 endpoint port PBS connects to instead of PBT_S3_ENDPOINT's (the
+  // outage proxy); the oracle still reads through the filer
+  std::optional<std::uint16_t> s3_port;
   // storage.encryption: KEK (keyring) and data cipher
   struct encryption_options {
     std::string kek_cipher;
@@ -574,7 +580,8 @@ struct s3_location {
   std::string filer;   // <filer>/buckets/<bucket>/<prefix>
 };
 
-s3_location s3_location_for(const std::string &prefix) {
+s3_location s3_location_for(const std::string &prefix,
+                            std::optional<std::uint16_t> port = {}) {
   const auto endpoint{pbt::detail::env("PBT_S3_ENDPOINT")};
   const auto access_key{pbt::detail::env("PBT_S3_ACCESS_KEY")};
   const auto secret_key{pbt::detail::env("PBT_S3_SECRET_KEY")};
@@ -590,9 +597,12 @@ s3_location s3_location_for(const std::string &prefix) {
   if (scheme_end == std::string::npos) {
     pbt::infrastructure_error("PBT_S3_ENDPOINT must be http[s]://host:port");
   }
+  auto host_port{endpoint->substr(scheme_end + 3U)};
+  if (port) {
+    host_port = "127.0.0.1:" + std::to_string(*port);
+  }
   return {endpoint->substr(0U, scheme_end + 3U) + *access_key + ":" +
-              *secret_key + "@" + endpoint->substr(scheme_end + 3U) + "/" +
-              *bucket + "/" + prefix,
+              *secret_key + "@" + host_port + "/" + *bucket + "/" + prefix,
           *filer + "/buckets/" + *bucket + "/" + prefix};
 }
 
@@ -684,7 +694,8 @@ std::unique_ptr<pbs_storage> make_storage(const pbs_options &options) {
   json::object storage{{"backend", "file"},
                        {"uri", "file://" + result->vault().generic_string()}};
   if (options.s3) {
-    result->s3 = s3_location_for(result->directory.path().filename().string());
+    result->s3 = s3_location_for(result->directory.path().filename().string(),
+                                 options.s3_port);
     storage["backend"] = "s3";
     storage["uri"] = result->s3->uri;
     // partially uploaded binlogs: inside the test's directory ($TMPDIR)
@@ -1310,6 +1321,19 @@ public:
       pbt::fail("binlog_server pull exited on its own (" + exited->describe() +
                 ")");
     }
+  }
+
+  // waits up to 'timeout' for pull to exit on its own (nullopt: still
+  // running)
+  std::optional<run_result> wait_for_exit(std::chrono::seconds timeout) {
+    const auto deadline{std::chrono::steady_clock::now() + timeout};
+    while (std::chrono::steady_clock::now() < deadline) {
+      if (const auto result{process_->poll()}; result) {
+        return result;
+      }
+      wait_ms(100U);
+    }
+    return std::nullopt;
   }
 
   void kill() {
@@ -1961,6 +1985,87 @@ BOOST_AUTO_TEST_CASE(ListenerServesServerEventsOnS3MySQL) {
   pbt::check([](hegel::TestCase &tc) { listener_serves_server_events(tc, true); },
              {.test_cases = 20U, .slow = true});
 }
+// A binlog dump request the storage cannot serve - a binlog it does not
+// have, a position beyond the end of a binlog, a position inside an event
+// - is answered like MySQL answers it: with an error packet (MySQL 1236:
+// "Could not find first log file name in binary log index file", "Client
+// requested source to start replication from position > file size",
+// "binlog truncated in the middle of event"), not with a dropped
+// connection and not with an empty, successful dump. A replica stops on
+// the error; on a lost connection it retries for ever.
+BOOST_AUTO_TEST_CASE(ListenerRejectsInvalidDumpRequestsMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        start_case(tc, server);
+        const auto options{draw_options(tc)};
+        pbt::note(tc, "binlog_server: " + describe(options));
+        const auto storage{make_storage(options)};
+        pbt::note(tc, "workload:");
+        auto workload{draw_workload(tc, server.info, 4U)};
+        workload.push_back(operation{.kind = op_kind::insert_rows, .count = 1});
+        apply_all(tc, server.sql, workload);
+        fetch(tc, *storage);
+        std::vector<std::pair<std::string, std::uint64_t>> stored;
+        const auto listing{list(tc, *storage)};
+        for (const auto &item : listing.at("result").as_array()) {
+          stored.emplace_back(item.at("name").as_string(),
+                              item.at("size").to_number<std::uint64_t>());
+        }
+        const auto index{tc.draw(
+            "binlog", gs::integers<std::size_t>({.max_value = stored.size() - 1U}))};
+        const auto &[name, size]{stored[index]};
+        const auto request{tc.draw(
+            "request", gs::sampled_from<std::string>(
+                           {"unknown binlog", "beyond the end", "inside an event"}))};
+        std::string file{name};
+        std::uint64_t position{4U};
+        if (request == "unknown binlog") {
+          // the next name after the newest stored binlog, or another base
+          const auto &newest{stored.back().first};
+          const auto number{std::stoul(newest.substr(newest.rfind('.') + 1U))};
+          std::string digits{std::to_string(number + 1U)};
+          digits.insert(0U, digits.size() < 6U ? 6U - digits.size() : 0U, '0');
+          file = tc.draw("other_base", gs::booleans())
+                     ? std::string{"nosuch.000001"}
+                     : newest.substr(0U, newest.rfind('.') + 1U) + digits;
+        } else if (request == "beyond the end") {
+          position = size + tc.draw("beyond", gs::sampled_from<std::uint64_t>(
+                                                   {1U, 1000U, 1000000U}));
+        } else {
+          const auto events{walk(storage->plaintext(name), "stored " + name)};
+          const auto event{tc.draw(
+              "event", gs::integers<std::size_t>({.max_value = events.offsets.size() - 1U}))};
+          const auto start{events.offsets[event]};
+          const auto end{event + 1U < events.offsets.size()
+                             ? events.offsets[event + 1U]
+                             : static_cast<std::size_t>(size)};
+          position = start + 1U +
+                     tc.draw("inside", gs::integers<std::size_t>(
+                                           {.max_value = end - start - 2U}));
+        }
+        pbt::note(tc, "dump " + file + ":" + std::to_string(position) + " (" +
+                          request + ")");
+        pull_process pull{tc, *storage};
+        pull.wait_until_listening();
+        const auto served{dump_binlog(listener_port(), "replica",
+                                      "replica-password", file, position, true)};
+        pbt::note(tc, "listener: " + (served.error.empty() ? std::string{"no error"}
+                                                          : served.error) +
+                          ", " + std::to_string(served.events.size()) + " events");
+        pull.require_running();
+        pull.stop();
+        // one requirement for both wrong answers (an empty, successful dump
+        // or a dropped connection): which of the two a request inside an
+        // event gets depends on timing
+        pbt::require(!served.error.empty() &&
+                         served.error.find("Lost connection") == std::string::npos,
+                     "the listener did not answer an invalid dump request "
+                     "with an error (" + request + ")");
+      },
+      {.test_cases = 30U, .slow = true});
+}
+
 // ===========================================================================
 // D7: a MySQL replica of the replication source listener
 // ===========================================================================
@@ -2308,4 +2413,381 @@ BOOST_AUTO_TEST_CASE(PurgeOnServerMySQL) {
         }
       },
       {.test_cases = 40U, .slow = true});
+}
+
+// ===========================================================================
+// D12: S3 outages
+// ===========================================================================
+//
+// The expected behaviour (agreed with the project, not in the README yet):
+// PBS relies on the AWS SDK's retries and has no application-level loop
+// that waits for S3 to come back. After the SDK gives up:
+//  - collecting binlogs from MySQL and writing them to S3: the error is
+//    logged, the process stops and exits with a failure exit code;
+//  - reading S3 during startup: startup fails, exit with failure;
+//  - reading binlogs from S3 to serve a replication client: the exception
+//    is logged and that client's session is closed; the process keeps
+//    running (if the collector does not fail as well) and the client must
+//    reconnect.
+// In every case the storage stays consistent: once S3 is back, a fetch
+// resumes and the storage matches the server.
+//
+// The outage is a TCP proxy in the test process between PBS and SeaweedFS
+// (storage.uri points at the proxy): "down" closes every open connection
+// and closes new ones right after accepting them. The oracle reads the
+// objects through the SeaweedFS filer, which the proxy does not affect.
+
+namespace {
+
+class tcp_proxy {
+public:
+  explicit tcp_proxy(std::uint16_t upstream_port) : upstream_port_{upstream_port} {
+    listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd_ < 0) {
+      throw std::runtime_error{"proxy: socket failed"};
+    }
+    const int reuse{1};
+    ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof reuse);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = 0;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    // NOLINTBEGIN(cppcoreguidelines-pro-type-reinterpret-cast)
+    if (::bind(listen_fd_, reinterpret_cast<sockaddr *>(&address), sizeof address) != 0 ||
+        ::listen(listen_fd_, 64) != 0) {
+      ::close(listen_fd_);
+      throw std::runtime_error{"proxy: bind / listen failed"};
+    }
+    socklen_t length{sizeof address};
+    ::getsockname(listen_fd_, reinterpret_cast<sockaddr *>(&address), &length);
+    // NOLINTEND(cppcoreguidelines-pro-type-reinterpret-cast)
+    port_ = ntohs(address.sin_port);
+    acceptor_ = std::thread{[this]() { accept_loop(); }};
+  }
+  tcp_proxy(const tcp_proxy &) = delete;
+  tcp_proxy &operator=(const tcp_proxy &) = delete;
+  tcp_proxy(tcp_proxy &&) = delete;
+  tcp_proxy &operator=(tcp_proxy &&) = delete;
+  ~tcp_proxy() {
+    stop_ = true;
+    acceptor_.join();
+    std::vector<std::thread> pumps;
+    {
+      const std::scoped_lock lock{mutex_};
+      pumps.swap(pumps_);
+    }
+    for (auto &pump : pumps) {
+      pump.join();
+    }
+    ::close(listen_fd_);
+  }
+
+  [[nodiscard]] std::uint16_t port() const noexcept { return port_; }
+  void set_down(bool down) { down_ = down; }
+
+private:
+  void accept_loop() {
+    while (!stop_) {
+      pollfd waiting{.fd = listen_fd_, .events = POLLIN, .revents = 0};
+      if (::poll(&waiting, 1, 50) <= 0) {
+        continue;
+      }
+      const int client{::accept(listen_fd_, nullptr, nullptr)};
+      if (client < 0) {
+        continue;
+      }
+      if (down_) {
+        ::close(client);  // the outage: connection closed at once
+        continue;
+      }
+      const std::scoped_lock lock{mutex_};
+      pumps_.emplace_back([this, client]() { pump(client); });
+    }
+  }
+
+  void pump(int client) {
+    const int upstream{::socket(AF_INET, SOCK_STREAM, 0)};
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(upstream_port_);
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    if (upstream < 0 || ::connect(upstream, reinterpret_cast<sockaddr *>(&address),
+                                  sizeof address) != 0) {
+      ::close(client);
+      if (upstream >= 0) {
+        ::close(upstream);
+      }
+      return;
+    }
+    std::array<char, 65536> buffer{};
+    std::array<pollfd, 2> fds{pollfd{.fd = client, .events = POLLIN, .revents = 0},
+                              pollfd{.fd = upstream, .events = POLLIN, .revents = 0}};
+    while (!stop_ && !down_) {
+      if (::poll(fds.data(), fds.size(), 50) <= 0) {
+        continue;
+      }
+      bool closed{false};
+      for (std::size_t i{0U}; i < fds.size() && !closed; ++i) {
+        if ((fds[i].revents & (POLLIN | POLLHUP | POLLERR)) == 0) {
+          continue;
+        }
+        const auto count{::read(fds[i].fd, buffer.data(), buffer.size())};
+        if (count <= 0) {
+          closed = true;
+          break;
+        }
+        const int target{fds[1U - i].fd};
+        std::size_t written{0U};
+        while (written < static_cast<std::size_t>(count)) {
+          const auto result{::write(target, buffer.data() + written,
+                                    static_cast<std::size_t>(count) - written)};
+          if (result <= 0) {
+            closed = true;
+            break;
+          }
+          written += static_cast<std::size_t>(result);
+        }
+      }
+      if (closed) {
+        break;
+      }
+    }
+    ::close(client);
+    ::close(upstream);
+  }
+
+  std::uint16_t upstream_port_;
+  std::uint16_t port_{};
+  int listen_fd_{-1};
+  std::atomic<bool> stop_{false};
+  std::atomic<bool> down_{false};
+  std::thread acceptor_;
+  std::mutex mutex_;
+  std::vector<std::thread> pumps_;
+};
+
+// the proxy in front of PBT_S3_ENDPOINT
+std::unique_ptr<tcp_proxy> make_s3_proxy() {
+  const auto endpoint{pbt::detail::env("PBT_S3_ENDPOINT")};
+  if (!endpoint) {
+    pbt::infrastructure_error("S3 endpoint not configured (PBT_S3_ENDPOINT)");
+  }
+  const auto colon{endpoint->rfind(':')};
+  if (colon == std::string::npos) {
+    pbt::infrastructure_error("PBT_S3_ENDPOINT must be http://host:port");
+  }
+  return std::make_unique<tcp_proxy>(
+      static_cast<std::uint16_t>(std::stoul(endpoint->substr(colon + 1U))));
+}
+
+// the SDK gives up within this time (generous for ASan builds)
+constexpr std::chrono::seconds s3_give_up_time{180};
+
+} // namespace
+
+// Collecting binlogs and writing them to S3 while S3 is down: pull exits
+// on its own with a failure exit code (no crash, no hang); once S3 is back
+// a fetch resumes and the storage matches the server.
+BOOST_AUTO_TEST_CASE(S3OutageWhileCollectingStopsPullMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        start_case(tc, server);
+        auto options{draw_options(tc)};
+        const auto proxy{make_s3_proxy()};
+        options.s3 = true;
+        options.s3_port = proxy->port();
+        // every transaction has to reach S3
+        options.checkpoint_size = "1";
+        pbt::note(tc, "binlog_server: " + describe(options));
+        const auto storage{make_storage(options)};
+        pbt::note(tc, "workload before the outage:");
+        auto before{draw_workload(tc, server.info, 4U)};
+        before.push_back(operation{.kind = op_kind::insert_rows, .count = 1});
+        apply_all(tc, server.sql, before);
+        pull_process pull{tc, *storage};
+        wait_until_pull_caught_up(tc, server.sql, pull);
+        pull.require_running();
+
+        pbt::note(tc, "S3 down; workload during the outage:");
+        proxy->set_down(true);
+        auto during{draw_workload(tc, server.info, 3U)};
+        during.push_back(operation{.kind = op_kind::insert_rows, .count = 1});
+        apply_all(tc, server.sql, during);
+        const auto exited{pull.wait_for_exit(s3_give_up_time)};
+        if (!exited || exited->signaled || exited->exit_code == 0) {
+          pbt::note(tc, "binlog_server log:" + log_tail(*storage));
+        }
+        pbt::require(exited.has_value(),
+                     "pull still running long after S3 became unavailable "
+                     "for writing");
+        pbt::require(!exited->signaled,
+                     "pull crashed after S3 became unavailable (" +
+                         exited->describe() + ")");
+        pbt::require(exited->exit_code != 0,
+                     "pull exited with code 0 after failing to write to S3");
+
+        pbt::note(tc, "S3 up; fetch");
+        proxy->set_down(false);
+        fetch(tc, *storage);
+        require_storage_matches_server(tc, server.sql, server.info, *storage);
+      },
+      {.test_cases = 6U, .slow = true});
+}
+
+// Starting fetch / pull / list while S3 is down: the operation fails with
+// a failure exit code (list: a JSON error), no crash, no hang, and the
+// storage is unchanged; once S3 is back everything works.
+BOOST_AUTO_TEST_CASE(S3OutageAtStartupFailsMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        start_case(tc, server);
+        auto options{draw_options(tc)};
+        const auto proxy{make_s3_proxy()};
+        options.s3 = true;
+        options.s3_port = proxy->port();
+        pbt::note(tc, "binlog_server: " + describe(options));
+        const auto storage{make_storage(options)};
+        pbt::note(tc, "workload:");
+        auto workload{draw_workload(tc, server.info, 4U)};
+        workload.push_back(operation{.kind = op_kind::insert_rows, .count = 1});
+        apply_all(tc, server.sql, workload);
+        std::vector<std::pair<std::string, std::string>> snapshot;
+        if (tc.draw("fetch_before_outage", gs::booleans())) {
+          pbt::note(tc, "fetch");
+          fetch(tc, *storage);
+          const auto listing{list(tc, *storage)};
+          for (const auto &item : listing.at("result").as_array()) {
+            const std::string name{item.at("name").as_string()};
+            snapshot.emplace_back(name, storage->stored(name));
+          }
+        }
+        const auto operation_name{tc.draw(
+            "operation", gs::sampled_from<std::string>({"fetch", "pull", "list"}))};
+        pbt::note(tc, "S3 down; " + operation_name);
+        proxy->set_down(true);
+        background_run process{{operation_name, storage->config_path}};
+        const auto [result, in_time]{process.wait_for(s3_give_up_time)};
+        if (!in_time || result.signaled || result.exit_code == 0) {
+          pbt::note(tc, "binlog_server log:" + log_tail(*storage));
+        }
+        pbt::require(in_time, operation_name +
+                                  " did not give up although S3 is unavailable");
+        pbt::require(!result.signaled,
+                     operation_name + " crashed while S3 is unavailable (" +
+                         result.describe() + ")");
+        pbt::require(result.exit_code != 0,
+                     operation_name + " succeeded while S3 is unavailable");
+
+        pbt::note(tc, "S3 up");
+        proxy->set_down(false);
+        for (const auto &[name, content] : snapshot) {
+          pbt::require(storage->stored(name) == content,
+                       "the failed " + operation_name + " changed " + name);
+        }
+        fetch(tc, *storage);
+        require_storage_matches_server(tc, server.sql, server.info, *storage);
+      },
+      {.test_cases = 6U, .slow = true});
+}
+
+// Serving a replication client from S3 while S3 is down (and the collector
+// has nothing to write): the client's dump may fail, but pull keeps
+// running, and once S3 is back a new dump receives exactly the server's
+// events.
+BOOST_AUTO_TEST_CASE(S3OutageWhileServingKeepsPullRunningMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        start_case(tc, server);
+        auto options{draw_options(tc)};
+        const auto proxy{make_s3_proxy()};
+        options.s3 = true;
+        options.s3_port = proxy->port();
+        // nothing for the collector to write during the outage
+        options.checkpoint_size.reset();
+        options.checkpoint_interval.reset();
+        pbt::note(tc, "binlog_server: " + describe(options));
+        const auto storage{make_storage(options)};
+        pbt::note(tc, "workload:");
+        auto workload{draw_workload(tc, server.info, 4U)};
+        // the first binlog is closed and only in S3
+        workload.push_back(operation{.kind = op_kind::insert_rows, .count = 1});
+        workload.push_back(operation{.kind = op_kind::flush});
+        workload.push_back(operation{.kind = op_kind::insert_rows, .count = 1});
+        apply_all(tc, server.sql, workload);
+        fetch(tc, *storage);
+        // the oldest stored binlog (GTID auto-positioning may have skipped
+        // server binlogs without transactions); with two or more stored it
+        // is closed and only in S3
+        std::vector<std::string> stored_names;
+        const auto listing{list(tc, *storage)};
+        for (const auto &item : listing.at("result").as_array()) {
+          stored_names.emplace_back(item.at("name").as_string());
+        }
+        pbt::require(stored_names.size() >= 2U,
+                     "the workload ends with a rotation and a transaction");
+        const auto first{stored_names.front()};
+
+        pull_process pull{tc, *storage};
+        pull.wait_until_listening();
+        wait_until_pull_caught_up(tc, server.sql, pull);
+        const auto server_settings_value{settings()};
+        const auto direct{dump_binlog(
+            static_cast<std::uint16_t>(server_settings_value.port),
+            server_settings_value.user, server_settings_value.password, first, 4U,
+            true)};
+        pbt::require(direct.error.empty(),
+                     "dump from the MySQL server failed: " + direct.error);
+
+        pbt::note(tc, "S3 down; dump " + first + " from the listener");
+        proxy->set_down(true);
+        const auto during{dump_binlog(listener_port(), "replica",
+                                      "replica-password", first, 4U, true)};
+        pbt::note(tc, "dump during the outage: " +
+                          (during.error.empty() ? std::string{"no error"}
+                                                : during.error) +
+                          ", " + std::to_string(during.events.size()) + " events");
+        // the first binlog exists only in S3: the session is closed
+        pbt::require(!during.error.empty(),
+                     "a dump that needs S3 succeeded during the outage");
+        wait_ms(2000U);
+        pull.require_running();
+
+        // "the client must reconnect": the listener runs its sessions on
+        // one thread and S3 reads are synchronous, so until the SDK gives
+        // up on the outage session's read every new session waits too
+        pbt::note(tc, "S3 up; dump again (until it succeeds)");
+        proxy->set_down(false);
+        const auto recovery_start{std::chrono::steady_clock::now()};
+        auto after{dump_binlog(listener_port(), "replica", "replica-password",
+                               first, 4U, true)};
+        while (!after.error.empty() &&
+               std::chrono::steady_clock::now() - recovery_start < s3_give_up_time) {
+          pull.require_running();
+          wait_ms(1000U);
+          after = dump_binlog(listener_port(), "replica", "replica-password",
+                              first, 4U, true);
+        }
+        pbt::note(tc, "listener usable again after " +
+                          std::to_string(std::chrono::duration_cast<std::chrono::seconds>(
+                                             std::chrono::steady_clock::now() - recovery_start)
+                                             .count()) +
+                          " s");
+        pull.require_running();
+        pbt::require(after.error.empty(),
+                     "dump from the listener after the outage failed: " +
+                         after.error);
+        pbt::require_equal(after.events.size(), direct.events.size(),
+                           "number of events after the outage");
+        for (std::size_t i{0U}; i < after.events.size(); ++i) {
+          pbt::require(after.events[i] == direct.events[i],
+                       "the listener sent an event that differs from the "
+                       "server's after the outage");
+        }
+        pull.stop();
+      },
+      {.test_cases = 8U, .slow = true});
 }
