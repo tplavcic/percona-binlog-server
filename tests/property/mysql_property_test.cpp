@@ -249,11 +249,19 @@ struct server_info {
   int minor{};
   std::string version;
   fs::path binlog_dir;
+  std::string gtid_mode;  // @@GLOBAL.gtid_mode (set per case: start_case)
 
   [[nodiscard]] bool at_least(int ma, int mi) const {
     return major > ma || (major == ma && minor >= mi);
   }
-  [[nodiscard]] bool has_tagged_gtids() const { return at_least(8, 3); }
+  // tagged GTIDs: MySQL 8.3+ and GTID_MODE=ON (SET gtid_next =
+  // 'AUTOMATIC:<tag>')
+  [[nodiscard]] bool has_tagged_gtids() const {
+    return at_least(8, 3) && gtid_mode == "ON";
+  }
+  [[nodiscard]] std::string binlog_status_statement() const {
+    return at_least(8, 2) ? "SHOW BINARY LOG STATUS" : "SHOW MASTER STATUS";
+  }
   [[nodiscard]] std::string reset_statement() const {
     return at_least(8, 2) ? "RESET BINARY LOGS AND GTIDS" : "RESET MASTER";
   }
@@ -266,12 +274,13 @@ server_info inspect(sql_connection &sql) {
   char dot{};
   parts >> info.major >> dot >> info.minor;
   if (sql.scalar("SELECT @@GLOBAL.log_bin") != "1" ||
-      sql.scalar("SELECT @@GLOBAL.gtid_mode") != "ON" ||
+      sql.scalar("SELECT @@GLOBAL.enforce_gtid_consistency") != "ON" ||
       sql.scalar("SELECT @@GLOBAL.binlog_checksum") != "CRC32") {
     pbt::infrastructure_error("the MySQL server must run with log_bin, "
-                              "gtid_mode=ON and binlog_checksum=CRC32 "
-                              "(extra/qa/mysqld.sh)");
+                              "enforce_gtid_consistency=ON and "
+                              "binlog_checksum=CRC32 (extra/qa/mysqld.sh)");
   }
+  info.gtid_mode = sql.scalar("SELECT @@GLOBAL.gtid_mode");
   info.binlog_dir =
       fs::path{sql.scalar("SELECT @@GLOBAL.log_bin_basename")}.parent_path();
   std::error_code error;
@@ -282,6 +291,24 @@ server_info inspect(sql_connection &sql) {
                               "must run on this host)");
   }
   return info;
+}
+
+// @@GLOBAL.gtid_mode changes one step at a time (OFF <-> OFF_PERMISSIVE <->
+// ON_PERMISSIVE <-> ON); the session must not be replicating
+void set_gtid_mode(sql_connection &sql, server_info &info,
+                   const std::string &target) {
+  static const std::vector<std::string> steps{"OFF", "OFF_PERMISSIVE",
+                                              "ON_PERMISSIVE", "ON"};
+  const auto position{[](const std::string &mode) {
+    return std::ranges::find(steps, mode) - steps.begin();
+  }};
+  auto current{position(sql.scalar("SELECT @@GLOBAL.gtid_mode"))};
+  const auto wanted{position(target)};
+  while (current != wanted) {
+    current += current < wanted ? 1 : -1;
+    sql.exec("SET GLOBAL gtid_mode = " + steps[static_cast<std::size_t>(current)]);
+  }
+  info.gtid_mode = target;
 }
 
 // a fresh binary log: no dump threads, the test schema, binlog.000001 only
@@ -1265,12 +1292,16 @@ struct server_session {
   server_info info{inspect(sql)};
 };
 
-void start_case(hegel::TestCase &tc, server_session &server) {
+// every case sets the server's GTID mode it needs (ON unless it tests
+// another one) before the reset
+void start_case(hegel::TestCase &tc, server_session &server,
+                const std::string &gtid_mode = "ON") {
   const auto max_binlog_size{tc.draw(
       "max_binlog_size",
       gs::sampled_from<std::uint64_t>({4096U, 16384U, 1073741824U}))};
   pbt::note(tc, "server " + server.info.version + ", max_binlog_size " +
-          std::to_string(max_binlog_size));
+          std::to_string(max_binlog_size) + ", gtid_mode " + gtid_mode);
+  set_gtid_mode(server.sql, server.info, gtid_mode);
   reset_server(server.sql, server.info, max_binlog_size);
 }
 
@@ -1532,10 +1563,12 @@ void control_server(const std::string &command) {
 // verify_checksum on and off), and 'list' describes them.
 namespace {
 
-void fetch_matches_server(hegel::TestCase &tc, bool s3) {
+// gtid_off: the server runs with GTID_MODE=OFF (anonymous transactions),
+// the storage in position mode (GTID mode needs a GTID_MODE=ON server)
+void fetch_matches_server(hegel::TestCase &tc, bool s3, bool gtid_off = false) {
         server_session server;
-        start_case(tc, server);
-        auto options{draw_options(tc)};
+        start_case(tc, server, gtid_off ? "OFF" : "ON");
+        auto options{gtid_off ? draw_options(tc, false) : draw_options(tc)};
         options.s3 = s3;
         pbt::note(tc, "binlog_server: " + describe(options));
         const auto storage{make_storage(options)};
@@ -1543,6 +1576,17 @@ void fetch_matches_server(hegel::TestCase &tc, bool s3) {
         apply_all(tc, server.sql, draw_workload(tc, server.info, 12U));
         fetch(tc, *storage);
         require_storage_matches_server(tc, server.sql, server.info, *storage);
+        if (gtid_off) {
+          // the setup: only anonymous transactions
+          for (const auto &binlog : server_binlogs(server.sql)) {
+            const auto events{walk(server_file(server.info, binlog.name),
+                                   "server " + binlog.name)};
+            pbt::require(std::ranges::none_of(events.types, [](std::uint8_t type) {
+                           return type == gtid_event || type == gtid_tagged_event;
+                         }),
+                         "a GTID_MODE=OFF server wrote a GTID event");
+          }
+        }
 }
 
 } // namespace
@@ -1556,6 +1600,13 @@ BOOST_AUTO_TEST_CASE(FetchMatchesServerBinlogsMySQL) {
 BOOST_AUTO_TEST_CASE(FetchMatchesServerBinlogsOnS3MySQL) {
   pbt::check([](hegel::TestCase &tc) { fetch_matches_server(tc, true); },
              {.test_cases = 30U, .slow = true});
+}
+
+// The same with a GTID_MODE=OFF server (anonymous transactions) and a
+// position-mode storage.
+BOOST_AUTO_TEST_CASE(FetchMatchesServerBinlogsGtidOffMySQL) {
+  pbt::check([](hegel::TestCase &tc) { fetch_matches_server(tc, false, true); },
+             {.test_cases = 40U, .slow = true});
 }
 
 // The server's newest binlog may have no transaction yet (right after
@@ -1589,10 +1640,12 @@ BOOST_AUTO_TEST_CASE(FetchStoresBinlogWithoutTransactionsMySQL) {
 // rotations); after every fetch the storage matches the server.
 namespace {
 
-void repeated_fetch_resumes(hegel::TestCase &tc, bool s3) {
+// gtid_off: the server runs with GTID_MODE=OFF (anonymous transactions),
+// the storage in position mode (GTID mode needs a GTID_MODE=ON server)
+void repeated_fetch_resumes(hegel::TestCase &tc, bool s3, bool gtid_off = false) {
         server_session server;
-        start_case(tc, server);
-        auto options{draw_options(tc)};
+        start_case(tc, server, gtid_off ? "OFF" : "ON");
+        auto options{gtid_off ? draw_options(tc, false) : draw_options(tc)};
         options.s3 = s3;
         pbt::note(tc, "binlog_server: " + describe(options));
         const auto storage{make_storage(options)};
@@ -1616,6 +1669,13 @@ BOOST_AUTO_TEST_CASE(RepeatedFetchResumesMySQL) {
 // The same with the S3 storage backend (SeaweedFS).
 BOOST_AUTO_TEST_CASE(RepeatedFetchResumesOnS3MySQL) {
   pbt::check([](hegel::TestCase &tc) { repeated_fetch_resumes(tc, true); },
+             {.test_cases = 20U, .slow = true});
+}
+
+// The same with a GTID_MODE=OFF server (anonymous transactions) and a
+// position-mode storage.
+BOOST_AUTO_TEST_CASE(RepeatedFetchResumesGtidOffMySQL) {
+  pbt::check([](hegel::TestCase &tc) { repeated_fetch_resumes(tc, false, true); },
              {.test_cases = 20U, .slow = true});
 }
 
@@ -1661,10 +1721,12 @@ BOOST_AUTO_TEST_CASE(GtidResumeStoresRotateEventMySQL) {
 // duplicated transactions.
 namespace {
 
-void killed_pull_resumes(hegel::TestCase &tc, bool s3) {
+// gtid_off: the server runs with GTID_MODE=OFF (anonymous transactions),
+// the storage in position mode (GTID mode needs a GTID_MODE=ON server)
+void killed_pull_resumes(hegel::TestCase &tc, bool s3, bool gtid_off = false) {
         server_session server;
-        start_case(tc, server);
-        auto options{draw_options(tc)};
+        start_case(tc, server, gtid_off ? "OFF" : "ON");
+        auto options{gtid_off ? draw_options(tc, false) : draw_options(tc)};
         options.s3 = s3;
         pbt::note(tc, "binlog_server: " + describe(options));
         const auto storage{make_storage(options)};
@@ -1718,6 +1780,13 @@ BOOST_AUTO_TEST_CASE(KilledPullResumesMySQL) {
 BOOST_AUTO_TEST_CASE(KilledPullResumesOnS3MySQL) {
   pbt::check([](hegel::TestCase &tc) { killed_pull_resumes(tc, true); },
              {.test_cases = 20U, .slow = true});
+}
+
+// The same with a GTID_MODE=OFF server (anonymous transactions) and a
+// position-mode storage.
+BOOST_AUTO_TEST_CASE(KilledPullResumesGtidOffMySQL) {
+  pbt::check([](hegel::TestCase &tc) { killed_pull_resumes(tc, false, true); },
+             {.test_cases = 15U, .slow = true});
 }
 
 // ===========================================================================
@@ -1918,6 +1987,18 @@ void listener_serves_server_events(hegel::TestCase &tc, bool s3) {
         // the newest binlog ends with a transaction (PBT-020)
         workload.push_back(operation{.kind = op_kind::insert_rows, .count = 1});
         apply_all(tc, server.sql, workload);
+        // that last insert can itself rotate (max_binlog_size): the new
+        // binlog would be stored as the magic only (PBT-020), and the
+        // listener could not send its preamble; one more small insert
+        for (int attempt{0}; attempt < 3; ++attempt) {
+          const auto newest{server_binlogs(server.sql).back().name};
+          if (walk(server_file(server.info, newest), "server " + newest)
+                  .transactions != 0U) {
+            break;
+          }
+          apply_all(tc, server.sql,
+                    {operation{.kind = op_kind::insert_rows, .count = 1}});
+        }
         fetch(tc, *storage);
         require_storage_matches_server(tc, server.sql, server.info, *storage);
 
@@ -2086,7 +2167,7 @@ std::string field(const std::vector<std::pair<std::string, std::string>> &column
 // replica with the test schema
 class replica_session {
 public:
-  replica_session()
+  explicit replica_session(const std::string &gtid_mode = "ON")
       : sql_{[]() -> std::uint16_t {
           const auto port{pbt::detail::env("PBT_MYSQL_REPLICA_PORT")};
           if (!port) {
@@ -2099,7 +2180,8 @@ public:
         }()} {
     sql_.exec("STOP REPLICA");
     sql_.exec("RESET REPLICA ALL");
-    const server_info info{inspect(sql_)};
+    server_info info{inspect(sql_)};
+    set_gtid_mode(sql_, info, gtid_mode);
     sql_.exec(info.reset_statement());
     sql_.exec("SET SESSION sql_log_bin = 0");
     sql_.exec("DROP DATABASE IF EXISTS pbt");
@@ -2790,4 +2872,168 @@ BOOST_AUTO_TEST_CASE(S3OutageWhileServingKeepsPullRunningMySQL) {
         pull.stop();
       },
       {.test_cases = 8U, .slow = true});
+}
+
+// ===========================================================================
+// D14: GTID_MODE other than ON
+// ===========================================================================
+
+// The server changes its GTID mode between workload rounds (one step at a
+// time through OFF / OFF_PERMISSIVE / ON_PERMISSIVE / ON), so binlogs hold
+// GTID and anonymous transactions, also mixed in one binlog. A
+// position-mode storage fetched after every round stays a byte-for-byte
+// copy of the server's binlogs.
+BOOST_AUTO_TEST_CASE(GtidModeTransitionsMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        static const std::vector<std::string> modes{"OFF", "OFF_PERMISSIVE",
+                                                    "ON_PERMISSIVE", "ON"};
+        start_case(tc, server, tc.draw("initial_gtid_mode", gs::sampled_from(modes)));
+        const auto options{draw_options(tc, false)};
+        pbt::note(tc, "binlog_server: " + describe(options));
+        const auto storage{make_storage(options)};
+        const auto rounds{tc.draw(
+            "rounds", gs::integers<std::size_t>({.min_value = 2U, .max_value = 5U}))};
+        for (std::size_t round{0U}; round < rounds; ++round) {
+          const auto mode{tc.draw("gtid_mode", gs::sampled_from(modes))};
+          pbt::note(tc, "round " + std::to_string(round + 1U) + ": gtid_mode " + mode);
+          set_gtid_mode(server.sql, server.info, mode);
+          apply_all(tc, server.sql, draw_workload(tc, server.info, 4U));
+          fetch(tc, *storage);
+          require_storage_matches_server(tc, server.sql, server.info, *storage);
+        }
+      },
+      {.test_cases = 30U, .slow = true});
+}
+
+// A GTID-mode storage needs a GTID_MODE=ON server (the dump uses
+// auto-positioning, which MySQL refuses otherwise): against a server in
+// another mode fetch and pull exit with a failure exit code (no crash, no
+// endless retrying) and leave the storage as it was - also when the
+// storage was filled while the server was still ON.
+BOOST_AUTO_TEST_CASE(GtidStorageNeedsGtidOnServerMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        start_case(tc, server);
+        const auto options{draw_options(tc, true)};
+        pbt::note(tc, "binlog_server: " + describe(options));
+        const auto storage{make_storage(options)};
+        std::vector<std::pair<std::string, std::string>> snapshot;
+        if (tc.draw("fetch_while_on", gs::booleans())) {
+          pbt::note(tc, "workload and fetch while gtid_mode is ON:");
+          auto workload{draw_workload(tc, server.info, 4U)};
+          workload.push_back(operation{.kind = op_kind::insert_rows, .count = 1});
+          apply_all(tc, server.sql, workload);
+          fetch(tc, *storage);
+        }
+        const auto listing{list(tc, *storage)};
+        for (const auto &item : listing.at("result").as_array()) {
+          const std::string name{item.at("name").as_string()};
+          snapshot.emplace_back(name, storage->stored(name));
+        }
+        const auto mode{tc.draw("gtid_mode", gs::sampled_from<std::string>(
+                                                 {"ON_PERMISSIVE", "OFF_PERMISSIVE", "OFF"}))};
+        pbt::note(tc, "gtid_mode " + mode + ", workload:");
+        set_gtid_mode(server.sql, server.info, mode);
+        auto workload{draw_workload(tc, server.info, 3U)};
+        workload.push_back(operation{.kind = op_kind::insert_rows, .count = 1});
+        apply_all(tc, server.sql, workload);
+        const auto operation_name{tc.draw(
+            "operation", gs::sampled_from<std::string>({"fetch", "pull"}))};
+        pbt::note(tc, operation_name);
+        background_run process{{operation_name, storage->config_path}};
+        const auto [result, in_time]{process.wait_for(std::chrono::seconds{60})};
+        if (!in_time || result.signaled || result.exit_code == 0) {
+          pbt::note(tc, "binlog_server log:" + log_tail(*storage));
+        }
+        pbt::require(in_time, operation_name + " in GTID mode keeps running "
+                                               "against a server whose "
+                                               "gtid_mode is not ON");
+        pbt::require(!result.signaled, operation_name + " crashed (" +
+                                           result.describe() + ")");
+        pbt::require(result.exit_code != 0,
+                     operation_name + " in GTID mode succeeded against a "
+                                      "server whose gtid_mode is not ON");
+        std::size_t count{0U};
+        const auto after{list(tc, *storage)};
+        count = after.at("result").as_array().size();
+        pbt::require_equal(count, snapshot.size(), "the failed " + operation_name +
+                                                       " adds no binlog");
+        for (const auto &[name, content] : snapshot) {
+          pbt::require(storage->stored(name) == content,
+                       "the failed " + operation_name + " changed " + name);
+        }
+      },
+      {.test_cases = 15U, .slow = true});
+}
+
+// The README: real MySQL replicas (position-based) can replicate from the
+// listener, which reports GTID_MODE from the storage's mode. Source, a
+// position-mode storage and the replica all with GTID_MODE=OFF: the
+// replica (from the first binlog) catches up with the source's binlog
+// position while pull runs and the workload continues, with the same table
+// contents.
+BOOST_AUTO_TEST_CASE(ReplicaOfPositionStorageGtidOffMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        replica_session replica{"OFF"};
+        start_case(tc, server, "OFF");
+        const auto options{draw_options(tc, false)};
+        pbt::note(tc, "binlog_server: " + describe(options));
+        const auto storage{make_storage(options)};
+        pull_process pull{tc, *storage};
+        pull.wait_until_listening();
+        const auto first{server_binlogs(server.sql).front().name};
+        replica.sql().exec(
+            "CHANGE REPLICATION SOURCE TO SOURCE_HOST = '127.0.0.1', "
+            "SOURCE_PORT = " + std::to_string(listener_port()) +
+            ", SOURCE_USER = 'replica', SOURCE_PASSWORD = 'replica-password', "
+            "SOURCE_LOG_FILE = '" + first + "', SOURCE_LOG_POS = 4, "
+            "GET_SOURCE_PUBLIC_KEY = 1, SOURCE_CONNECT_RETRY = 1");
+        replica.sql().exec("START REPLICA");
+        pbt::note(tc, "workload while replicating:");
+        auto workload{draw_workload(tc, server.info, 8U)};
+        workload.push_back(operation{.kind = op_kind::insert_rows, .count = 1});
+        apply_all(tc, server.sql, workload);
+
+        const auto status_row{server.sql.first_row_named(server.info.binlog_status_statement())};
+        const auto source_file{field(status_row, "File")};
+        const auto source_position{field(status_row, "Position")};
+        pbt::note(tc, "source at " + source_file + ":" + source_position);
+        const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{30}};
+        for (;;) {
+          const auto status{replica.sql().first_row_named("SHOW REPLICA STATUS")};
+          const auto io_error{field(status, "Last_IO_Error")};
+          const auto sql_error{field(status, "Last_SQL_Error")};
+          if (!io_error.empty() || !sql_error.empty()) {
+            pbt::note(tc, "Last_IO_Error: " + io_error);
+            pbt::note(tc, "Last_SQL_Error: " + sql_error);
+            pbt::note(tc, "binlog_server log:" + log_tail(*storage));
+          }
+          pbt::require(io_error.empty(), "replica I/O thread error: " + io_error);
+          pbt::require(sql_error.empty(), "replica SQL thread error: " + sql_error);
+          if (field(status, "Relay_Source_Log_File") == source_file &&
+              field(status, "Exec_Source_Log_Pos") == source_position) {
+            break;
+          }
+          pull.require_running();
+          if (std::chrono::steady_clock::now() >= deadline) {
+            pbt::note(tc, "replica at " + field(status, "Relay_Source_Log_File") + ":" +
+                              field(status, "Exec_Source_Log_Pos"));
+          }
+          pbt::require(std::chrono::steady_clock::now() < deadline,
+                       "the replica did not catch up with the source in 30 s");
+          wait_ms(100U);
+        }
+        const auto checksum_of{[](sql_connection &sql) {
+          return sql.query("CHECKSUM TABLE pbt.t1").at(0).at(1).value_or("NULL");
+        }};
+        pbt::require_equal(checksum_of(replica.sql()), checksum_of(server.sql),
+                           "CHECKSUM TABLE pbt.t1 on the replica and the source");
+        pull.stop();
+      },
+      {.test_cases = 15U, .slow = true});
 }

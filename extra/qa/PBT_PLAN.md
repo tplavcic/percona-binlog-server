@@ -202,6 +202,7 @@ walker (magic, sizes, log_pos, CRC32, GTID order).
 | D11 | encrypted storage: every MySQL property draws `storage.encryption` in a third of its cases (KEK AES-128-ECB / AES-256-CBC / AES-256-GCM / AES-192-CTR / CAMELLIA-128-CBC; data cipher AES-128/192/256-CTR, ARIA-128-CTR, CAMELLIA-256-CTR, within the README's KEK / key-length rule); the oracle decrypts every stored binlog independently (OpenSSL EVP, the test's keyring, the envelopes in `<binlog>.json`) before comparing it with the server's file. Covers fetch, resume, killed `pull`, server restarts, purge, rewrite, S3, the listener serving an encrypted storage and the real replica | ✅ |
 | D12 | S3 outages (TCP proxy in the test between PBS and SeaweedFS, switched off / on): `S3OutageWhileCollectingStopsPullMySQL` (pull writing to S3 exits on its own with a failure exit code, no crash / hang; afterwards fetch resumes and the storage matches), `S3OutageAtStartupFailsMySQL` (fetch / pull / list fail cleanly, storage unchanged), `S3OutageWhileServingKeepsPullRunningMySQL` (a dump that needs S3 fails, pull keeps running, a new dump after the outage is exact). Expected behaviour: see "S3 outages" below | ✅ |
 | D13 | `ListenerRejectsInvalidDumpRequestsMySQL`: a dump of a binlog the storage does not have, from a position beyond the end of a binlog or inside an event gets an error packet like from MySQL (1236), not a dropped connection or an empty successful dump | ✅ (PBT-037) |
+| D14 | GTID_MODE other than ON (the server's mode is set per case at runtime, one step at a time; no extra server instance): `FetchMatchesServerBinlogsGtidOffMySQL`, `RepeatedFetchResumesGtidOffMySQL`, `KilledPullResumesGtidOffMySQL` (D1-D3 with a GTID_MODE=OFF server, anonymous transactions only, position-mode storage); `GtidModeTransitionsMySQL` (the mode changes between rounds through OFF / OFF_PERMISSIVE / ON_PERMISSIVE / ON, GTID and anonymous transactions mixed; position-mode storage stays a byte copy); `GtidStorageNeedsGtidOnServerMySQL` (a GTID-mode storage against a server not in ON: fetch / pull exit with a failure code, no crash, no endless retry, storage unchanged); `ReplicaOfPositionStorageGtidOffMySQL` (source, position-mode storage and replica all OFF: the replica reaches the source's binlog position, same CHECKSUM TABLE) | ✅ |
 | D9 | `PurgeOnServerMySQL`: `PURGE BINARY LOGS TO` before / after the storage got the binlogs; fetch succeeds exactly when the server still has what the storage needs (position: its newest binlog; GTID: gtid_purged covered; empty storage), else exits 1 leaving the storage unchanged | ✅ |
 
 GTID auto-positioning: the server starts a GTID dump at the newest binlog
@@ -212,8 +213,6 @@ those shapes, noted in the counterexample) and checked strictly by D1a /
 D2a, so they do not hide other findings.
 
 Not covered yet (later):
-- a server with gtid_mode=OFF (anonymous transactions) in position mode
-  (needs a third, differently configured instance);
 - GTID dumps (COM_BINLOG_DUMP_GTID) from the listener, once it supports
   them (PBT-034);
 
@@ -572,6 +571,26 @@ retries its dump after the outage (up to the SDK give-up time).
   invalid dump requests (unknown binlog, position beyond the end, position
   inside an event) with a dropped connection or an empty successful dump
   instead of MySQL's error 1236 (D13).
+
+### GTID_MODE other than ON (sandbox run)
+
+No new finding. Position-mode storages are byte-for-byte copies with
+anonymous transactions and across GTID mode changes; a GTID-mode storage
+against a server that is not in ON fails cleanly with the server's error
+("cannot start in AUTO_POSITION mode ...", exit code 1, storage
+unchanged); a GTID_MODE=OFF replica replicates from a position-mode
+storage. PBT-026 (`pull` killed while creating a binlog) also shows up in
+`KilledPullResumesGtidOffMySQL` (covered by the `KilledPullResumes*MySQL`
+row).
+
+Test fix from the debug asan+ubsan sandbox run:
+`ListenerServesServerEventsOnS3MySQL` failed once because the listener sent
+3 events fewer than the server. The workload's final insert had itself
+rotated the binlog (max_binlog_size 4096), so the newest binlog had no
+transaction and was stored as the 4-byte magic only (PBT-020, known). The
+listener cannot send a preamble it does not have. The listener properties
+now add small inserts until the newest server binlog has a transaction,
+which the property's comment already intended.
 
 ## 6. Open questions
 
