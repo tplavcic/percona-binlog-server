@@ -145,9 +145,14 @@ if [[ -n "${mysql_client_root}" ]]; then
   mkdir -p "${mysql_include_dir}"
   ln -sfn "${mysql_client_root}/include" "${mysql_include_dir}/mysql"
   pbt_log "MySQL client: ${mysql_library} (headers ${mysql_client_root}/include)"
+  # src/minimysql/connection_context.cpp includes <mysql/mysqld_error.h>
+  # but the binlog_server target does not link MySQL::client, so only a
+  # system-wide /usr/include/mysql works there (todo.md T9): the directory
+  # is added to every C++ compile instead
   mysql_args=(
     "-DMYSQL_INCLUDE_DIR=${mysql_include_dir}"
     "-DMYSQL_LIBRARY=${mysql_library}"
+    "-DCMAKE_CXX_STANDARD_INCLUDE_DIRECTORIES=${mysql_include_dir}"
   )
 fi
 

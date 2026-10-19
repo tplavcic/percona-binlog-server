@@ -128,3 +128,18 @@ for it. When a change lands, move the tests into `PBT_PLAN.md` as
   replication client closes only that client's session.
 - **Why:** the README says network errors towards MySQL are retried in
   `pull` mode, which a reader may assume for S3 as well.
+
+## T9 - binlog_server uses MySQL headers without linking MySQL::client
+
+- **Tests that need it:** none; it breaks the build when the MySQL client
+  is not installed system-wide (QA host: client from a Percona Server
+  tarball, `build_property_tests.sh --mysql-client-root`).
+- **Change:** add `MySQL::client` to `target_link_libraries(binlog_server
+  PRIVATE ...)` in `CMakeLists.txt` (it is linked already, through
+  `lib_easymysql`; this adds its include directory).
+- **Why:** `src/minimysql/connection_context.cpp` includes
+  `<mysql/mysqld_error.h>`, but `binlog_server` gets the MySQL include
+  directory from nowhere (`lib_easymysql` links `MySQL::client` PRIVATE),
+  so the file only compiles when the headers are in `/usr/include`.
+  `build_property_tests.sh` works around it with
+  `CMAKE_CXX_STANDARD_INCLUDE_DIRECTORIES`.
