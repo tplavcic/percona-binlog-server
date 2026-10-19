@@ -27,7 +27,8 @@
 #   --preset P       CMake preset (default: $BUILD_PRESET or release_gcc14)
 #   --mysql-client-root DIR
 #                    build against the MySQL client of a binary tarball
-#                    (DIR/include/mysql.h, DIR/lib/libmysqlclient.so)
+#                    (DIR/include/mysql.h, DIR/lib/libmysqlclient.so or
+#                    libperconaserverclient.so)
 #                    instead of the system libmysqlclient-dev (default:
 #                    $MYSQL_CLIENT_ROOT; without it and without
 #                    /usr/include/mysql/mysql.h: $MYSQLD_BASEDIR, then
@@ -127,15 +128,18 @@ if [[ -n "${mysql_client_root}" ]]; then
   [[ -f "${mysql_client_root}/include/mysql.h" ]] \
     || pbt_die "${mysql_client_root}/include/mysql.h not found (MYSQL_CLIENT_ROOT)"
   mysql_library=""
+  # Percona Server tarballs name it libperconaserverclient
   for candidate in "${mysql_client_root}/lib/libmysqlclient.so" \
-                   "${mysql_client_root}/lib/libmysqlclient.a"; do
+                   "${mysql_client_root}/lib/libperconaserverclient.so" \
+                   "${mysql_client_root}/lib/libmysqlclient.a" \
+                   "${mysql_client_root}/lib/libperconaserverclient.a"; do
     if [[ -e "${candidate}" ]]; then
       mysql_library="${candidate}"
       break
     fi
   done
   [[ -n "${mysql_library}" ]] \
-    || pbt_die "no libmysqlclient.so / .a in ${mysql_client_root}/lib (MYSQL_CLIENT_ROOT)"
+    || pbt_die "no libmysqlclient / libperconaserverclient (.so / .a) in ${mysql_client_root}/lib (MYSQL_CLIENT_ROOT)"
   mysql_include_dir="${WORKDIR}/mysql-client-include"
   pbt_require_in_workdir "${mysql_include_dir}"
   mkdir -p "${mysql_include_dir}"

@@ -88,7 +88,8 @@ PBT_REPO_DIR="$(cd "${PBT_QA_DIR}/../.." && pwd)"
 
 # MySQL client library (headers + libmysqlclient) build_property_tests.sh
 # builds against: a MySQL / Percona Server binary tarball directory
-# (include/mysql.h, lib/libmysqlclient.so) instead of the system
+# (include/mysql.h, lib/libmysqlclient.so or libperconaserverclient.so)
+# instead of the system
 # libmysqlclient-dev. Empty = the system one if /usr/include/mysql/mysql.h
 # exists, else MYSQLD_BASEDIR, else $WORKDIR/mysql.
 : "${MYSQL_CLIENT_ROOT:=}"
