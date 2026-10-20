@@ -203,6 +203,8 @@ walker (magic, sizes, log_pos, CRC32, GTID order).
 | D12 | S3 outages (TCP proxy in the test between PBS and SeaweedFS, switched off / on): `S3OutageWhileCollectingStopsPullMySQL` (pull writing to S3 exits on its own with a failure exit code, no crash / hang; afterwards fetch resumes and the storage matches), `S3OutageAtStartupFailsMySQL` (fetch / pull / list fail cleanly, storage unchanged), `S3OutageWhileServingKeepsPullRunningMySQL` (a dump that needs S3 fails, pull keeps running, a new dump after the outage is exact). Expected behaviour: see "S3 outages" below | ✅ |
 | D13 | `ListenerRejectsInvalidDumpRequestsMySQL`: a dump of a binlog the storage does not have, from a position beyond the end of a binlog or inside an event gets an error packet like from MySQL (1236), not a dropped connection or an empty successful dump | ✅ (PBT-037) |
 | D14 | GTID_MODE other than ON (the server's mode is set per case at runtime, one step at a time; no extra server instance): `FetchMatchesServerBinlogsGtidOffMySQL`, `RepeatedFetchResumesGtidOffMySQL`, `KilledPullResumesGtidOffMySQL` (D1-D3 with a GTID_MODE=OFF server, anonymous transactions only, position-mode storage); `GtidModeTransitionsMySQL` (the mode changes between rounds through OFF / OFF_PERMISSIVE / ON_PERMISSIVE / ON, GTID and anonymous transactions mixed; position-mode storage stays a byte copy); `GtidStorageNeedsGtidOnServerMySQL` (a GTID-mode storage against a server not in ON: fetch / pull exit with a failure code, no crash, no endless retry, storage unchanged); `ReplicaOfPositionStorageGtidOffMySQL` (source, position-mode storage and replica all OFF: the replica reaches the source's binlog position, same CHECKSUM TABLE) | ✅ |
+| D15 | more kinds of binlog content (the varied workload: per operation `binlog_checksum` NONE / CRC32, `binlog_row_metadata` FULL, STATEMENT / MIXED format with INTVAR / RAND / USER_VAR, `binlog_row_image` MINIMAL / NOBLOB, ROWS_QUERY, XA PREPARE / COMMIT / ROLLBACK / ONE PHASE, PARTIAL_JSON updates, a MyISAM table, LOAD DATA in statement format, 80-400 KB transactions, compressed or not): `VariedEventsFetchMatchesServerMySQL`, `VariedEventsFetchMatchesServerGtidOffMySQL`, `RepeatedFetchResumesVariedEventsMySQL`, `KilledPullResumesVariedEventsMySQL`, `ListenerServesVariedEventsMySQL`, `RewriteModeKeepsVariedTransactionsMySQL` (CRC32 only, README), `ReplicaOfListenerVariedEventsMySQL` (CHECKSUM TABLE of every test table); the oracle's binlog reader follows the checksum algorithm of each FORMAT_DESCRIPTION | ✅ |
+| D16 | network faults between PBS and MySQL (TCP proxy in the test: open connections closed, a connection cut after 0 / 1 / 4 / 19 / ... / 50000 bytes from the server, no delivery for 0.3-4 s, connections refused, the server killing its dump thread): `NetworkFaultsDuringPullMySQL` (README: pull never exits on network errors, reconnects; afterwards the storage matches the server, also after a fetch), `NetworkFaultDuringFetchMySQL` (fetch terminates within 60 s without crashing; an exit code 0 means a complete copy; a fetch over a healthy network afterwards completes the storage) | ✅ |
 | D9 | `PurgeOnServerMySQL`: `PURGE BINARY LOGS TO` before / after the storage got the binlogs; fetch succeeds exactly when the server still has what the storage needs (position: its newest binlog; GTID: gtid_purged covered; empty storage), else exits 1 leaving the storage unchanged | ✅ |
 
 GTID auto-positioning: the server starts a GTID dump at the newest binlog
@@ -591,6 +593,22 @@ transaction and was stored as the 4-byte magic only (PBT-020, known). The
 listener cannot send a preamble it does not have. The listener properties
 now add small inserts until the newest server binlog has a transaction,
 which the property's comment already intended.
+
+### Event variety and network faults (sandbox run)
+
+No new finding. Binlogs with `binlog_checksum=NONE` (also switched back and
+forth), statement / mixed format events, XA, PARTIAL_UPDATE_ROWS, MyISAM
+transactions, LOAD DATA and large compressed transactions are stored byte
+for byte, served by the listener, applied by a replica of the listener and
+rewritten in rewrite mode. `fetch` exits with code 1 on every fault that
+hits it, `pull` reconnects after each one.
+
+One difference that is not a bug, tolerated by the listener properties: in
+a `binlog_checksum=NONE` binlog, the CRC32 field of the artificial
+FORMAT_DESCRIPTION at the start of a dump (log_pos 0) is sent unchanged by
+MySQL, so it no longer matches the event, while PBS recomputes it. Nobody
+verifies that field, because the event itself says the binlog has no
+checksums.
 
 ## 6. Open questions
 
