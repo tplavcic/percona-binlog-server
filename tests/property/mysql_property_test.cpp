@@ -273,12 +273,13 @@ server_info inspect(sql_connection &sql) {
   std::istringstream parts{info.version};
   char dot{};
   parts >> info.major >> dot >> info.minor;
+  // binlog_checksum / binlog_row_metadata: reset_server() sets them per
+  // case (the varied workload changes them)
   if (sql.scalar("SELECT @@GLOBAL.log_bin") != "1" ||
-      sql.scalar("SELECT @@GLOBAL.enforce_gtid_consistency") != "ON" ||
-      sql.scalar("SELECT @@GLOBAL.binlog_checksum") != "CRC32") {
-    pbt::infrastructure_error("the MySQL server must run with log_bin, "
-                              "enforce_gtid_consistency=ON and "
-                              "binlog_checksum=CRC32 (extra/qa/mysqld.sh)");
+      sql.scalar("SELECT @@GLOBAL.enforce_gtid_consistency") != "ON") {
+    pbt::infrastructure_error("the MySQL server must run with log_bin and "
+                              "enforce_gtid_consistency=ON "
+                              "(extra/qa/mysqld.sh)");
   }
   info.gtid_mode = sql.scalar("SELECT @@GLOBAL.gtid_mode");
   info.binlog_dir =
@@ -311,9 +312,9 @@ void set_gtid_mode(sql_connection &sql, server_info &info,
   info.gtid_mode = target;
 }
 
-// a fresh binary log: no dump threads, the test schema, binlog.000001 only
-void reset_server(sql_connection &sql, const server_info &info,
-                  std::uint64_t max_binlog_size) {
+// ends every binlog dump thread of the server (the clients see a
+// connection killed by the server)
+void kill_dump_threads(sql_connection &sql) {
   for (const auto &dump : sql.query(
            "SELECT id FROM information_schema.processlist "
            "WHERE command LIKE 'Binlog Dump%'")) {
@@ -323,6 +324,14 @@ void reset_server(sql_connection &sql, const server_info &info,
       // already gone
     }
   }
+}
+
+// a fresh binary log: no dump threads, the test schema, binlog.000001 only
+void reset_server(sql_connection &sql, const server_info &info,
+                  std::uint64_t max_binlog_size) {
+  kill_dump_threads(sql);
+  sql.exec("SET GLOBAL binlog_checksum = 'CRC32'");
+  sql.exec("SET GLOBAL binlog_row_metadata = 'MINIMAL'");
   sql.exec("DROP DATABASE IF EXISTS pbt");
   sql.exec("CREATE DATABASE pbt");
   sql.exec("CREATE TABLE pbt.t1 (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, "
@@ -344,7 +353,30 @@ enum class op_kind : std::uint8_t {
   compressed,
   tagged,
   update_rows,
-  delete_rows
+  delete_rows,
+  // the varied workload (workload_set::varied): other event types and
+  // server settings
+  checksum_switch,   // SET GLOBAL binlog_checksum (rotates the binlog)
+  row_metadata,      // SET GLOBAL binlog_row_metadata (TABLE_MAP contents)
+  statement_format,  // binlog_format=STATEMENT: QUERY, INTVAR, RAND, USER_VAR
+  mixed_format,      // binlog_format=MIXED: an unsafe and a safe statement
+  row_image,         // binlog_row_image=MINIMAL / NOBLOB updates and deletes
+  rows_query,        // binlog_rows_query_log_events=ON: ROWS_QUERY
+  xa,                // XA PREPARE + XA COMMIT / ROLLBACK, XA COMMIT ONE PHASE
+  partial_json,      // binlog_row_value_options=PARTIAL_JSON: PARTIAL_UPDATE_ROWS
+  myisam,            // a non-transactional table (ends with QUERY COMMIT)
+  load_data,         // LOAD DATA in statement format: BEGIN / EXECUTE_LOAD_QUERY
+  big_transaction    // a transaction of 80-400 KB (binlog cache spills to disk)
+};
+
+// which operations a workload is drawn from
+enum class workload_set : std::uint8_t {
+  basic,
+  // also the operations after delete_rows
+  varied,
+  // the same without checksum_switch: rewrite mode needs CRC32 checksums
+  // (README "replication.rewrite")
+  varied_crc32
 };
 
 struct operation {
@@ -376,19 +408,67 @@ std::string describe(const operation &op) {
     return "update rows with id % 3 = " + std::to_string(op.count);
   case op_kind::delete_rows:
     return "delete " + std::to_string(op.count) + " row(s)";
+  case op_kind::checksum_switch:
+    return op.count == 0 ? "SET GLOBAL binlog_checksum = NONE"
+                         : "SET GLOBAL binlog_checksum = CRC32";
+  case op_kind::row_metadata:
+    return op.count == 0 ? "SET GLOBAL binlog_row_metadata = MINIMAL"
+                         : "SET GLOBAL binlog_row_metadata = FULL";
+  case op_kind::statement_format: {
+    static const std::array<std::string_view, 5> variants{
+        "plain INSERT", "INSERT with a user variable", "INSERT with RAND()",
+        "INSERT with LAST_INSERT_ID()", "unsafe UPDATE ... LIMIT"};
+    return "binlog_format=STATEMENT: " +
+           std::string{variants.at(static_cast<std::size_t>(op.count))};
+  }
+  case op_kind::mixed_format:
+    return "binlog_format=MIXED: INSERT with UUID(), then a plain INSERT";
+  case op_kind::row_image:
+    return std::string{"binlog_row_image="} + (op.count == 0 ? "MINIMAL" : "NOBLOB") +
+           ": UPDATE and DELETE";
+  case op_kind::rows_query:
+    return "binlog_rows_query_log_events=ON: INSERT";
+  case op_kind::xa: {
+    static const std::array<std::string_view, 3> variants{
+        "XA PREPARE + XA COMMIT", "XA PREPARE + XA ROLLBACK",
+        "XA COMMIT ONE PHASE"};
+    return std::string{variants.at(static_cast<std::size_t>(op.count))};
+  }
+  case op_kind::partial_json:
+    return "JSON_SET update with binlog_row_value_options=PARTIAL_JSON";
+  case op_kind::myisam:
+    return std::string{"MyISAM table: "} +
+           (op.count == 0 ? "INSERT (row format)" : "INSERT (statement format)");
+  case op_kind::load_data:
+    return "LOAD DATA INFILE of " + std::to_string(op.count) +
+           " row(s) (statement format)";
+  case op_kind::big_transaction:
+    return std::string{"transaction of "} + std::to_string(op.count) +
+           " x 2000 byte rows" + (op.size != 0U ? " (compressed)" : "");
   }
   return "?";
 }
 
 std::vector<operation> draw_workload(hegel::TestCase &tc,
                                      const server_info &info,
-                                     std::size_t max_operations) {
+                                     std::size_t max_operations,
+                                     workload_set set = workload_set::basic) {
   std::vector<op_kind> kinds{
       op_kind::insert_rows, op_kind::transaction, op_kind::rollback,
       op_kind::large_row,   op_kind::ddl,         op_kind::flush,
       op_kind::compressed,  op_kind::update_rows, op_kind::delete_rows};
   if (info.has_tagged_gtids()) {
     kinds.push_back(op_kind::tagged);
+  }
+  if (set != workload_set::basic) {
+    kinds.insert(kinds.end(),
+                 {op_kind::row_metadata, op_kind::statement_format,
+                  op_kind::mixed_format, op_kind::row_image, op_kind::rows_query,
+                  op_kind::xa, op_kind::partial_json, op_kind::myisam,
+                  op_kind::load_data, op_kind::big_transaction});
+    if (set == workload_set::varied) {
+      kinds.push_back(op_kind::checksum_switch);
+    }
   }
   const auto count{tc.draw(
       "operations", gs::integers<std::size_t>({.max_value = max_operations}))};
@@ -423,6 +503,29 @@ std::vector<operation> draw_workload(hegel::TestCase &tc,
       // MySQL lower-cases tags (PBT-004 is about PBS's own parser)
       op.tag = tc.draw("tag", gs::sampled_from<std::string>(
                                   {"alpha", "b_2", "Upper", "t"}));
+      break;
+    case op_kind::checksum_switch:
+    case op_kind::row_metadata:
+    case op_kind::row_image:
+    case op_kind::myisam:
+      op.count = tc.draw("variant", gs::integers<int>({.min_value = 0,
+                                                       .max_value = 1}));
+      break;
+    case op_kind::statement_format:
+      op.count = tc.draw("variant", gs::integers<int>({.min_value = 0,
+                                                       .max_value = 4}));
+      break;
+    case op_kind::xa:
+      op.count = tc.draw("variant", gs::integers<int>({.min_value = 0,
+                                                       .max_value = 2}));
+      break;
+    case op_kind::load_data:
+      op.count = tc.draw("rows", gs::integers<int>({.min_value = 1,
+                                                    .max_value = 20}));
+      break;
+    case op_kind::big_transaction:
+      op.count = tc.draw("rows", gs::sampled_from<int>({40, 200}));
+      op.size = tc.draw("compressed", gs::booleans()) ? 1U : 0U;
       break;
     default:
       break;
@@ -501,6 +604,126 @@ void apply(sql_connection &sql, const operation &op) {
     sql.exec("DELETE FROM pbt.t1 ORDER BY id DESC LIMIT " +
              std::to_string(op.count));
     break;
+  case op_kind::checksum_switch:
+    sql.exec(op.count == 0 ? "SET GLOBAL binlog_checksum = 'NONE'"
+                           : "SET GLOBAL binlog_checksum = 'CRC32'");
+    break;
+  case op_kind::row_metadata:
+    sql.exec(op.count == 0 ? "SET GLOBAL binlog_row_metadata = 'MINIMAL'"
+                           : "SET GLOBAL binlog_row_metadata = 'FULL'");
+    break;
+  case op_kind::statement_format:
+    sql.exec("SET SESSION binlog_format = 'STATEMENT'");
+    switch (op.count) {
+    case 0:
+      sql.exec("INSERT INTO pbt.t1 (v, b) VALUES (1, 'statement')");
+      break;
+    case 1:
+      sql.exec("SET @pbt_value = 42");
+      sql.exec("INSERT INTO pbt.t1 (v, b) VALUES (@pbt_value, 'user variable')");
+      break;
+    case 2:
+      sql.exec("INSERT INTO pbt.t1 (v, b) VALUES (FLOOR(RAND() * 1000), 'rand')");
+      break;
+    case 3:
+      sql.exec("INSERT INTO pbt.t1 (v, b) VALUES (LAST_INSERT_ID(), 'intvar')");
+      break;
+    default:
+      // unsafe for statement format: logged as a statement with a warning
+      sql.exec("UPDATE pbt.t1 SET v = v + 1 LIMIT 1");
+      break;
+    }
+    sql.exec("SET SESSION binlog_format = 'ROW'");
+    break;
+  case op_kind::mixed_format:
+    sql.exec("SET SESSION binlog_format = 'MIXED'");
+    sql.exec("INSERT INTO pbt.t1 (v, b) VALUES (3, UUID())");
+    sql.exec("INSERT INTO pbt.t1 (v, b) VALUES (4, 'mixed')");
+    sql.exec("SET SESSION binlog_format = 'ROW'");
+    break;
+  case op_kind::row_image:
+    sql.exec(op.count == 0 ? "SET SESSION binlog_row_image = 'MINIMAL'"
+                           : "SET SESSION binlog_row_image = 'NOBLOB'");
+    sql.exec("UPDATE pbt.t1 SET v = v + 3 WHERE id % 2 = 0");
+    sql.exec("DELETE FROM pbt.t1 ORDER BY id LIMIT 1");
+    sql.exec("SET SESSION binlog_row_image = 'FULL'");
+    break;
+  case op_kind::rows_query:
+    sql.exec("SET SESSION binlog_rows_query_log_events = ON");
+    sql.exec(insert_values(2));
+    sql.exec("SET SESSION binlog_rows_query_log_events = OFF");
+    break;
+  case op_kind::xa: {
+    static unsigned xid_counter{0U};
+    const auto xid{"'pbt-" + std::to_string(::getpid()) + "-" +
+                   std::to_string(++xid_counter) + "'"};
+    sql.exec("XA START " + xid);
+    sql.exec(insert_values(1));
+    sql.exec("XA END " + xid);
+    if (op.count == 2) {
+      sql.exec("XA COMMIT " + xid + " ONE PHASE");
+    } else {
+      sql.exec("XA PREPARE " + xid);
+      sql.exec((op.count == 0 ? "XA COMMIT " : "XA ROLLBACK ") + xid);
+    }
+    break;
+  }
+  case op_kind::partial_json:
+    sql.exec("CREATE TABLE IF NOT EXISTS pbt.tj (id INT NOT NULL "
+             "AUTO_INCREMENT PRIMARY KEY, j JSON NOT NULL) ENGINE=InnoDB");
+    sql.exec("INSERT INTO pbt.tj (j) VALUES "
+             "('{\"a\": 1, \"s\": \"abcdefghijklmnopqrstuvwxyz\"}')");
+    sql.exec("SET SESSION binlog_row_image = 'MINIMAL'");
+    sql.exec("SET SESSION binlog_row_value_options = 'PARTIAL_JSON'");
+    sql.exec("UPDATE pbt.tj SET j = JSON_SET(j, '$.a', id + 1), "
+             "j = JSON_REPLACE(j, '$.s', 'xy')");
+    sql.exec("SET SESSION binlog_row_value_options = ''");
+    sql.exec("SET SESSION binlog_row_image = 'FULL'");
+    break;
+  case op_kind::myisam:
+    sql.exec("CREATE TABLE IF NOT EXISTS pbt.tm (id INT NOT NULL "
+             "AUTO_INCREMENT PRIMARY KEY, v INT NOT NULL) ENGINE=MyISAM");
+    if (op.count == 1) {
+      sql.exec("SET SESSION binlog_format = 'STATEMENT'");
+    }
+    sql.exec("INSERT INTO pbt.tm (v) VALUES (1), (2)");
+    sql.exec("SET SESSION binlog_format = 'ROW'");
+    break;
+  case op_kind::load_data: {
+    // read by the server: it runs on this host (secure_file_priv empty,
+    // extra/qa/mysqld.sh)
+    const auto path{fs::temp_directory_path() /
+                    ("pbs-pbt-load-" + std::to_string(::getpid()) + ".tsv")};
+    {
+      std::ofstream file{path};
+      for (int i{0}; i < op.count; ++i) {
+        file << i << "\tload-" << i << "\n";
+      }
+    }
+    fs::permissions(path, fs::perms::owner_read | fs::perms::owner_write |
+                              fs::perms::group_read | fs::perms::others_read);
+    sql.exec("SET SESSION binlog_format = 'STATEMENT'");
+    sql.exec("LOAD DATA INFILE '" + path.string() +
+             "' INTO TABLE pbt.t1 (v, b)");
+    sql.exec("SET SESSION binlog_format = 'ROW'");
+    break;
+  }
+  case op_kind::big_transaction:
+    if (op.size != 0U) {
+      sql.exec("SET SESSION binlog_transaction_compression = ON");
+    }
+    sql.exec("BEGIN");
+    for (int i{0}; i < op.count; i += 20) {
+      std::string statement{"INSERT INTO pbt.t1 (v, b) VALUES "};
+      for (int j{0}; j < 20 && i + j < op.count; ++j) {
+        statement += (j == 0 ? "(" : ", (") + std::to_string(i + j) +
+                     ", REPEAT('B', 2000))";
+      }
+      sql.exec(statement);
+    }
+    sql.exec("COMMIT");
+    sql.exec("SET SESSION binlog_transaction_compression = OFF");
+    break;
   }
 }
 
@@ -525,6 +748,9 @@ struct pbs_options {
   // S3 endpoint port PBS connects to instead of PBT_S3_ENDPOINT's (the
   // outage proxy); the oracle still reads through the filer
   std::optional<std::uint16_t> s3_port;
+  // MySQL port PBS connects to instead of PBT_MYSQL_PORT (the network fault
+  // proxy); the oracle still talks to the server directly
+  std::optional<std::uint16_t> mysql_port;
   // storage.encryption: KEK (keyring) and data cipher
   struct encryption_options {
     std::string kek_cipher;
@@ -548,6 +774,9 @@ std::string describe(const pbs_options &options) {
   }
   if (options.s3) {
     result += ", S3 storage";
+  }
+  if (options.mysql_port) {
+    result += ", MySQL through the fault proxy";
   }
   if (options.encryption) {
     result += ", encrypted (KEK " + options.encryption->kek_cipher + ", data " +
@@ -690,7 +919,9 @@ std::unique_ptr<pbs_storage> make_storage(const pbs_options &options) {
   config["logger"] = json::object{{"level", "info"},
                                   {"file", result->log().string()}};
   config["connection"] = json::object{{"host", server.host},
-                                      {"port", server.port},
+                                      {"port", options.mysql_port
+                                                   ? unsigned{*options.mysql_port}
+                                                   : server.port},
                                       {"user", server.user},
                                       {"password", server.password},
                                       {"connect_timeout", 10},
@@ -1028,17 +1259,22 @@ struct walked_file {
   std::vector<std::size_t> offsets;  // start of every event
   std::uint32_t min_timestamp{};     // over every event (0: no event)
   std::uint32_t max_timestamp{};
+  bool checksummed{true};            // the FORMAT_DESCRIPTION's algorithm
 };
 
 // Walks the events of a binlog file with an independent reader: magic,
-// event sizes, log_pos (= end of the event) and CRC32 footers. Violations
-// are reported with 'what'.
+// event sizes, log_pos (= end of the event) and CRC32 footers. The
+// FORMAT_DESCRIPTION names the checksum algorithm of the events after it
+// (the byte before its own CRC32, which it always has): binlog_checksum =
+// NONE binlogs have no footer on any other event. Violations are reported
+// with 'what'.
 walked_file walk(const std::string &data, const std::string &what) {
   pbt::require(data.size() >= 4U && data.compare(0U, 4U, "\xFE" "bin") == 0,
                what + ": binlog magic");
   walked_file result;
   std::size_t offset{4U};
   constexpr std::size_t header_size{19U};
+  bool checksummed{true};  // until a FORMAT_DESCRIPTION says otherwise
   while (offset < data.size()) {
     pbt::require(data.size() - offset >= header_size,
                  what + ": truncated event header at offset " +
@@ -1046,19 +1282,31 @@ walked_file walk(const std::string &data, const std::string &what) {
     const auto type{static_cast<std::uint8_t>(data[offset + 4U])};
     const auto size{le32(data, offset + 9U)};
     const auto log_pos{le32(data, offset + 13U)};
-    pbt::require(size >= header_size + 4U && size <= data.size() - offset,
+    const bool has_footer{checksummed || type == format_description_event};
+    pbt::require(size >= header_size + (has_footer ? 5U : 0U) &&
+                     size <= data.size() - offset,
                  what + ": event size " + std::to_string(size) +
                      " at offset " + std::to_string(offset));
     pbt::require_equal(static_cast<std::size_t>(log_pos), offset + size,
                        what + ": log_pos of the event at offset " +
                            std::to_string(offset));
-    const auto *bytes{reinterpret_cast<const Bytef *>(data.data() + offset)};
-    const auto crc{static_cast<std::uint32_t>(
-        ::crc32(0UL, bytes, size - 4U))};
-    pbt::require_equal(crc, le32(data, offset + size - 4U),
-                       what + ": CRC32 of the event at offset " +
-                           std::to_string(offset) + " (type " +
-                           std::to_string(type) + ")");
+    if (has_footer) {
+      const auto *bytes{reinterpret_cast<const Bytef *>(data.data() + offset)};
+      const auto crc{static_cast<std::uint32_t>(
+          ::crc32(0UL, bytes, size - 4U))};
+      pbt::require_equal(crc, le32(data, offset + size - 4U),
+                         what + ": CRC32 of the event at offset " +
+                             std::to_string(offset) + " (type " +
+                             std::to_string(type) + ")");
+    }
+    if (type == format_description_event) {
+      const auto algorithm{static_cast<unsigned char>(data[offset + size - 5U])};
+      pbt::require(algorithm <= 1U, what + ": checksum algorithm " +
+                                        std::to_string(algorithm) +
+                                        " in the FORMAT_DESCRIPTION");
+      checksummed = algorithm == 1U;
+      result.checksummed = checksummed;
+    }
     result.types.push_back(type);
     result.offsets.push_back(offset);
     const auto timestamp{le32(data, offset)};
@@ -1095,9 +1343,21 @@ std::string first_difference(const std::string &expected,
   while (position < common && expected[position] == actual[position]) {
     ++position;
   }
+  // up to 8 bytes from there, in hex
+  const auto hex_at{[position](const std::string &data) {
+    static constexpr std::string_view digits{"0123456789abcdef"};
+    std::string text;
+    for (std::size_t i{position}; i < data.size() && i < position + 8U; ++i) {
+      const auto byte{static_cast<unsigned char>(data[i])};
+      text += digits[byte >> 4U];
+      text += digits[byte & 0x0FU];
+    }
+    return text.empty() ? std::string{"-"} : text;
+  }};
   return "first difference at offset " + std::to_string(position) +
          " (server " + std::to_string(expected.size()) + " bytes, stored " +
-         std::to_string(actual.size()) + " bytes)";
+         std::to_string(actual.size()) + " bytes; server " + hex_at(expected) +
+         ", stored " + hex_at(actual) + ")";
 }
 
 // ===========================================================================
@@ -1519,6 +1779,24 @@ dump_result dump_binlog(std::uint16_t port, const std::string &user,
   return result;
 }
 
+// the same event, except for one field that is not verified by anybody:
+// in a binlog_checksum = NONE binlog the CRC32 of a FORMAT_DESCRIPTION
+// that the dump modifies (the artificial one at the start, log_pos 0) is
+// sent unchanged by MySQL (so it no longer matches the event) and
+// recomputed by PBS. Readers check a FORMAT_DESCRIPTION against the
+// algorithm it names itself (none).
+bool same_event(const std::string &server, const std::string &listener) {
+  if (server == listener) {
+    return true;
+  }
+  constexpr std::size_t header_size{19U};
+  return server.size() == listener.size() && server.size() > header_size + 5U &&
+         static_cast<std::uint8_t>(server[4]) == format_description_event &&
+         static_cast<unsigned char>(server[server.size() - 5U]) == 0U &&
+         server.compare(0U, server.size() - 4U, listener, 0U,
+                        listener.size() - 4U) == 0;
+}
+
 std::string describe_event(const std::string &event) {
   if (event.size() < 19U) {
     return "(" + std::to_string(event.size()) + " bytes)";
@@ -1565,7 +1843,8 @@ namespace {
 
 // gtid_off: the server runs with GTID_MODE=OFF (anonymous transactions),
 // the storage in position mode (GTID mode needs a GTID_MODE=ON server)
-void fetch_matches_server(hegel::TestCase &tc, bool s3, bool gtid_off = false) {
+void fetch_matches_server(hegel::TestCase &tc, bool s3, bool gtid_off = false,
+                          workload_set set = workload_set::basic) {
         server_session server;
         start_case(tc, server, gtid_off ? "OFF" : "ON");
         auto options{gtid_off ? draw_options(tc, false) : draw_options(tc)};
@@ -1573,7 +1852,7 @@ void fetch_matches_server(hegel::TestCase &tc, bool s3, bool gtid_off = false) {
         pbt::note(tc, "binlog_server: " + describe(options));
         const auto storage{make_storage(options)};
         pbt::note(tc, "workload:");
-        apply_all(tc, server.sql, draw_workload(tc, server.info, 12U));
+        apply_all(tc, server.sql, draw_workload(tc, server.info, 12U, set));
         fetch(tc, *storage);
         require_storage_matches_server(tc, server.sql, server.info, *storage);
         if (gtid_off) {
@@ -1642,7 +1921,8 @@ namespace {
 
 // gtid_off: the server runs with GTID_MODE=OFF (anonymous transactions),
 // the storage in position mode (GTID mode needs a GTID_MODE=ON server)
-void repeated_fetch_resumes(hegel::TestCase &tc, bool s3, bool gtid_off = false) {
+void repeated_fetch_resumes(hegel::TestCase &tc, bool s3, bool gtid_off = false,
+                            workload_set set = workload_set::basic) {
         server_session server;
         start_case(tc, server, gtid_off ? "OFF" : "ON");
         auto options{gtid_off ? draw_options(tc, false) : draw_options(tc)};
@@ -1653,7 +1933,7 @@ void repeated_fetch_resumes(hegel::TestCase &tc, bool s3, bool gtid_off = false)
             "rounds", gs::integers<std::size_t>({.min_value = 2U, .max_value = 4U}))};
         for (std::size_t round{0U}; round < rounds; ++round) {
           pbt::note(tc, "round " + std::to_string(round + 1U) + ":");
-          apply_all(tc, server.sql, draw_workload(tc, server.info, 5U));
+          apply_all(tc, server.sql, draw_workload(tc, server.info, 5U, set));
           fetch(tc, *storage);
           require_storage_matches_server(tc, server.sql, server.info, *storage);
         }
@@ -1723,7 +2003,8 @@ namespace {
 
 // gtid_off: the server runs with GTID_MODE=OFF (anonymous transactions),
 // the storage in position mode (GTID mode needs a GTID_MODE=ON server)
-void killed_pull_resumes(hegel::TestCase &tc, bool s3, bool gtid_off = false) {
+void killed_pull_resumes(hegel::TestCase &tc, bool s3, bool gtid_off = false,
+                         workload_set set = workload_set::basic) {
         server_session server;
         start_case(tc, server, gtid_off ? "OFF" : "ON");
         auto options{gtid_off ? draw_options(tc, false) : draw_options(tc)};
@@ -1739,7 +2020,7 @@ void killed_pull_resumes(hegel::TestCase &tc, bool s3, bool gtid_off = false) {
                             {"workload", "workload", "sleep", "kill", "stop"}))};
           if (action == "workload") {
             pbt::note(tc, "workload:");
-            apply_all(tc, server.sql, draw_workload(tc, server.info, 3U));
+            apply_all(tc, server.sql, draw_workload(tc, server.info, 3U, set));
           } else if (action == "sleep") {
             const auto delay{tc.draw("sleep_ms", gs::sampled_from<std::uint64_t>(
                                                      {10U, 100U, 400U, 1500U}))};
@@ -1861,7 +2142,8 @@ BOOST_AUTO_TEST_CASE(SearchByGtidSetMatchesServerMySQL) {
 // order; 'list' reports their GTIDs.
 namespace {
 
-void check_rewrite_mode(hegel::TestCase &tc, bool verify_checksum) {
+void check_rewrite_mode(hegel::TestCase &tc, bool verify_checksum,
+                        workload_set set = workload_set::basic) {
         server_session server;
         start_case(tc, server);
         auto options{draw_options(tc, true)};
@@ -1874,7 +2156,7 @@ void check_rewrite_mode(hegel::TestCase &tc, bool verify_checksum) {
             "rounds", gs::integers<std::size_t>({.min_value = 1U, .max_value = 3U}))};
         for (std::size_t round{0U}; round < rounds; ++round) {
           pbt::note(tc, "round " + std::to_string(round + 1U) + ":");
-          apply_all(tc, server.sql, draw_workload(tc, server.info, 8U));
+          apply_all(tc, server.sql, draw_workload(tc, server.info, 8U, set));
           fetch(tc, *storage);
         }
 
@@ -1975,7 +2257,8 @@ BOOST_AUTO_TEST_CASE(RewriteModeWithoutChecksumVerificationMySQL) {
 // FORMAT_DESCRIPTION at the start and the ROTATEs between binlogs.
 namespace {
 
-void listener_serves_server_events(hegel::TestCase &tc, bool s3) {
+void listener_serves_server_events(hegel::TestCase &tc, bool s3,
+                                   workload_set set = workload_set::basic) {
         server_session server;
         start_case(tc, server);
         auto options{draw_options(tc)};
@@ -1983,7 +2266,7 @@ void listener_serves_server_events(hegel::TestCase &tc, bool s3) {
         pbt::note(tc, "binlog_server: " + describe(options));
         const auto storage{make_storage(options)};
         pbt::note(tc, "workload:");
-        auto workload{draw_workload(tc, server.info, 10U)};
+        auto workload{draw_workload(tc, server.info, 10U, set)};
         // the newest binlog ends with a transaction (PBT-020)
         workload.push_back(operation{.kind = op_kind::insert_rows, .count = 1});
         apply_all(tc, server.sql, workload);
@@ -2040,15 +2323,15 @@ void listener_serves_server_events(hegel::TestCase &tc, bool s3) {
                          served.error);
         const auto common{std::min(direct.events.size(), served.events.size())};
         for (std::size_t i{0U}; i < common; ++i) {
-          if (direct.events[i] != served.events[i]) {
+          const bool same{same_event(direct.events[i], served.events[i])};
+          if (!same) {
             pbt::note(tc, "event " + std::to_string(i) + ": server " +
                     describe_event(direct.events[i]) + "; listener " +
                     describe_event(served.events[i]) + "; " +
                     first_difference(direct.events[i], served.events[i]));
           }
-          pbt::require(direct.events[i] == served.events[i],
-                       "the listener sent an event that differs from the "
-                       "server's");
+          pbt::require(same, "the listener sent an event that differs from the "
+                             "server's");
         }
         pbt::require_equal(served.events.size(), direct.events.size(),
                            "number of events");
@@ -2214,9 +2497,10 @@ private:
 // position-based replica of the listener (from the first binlog) while
 // 'pull' runs and the workload continues ends up with the source's
 // gtid_executed and the same table contents.
-BOOST_AUTO_TEST_CASE(ReplicaOfListenerMatchesSourceMySQL) {
-  pbt::check(
-      [](hegel::TestCase &tc) {
+namespace {
+
+void replica_of_listener_matches_source(hegel::TestCase &tc,
+                                        workload_set set = workload_set::basic) {
         server_session server;
         replica_session replica;
         start_case(tc, server);
@@ -2268,7 +2552,7 @@ BOOST_AUTO_TEST_CASE(ReplicaOfListenerMatchesSourceMySQL) {
           }
         }
         pbt::note(tc, "workload while replicating:");
-        auto workload{draw_workload(tc, server.info, 8U)};
+        auto workload{draw_workload(tc, server.info, 8U, set)};
         workload.push_back(operation{.kind = op_kind::insert_rows, .count = 1});
         apply_all(tc, server.sql, workload);
 
@@ -2285,14 +2569,30 @@ BOOST_AUTO_TEST_CASE(ReplicaOfListenerMatchesSourceMySQL) {
                        "the replica did not catch up with the source in 30 s");
           wait_ms(100U);
         }
-        const auto checksum_of{[](sql_connection &sql) {
-          return sql.query("CHECKSUM TABLE pbt.t1").at(0).at(1).value_or("NULL");
+        // every table of the test schema (the varied workload adds some)
+        const auto checksums_of{[](sql_connection &sql) {
+          std::string result;
+          for (const auto &table : sql.query(
+                   "SELECT table_name FROM information_schema.tables WHERE "
+                   "table_schema = 'pbt' ORDER BY table_name")) {
+            const auto name{table.at(0).value_or("")};
+            result += name + "=" +
+                      sql.query("CHECKSUM TABLE pbt." + name).at(0).at(1).value_or("NULL") +
+                      " ";
+          }
+          return result;
         }};
-        pbt::require_equal(checksum_of(replica.sql()), checksum_of(server.sql),
-                           "CHECKSUM TABLE pbt.t1 on the replica and the source");
+        pbt::require_equal(checksums_of(replica.sql()), checksums_of(server.sql),
+                           "CHECKSUM TABLE of the pbt tables on the replica and "
+                           "the source");
         pull.stop();
-      },
-      {.test_cases = 20U, .slow = true});
+}
+
+} // namespace
+
+BOOST_AUTO_TEST_CASE(ReplicaOfListenerMatchesSourceMySQL) {
+  pbt::check([](hegel::TestCase &tc) { replica_of_listener_matches_source(tc); },
+             {.test_cases = 20U, .slow = true});
 }
 
 // ===========================================================================
@@ -2565,7 +2865,32 @@ public:
   }
 
   [[nodiscard]] std::uint16_t port() const noexcept { return port_; }
+  // down: open connections are closed, new ones closed right after accept
   void set_down(bool down) { down_ = down; }
+  // the open connections are closed now; new ones work
+  void drop_connections() { ++generation_; }
+  // stalled: nothing is forwarded in either direction (connections stay
+  // open, also new ones), like a network that stops delivering packets
+  void set_stalled(bool stalled) { stalled_ = stalled; }
+  // the connection that forwards the next 'bytes' bytes from the upstream
+  // server to its client is closed right after them (0: at its next read),
+  // e.g. in the middle of an event; once
+  void cut_after(std::int64_t bytes) {
+    const std::scoped_lock lock{cut_mutex_};
+    cut_after_ = bytes;
+  }
+  [[nodiscard]] bool cut_pending() {
+    const std::scoped_lock lock{cut_mutex_};
+    return cut_after_ >= 0;
+  }
+  // no fault: up, not stalled, no cut pending; the connections opened
+  // during a fault are closed
+  void clear() {
+    cut_after(-1);
+    down_ = false;
+    stalled_ = false;
+    drop_connections();
+  }
 
 private:
   void accept_loop() {
@@ -2605,7 +2930,12 @@ private:
     std::array<char, 65536> buffer{};
     std::array<pollfd, 2> fds{pollfd{.fd = client, .events = POLLIN, .revents = 0},
                               pollfd{.fd = upstream, .events = POLLIN, .revents = 0}};
-    while (!stop_ && !down_) {
+    const auto generation{generation_.load()};
+    while (!stop_ && !down_ && generation_ == generation) {
+      if (stalled_) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{20});
+        continue;
+      }
       if (::poll(fds.data(), fds.size(), 50) <= 0) {
         continue;
       }
@@ -2619,16 +2949,34 @@ private:
           closed = true;
           break;
         }
+        // upstream -> client: a pending cut
+        auto forward{static_cast<std::size_t>(count)};
+        bool cut_now{false};
+        if (i == 1U) {
+          const std::scoped_lock lock{cut_mutex_};
+          if (cut_after_ >= 0) {
+            if (static_cast<std::size_t>(cut_after_) <= forward) {
+              forward = static_cast<std::size_t>(cut_after_);
+              cut_after_ = -1;
+              cut_now = true;
+            } else {
+              cut_after_ -= static_cast<std::int64_t>(forward);
+            }
+          }
+        }
         const int target{fds[1U - i].fd};
         std::size_t written{0U};
-        while (written < static_cast<std::size_t>(count)) {
+        while (written < forward) {
           const auto result{::write(target, buffer.data() + written,
-                                    static_cast<std::size_t>(count) - written)};
+                                    forward - written)};
           if (result <= 0) {
             closed = true;
             break;
           }
           written += static_cast<std::size_t>(result);
+        }
+        if (cut_now) {
+          closed = true;
         }
       }
       if (closed) {
@@ -2644,6 +2992,10 @@ private:
   int listen_fd_{-1};
   std::atomic<bool> stop_{false};
   std::atomic<bool> down_{false};
+  std::atomic<bool> stalled_{false};
+  std::atomic<std::uint64_t> generation_{0U};
+  std::mutex cut_mutex_;
+  std::int64_t cut_after_{-1};
   std::thread acceptor_;
   std::mutex mutex_;
   std::vector<std::thread> pumps_;
@@ -2661,6 +3013,11 @@ std::unique_ptr<tcp_proxy> make_s3_proxy() {
   }
   return std::make_unique<tcp_proxy>(
       static_cast<std::uint16_t>(std::stoul(endpoint->substr(colon + 1U))));
+}
+
+// the proxy in front of the MySQL server (PBT_MYSQL_PORT)
+std::unique_ptr<tcp_proxy> make_mysql_proxy() {
+  return std::make_unique<tcp_proxy>(static_cast<std::uint16_t>(settings().port));
 }
 
 // the SDK gives up within this time (generous for ASan builds)
@@ -3036,4 +3393,260 @@ BOOST_AUTO_TEST_CASE(ReplicaOfPositionStorageGtidOffMySQL) {
         pull.stop();
       },
       {.test_cases = 15U, .slow = true});
+}
+
+// ===========================================================================
+// D15: more kinds of binlog content
+// ===========================================================================
+
+// The basic workload writes ROW events with full row images, CRC32
+// checksums and InnoDB tables only. The varied workload adds what other
+// servers write (server settings switched per operation, see op_kind):
+// binlog_checksum NONE (and switching back, which rotates the binlog),
+// FULL row metadata, STATEMENT / MIXED format with INTVAR / RAND / USER_VAR
+// events, MINIMAL / NOBLOB row images, ROWS_QUERY events, XA transactions
+// (XA_PREPARE ends a transaction of its own), PARTIAL_UPDATE_ROWS (JSON),
+// a non-transactional MyISAM table (its transactions end with a QUERY
+// COMMIT, not an XID), LOAD DATA in statement format (BEGIN_LOAD_QUERY /
+// EXECUTE_LOAD_QUERY) and transactions of up to 400 KB, compressed or not.
+// The properties are the ones of D1, D2, D3, D5, D6 and D7.
+
+BOOST_AUTO_TEST_CASE(VariedEventsFetchMatchesServerMySQL) {
+  pbt::check([](hegel::TestCase &tc) {
+               fetch_matches_server(tc, false, false, workload_set::varied);
+             },
+             {.test_cases = 40U, .slow = true});
+}
+
+// The same with a GTID_MODE=OFF server and a position-mode storage.
+BOOST_AUTO_TEST_CASE(VariedEventsFetchMatchesServerGtidOffMySQL) {
+  pbt::check([](hegel::TestCase &tc) {
+               fetch_matches_server(tc, false, true, workload_set::varied);
+             },
+             {.test_cases = 15U, .slow = true});
+}
+
+BOOST_AUTO_TEST_CASE(RepeatedFetchResumesVariedEventsMySQL) {
+  pbt::check([](hegel::TestCase &tc) {
+               repeated_fetch_resumes(tc, false, false, workload_set::varied);
+             },
+             {.test_cases = 20U, .slow = true});
+}
+
+BOOST_AUTO_TEST_CASE(KilledPullResumesVariedEventsMySQL) {
+  pbt::check([](hegel::TestCase &tc) {
+               killed_pull_resumes(tc, false, false, workload_set::varied);
+             },
+             {.test_cases = 15U, .slow = true});
+}
+
+BOOST_AUTO_TEST_CASE(ListenerServesVariedEventsMySQL) {
+  pbt::check([](hegel::TestCase &tc) {
+               listener_serves_server_events(tc, false, workload_set::varied);
+             },
+             {.test_cases = 30U, .slow = true});
+}
+
+// Rewrite mode needs CRC32 checksums (README), so no binlog_checksum NONE.
+BOOST_AUTO_TEST_CASE(RewriteModeKeepsVariedTransactionsMySQL) {
+  pbt::check([](hegel::TestCase &tc) {
+               check_rewrite_mode(tc, true, workload_set::varied_crc32);
+             },
+             {.test_cases = 20U, .slow = true});
+}
+
+BOOST_AUTO_TEST_CASE(ReplicaOfListenerVariedEventsMySQL) {
+  pbt::check([](hegel::TestCase &tc) {
+               replica_of_listener_matches_source(tc, workload_set::varied);
+             },
+             {.test_cases = 15U, .slow = true});
+}
+
+// ===========================================================================
+// D16: network faults between PBS and the MySQL server
+// ===========================================================================
+
+// README: in 'fetch' mode "any error (network issues, server down, ...)
+// results in immediate termination of the program making sure that storage
+// is left in consistent state"; in 'pull' mode "any network-related error
+// ... does not result in immediate termination of the program. Instead,
+// another reconnection attempt is made."
+//
+// The faults come from a TCP proxy in the test process between PBS and the
+// server (connection.port points at it): open connections closed (drop),
+// a connection closed after a given number of bytes from the server
+// (cut: in the handshake, inside an event header, an event, a packet),
+// nothing delivered for a while (stall: longer than read_timeout = 1 s),
+// connections refused (outage), and the server killing its dump thread.
+
+namespace {
+
+std::string draw_cut(hegel::TestCase &tc, tcp_proxy &proxy) {
+  const auto bytes{tc.draw("cut_after", gs::sampled_from<std::int64_t>(
+                                            {0, 1, 4, 19, 60, 200, 1000, 5000,
+                                             50000}))};
+  proxy.cut_after(bytes);
+  return "cut the next connection after " + std::to_string(bytes) +
+         " byte(s) from the server";
+}
+
+// the dump threads of connections closed by a fault can stay in "has sent
+// all binlog" until the server writes again: end them all, so that
+// wait_until_pull_caught_up sees only the one of pull's next connection
+void restart_dumps(sql_connection &sql) {
+  kill_dump_threads(sql);
+  wait_ms(500U);
+}
+
+} // namespace
+
+// 'pull' through network faults while the workload runs: it never exits,
+// and once the network is healthy again it catches up; the storage then
+// matches the server, also after a 'fetch'.
+BOOST_AUTO_TEST_CASE(NetworkFaultsDuringPullMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        start_case(tc, server);
+        auto options{draw_options(tc)};
+        const auto proxy{make_mysql_proxy()};
+        options.mysql_port = proxy->port();
+        pbt::note(tc, "binlog_server: " + describe(options));
+        const auto storage{make_storage(options)};
+        apply_all(tc, server.sql,
+                  {operation{.kind = op_kind::insert_rows, .count = 1}});
+        pull_process pull{tc, *storage};
+        const auto steps{tc.draw(
+            "steps", gs::integers<std::size_t>({.min_value = 1U, .max_value = 8U}))};
+        for (std::size_t step{0U}; step < steps; ++step) {
+          const auto action{tc.draw(
+              "action", gs::sampled_from<std::string>(
+                            {"workload", "workload", "sleep", "drop", "cut",
+                             "stall", "outage", "kill_dump"}))};
+          if (action == "workload") {
+            pbt::note(tc, "workload:");
+            apply_all(tc, server.sql, draw_workload(tc, server.info, 3U));
+          } else if (action == "sleep") {
+            const auto delay{tc.draw("sleep_ms", gs::sampled_from<std::uint64_t>(
+                                                     {10U, 100U, 400U, 1500U}))};
+            pbt::note(tc, "sleep " + std::to_string(delay) + " ms");
+            wait_ms(delay);
+          } else if (action == "drop") {
+            pbt::note(tc, "close pull's connection to the server");
+            proxy->drop_connections();
+          } else if (action == "cut") {
+            pbt::note(tc, draw_cut(tc, *proxy));
+          } else if (action == "kill_dump") {
+            pbt::note(tc, "the server kills its binlog dump thread");
+            kill_dump_threads(server.sql);
+          } else {
+            const bool stall{action == "stall"};
+            const auto duration{tc.draw(
+                "fault_ms", gs::sampled_from<std::uint64_t>({300U, 1500U, 4000U}))};
+            const bool with_workload{tc.draw("during_fault", gs::booleans())};
+            pbt::note(tc, std::string{stall ? "network stalls" : "server unreachable"} +
+                              " for " + std::to_string(duration) + " ms" +
+                              (with_workload ? ", workload meanwhile:" : ""));
+            if (stall) {
+              proxy->set_stalled(true);
+            } else {
+              proxy->set_down(true);
+            }
+            const auto start{std::chrono::steady_clock::now()};
+            if (with_workload) {
+              apply_all(tc, server.sql, draw_workload(tc, server.info, 3U));
+            }
+            const auto elapsed{std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start)};
+            if (elapsed.count() < static_cast<std::int64_t>(duration)) {
+              wait_ms(duration - static_cast<std::uint64_t>(elapsed.count()));
+            }
+            proxy->set_stalled(false);
+            proxy->set_down(false);
+          }
+          pull.require_running();
+        }
+        pbt::note(tc, "network healthy again");
+        proxy->clear();
+        restart_dumps(server.sql);
+        wait_until_pull_caught_up(tc, server.sql, pull);
+        pull.require_running();
+        pbt::note(tc, "SIGTERM pull, compare, then fetch and compare again");
+        pull.stop();
+        require_storage_matches_server(tc, server.sql, server.info, *storage);
+        fetch(tc, *storage);
+        require_storage_matches_server(tc, server.sql, server.info, *storage);
+      },
+      {.test_cases = 15U, .slow = true});
+}
+
+// 'fetch' with a network fault: it terminates (no hang, no crash); if it
+// reports success, the storage matches the server; either way the storage
+// stays consistent: a fetch over a healthy network afterwards completes it.
+BOOST_AUTO_TEST_CASE(NetworkFaultDuringFetchMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        start_case(tc, server);
+        auto options{draw_options(tc)};
+        const auto proxy{make_mysql_proxy()};
+        options.mysql_port = proxy->port();
+        pbt::note(tc, "binlog_server: " + describe(options));
+        const auto storage{make_storage(options)};
+        const auto rounds{tc.draw(
+            "rounds", gs::integers<std::size_t>({.min_value = 1U, .max_value = 3U}))};
+        for (std::size_t round{0U}; round < rounds; ++round) {
+          pbt::note(tc, "round " + std::to_string(round + 1U) + ":");
+          apply_all(tc, server.sql, draw_workload(tc, server.info, 6U));
+          const auto fault{tc.draw("fault", gs::sampled_from<std::string>(
+                                                {"none", "cut", "cut", "stall",
+                                                 "outage", "drop"}))};
+          std::uint64_t drop_delay{0U};
+          if (fault == "cut") {
+            pbt::note(tc, draw_cut(tc, *proxy));
+          } else if (fault == "stall") {
+            pbt::note(tc, "network stalled during the fetch");
+            proxy->set_stalled(true);
+          } else if (fault == "outage") {
+            pbt::note(tc, "server unreachable during the fetch");
+            proxy->set_down(true);
+          } else if (fault == "drop") {
+            drop_delay = tc.draw("drop_ms",
+                                 gs::sampled_from<std::uint64_t>({0U, 5U, 30U, 100U}));
+            pbt::note(tc, "close the connection " + std::to_string(drop_delay) +
+                              " ms into the fetch");
+          } else {
+            pbt::note(tc, "no fault");
+          }
+          background_run faulty{{"fetch", storage->config_path}};
+          if (fault == "drop") {
+            wait_ms(drop_delay);
+            proxy->drop_connections();
+          }
+          const auto [result, in_time]{faulty.wait_for(std::chrono::seconds{60})};
+          if (!in_time || result.signaled) {
+            pbt::note(tc, "binlog_server log:" + log_tail(*storage));
+          }
+          pbt::require(in_time, "fetch did not terminate within 60 s of a "
+                                "network fault");
+          pbt::require(!result.signaled,
+                       "fetch crashed after a network fault (" + result.describe() + ")");
+          pbt::note(tc, "fetch: " + result.describe());
+          if (fault == "none" && result.exit_code != 0) {
+            pbt::note(tc, "binlog_server log:" + log_tail(*storage));
+          }
+          pbt::require(fault != "none" || result.exit_code == 0,
+                       "fetch through the proxy failed without a fault (" +
+                           result.describe() + ")");
+          proxy->clear();
+          if (result.exit_code == 0) {
+            // a success is a complete copy
+            require_storage_matches_server(tc, server.sql, server.info, *storage);
+          }
+          pbt::note(tc, "fetch over a healthy network");
+          fetch(tc, *storage);
+          require_storage_matches_server(tc, server.sql, server.info, *storage);
+        }
+      },
+      {.test_cases = 30U, .slow = true});
 }
