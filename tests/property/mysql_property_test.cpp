@@ -1594,8 +1594,10 @@ bool port_accepts_connections(std::uint16_t port) {
 // binsrv.log.<n>.
 class pull_process {
 public:
-  pull_process(hegel::TestCase &tc, const pbs_storage &storage)
-      : tc_{tc}, storage_{storage} {
+  // 'file_size_limit': see pbt::process::detail::exec_child (a full disk)
+  pull_process(hegel::TestCase &tc, const pbs_storage &storage,
+               std::optional<std::uint64_t> file_size_limit = {})
+      : tc_{tc}, storage_{storage}, file_size_limit_{file_size_limit} {
     launch();
   }
 
@@ -1607,7 +1609,7 @@ public:
                  ignored);
     }
     process_ = std::make_unique<background_run>(
-        std::vector<std::string>{"pull", storage_.config_path});
+        std::vector<std::string>{"pull", storage_.config_path}, file_size_limit_);
   }
 
   void require_running() {
@@ -1630,6 +1632,10 @@ public:
     }
     return std::nullopt;
   }
+
+  // SIGTERM without waiting for anything (e.g. on a full disk, where the
+  // log that stop() waits for may stay empty)
+  void send_term() { process_->send(SIGTERM); }
 
   void kill() {
     process_->send(SIGKILL);
@@ -1678,6 +1684,7 @@ private:
 
   hegel::TestCase &tc_;
   const pbs_storage &storage_;
+  std::optional<std::uint64_t> file_size_limit_;
   std::size_t runs_{0U};
   std::unique_ptr<background_run> process_;
 };
@@ -3653,4 +3660,177 @@ BOOST_AUTO_TEST_CASE(NetworkFaultDuringFetchMySQL) {
         }
       },
       {.test_cases = 30U, .slow = true});
+}
+
+// ===========================================================================
+// D17: the storage's disk is full
+// ===========================================================================
+
+// README: in 'fetch' mode "any error (network issues, server down, out of
+// space, etc) ... results in immediate termination of the program making
+// sure that storage is left in consistent state"; in 'pull' mode "more
+// serious errors (like out of space, etc.) cause program termination".
+//
+// A full disk without root rights or a small file system: binlog_server
+// runs with RLIMIT_FSIZE (no file may grow beyond the limit) and SIGXFSZ
+// ignored, so a write beyond it fails (EFBIG) the way a write to a full
+// disk fails (ENOSPC), possibly after a partial write. The limit applies
+// to every file binlog_server writes: binlogs, their .json metadata,
+// binlog.index, the log, the S3 upload buffer.
+
+namespace {
+
+// small limits are dense: whether a write fails depends on which of the
+// small metadata files (metadata.json 31 bytes, <binlog>.json about 120,
+// binlog.index 16 per binlog) still fit
+std::uint64_t draw_file_size_limit(hegel::TestCase &tc) {
+  const auto limit{tc.draw("file_size_limit",
+                           gs::sampled_from<std::uint64_t>(
+                               {0U, 4U, 32U, 48U, 64U, 80U, 100U, 120U, 160U,
+                                300U, 1000U, 5000U, 20000U, 60000U}))};
+  pbt::note(tc, "file size limit " + std::to_string(limit) + " bytes");
+  return limit;
+}
+
+} // namespace
+
+// The storage after a write failure on a full disk is consistent: whatever
+// 'fetch' or 'pull' (killed after 60 s if still running) did, a 'fetch'
+// with space again succeeds and the storage matches the server.
+BOOST_AUTO_TEST_CASE(DiskFullLeavesStorageConsistentMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        start_case(tc, server);
+        auto options{draw_options(tc)};
+        options.s3 = tc.draw("s3", gs::integers<int>({.min_value = 0, .max_value = 3})) == 0;
+        pbt::note(tc, "binlog_server: " + describe(options));
+        const auto storage{make_storage(options)};
+        const auto rounds{tc.draw(
+            "rounds", gs::integers<std::size_t>({.min_value = 1U, .max_value = 3U}))};
+        for (std::size_t round{0U}; round < rounds; ++round) {
+          pbt::note(tc, "round " + std::to_string(round + 1U) + ":");
+          auto workload{draw_workload(tc, server.info, 6U)};
+          if (tc.draw("large_row", gs::booleans())) {
+            workload.push_back(operation{.kind = op_kind::large_row, .size = 70000U});
+          }
+          apply_all(tc, server.sql, workload);
+          // always in the first round: creating the first binlog
+          if (round == 0U || tc.draw("disk_full", gs::booleans())) {
+            const auto limit{draw_file_size_limit(tc)};
+            if (tc.draw("pull", gs::booleans())) {
+              pull_process pull{tc, *storage, limit};
+              auto exited{pull.wait_for_exit(std::chrono::seconds{5})};
+              if (!exited) {
+                // a graceful stop: kill -9 would mix in PBT-026
+                pbt::note(tc, "pull with the limit still running after 5 s: SIGTERM");
+                pull.send_term();
+                exited = pull.wait_for_exit(std::chrono::seconds{20});
+              }
+              if (exited) {
+                pbt::note(tc, "pull with the limit: " + exited->describe());
+              } else {
+                pbt::note(tc, "pull ignored SIGTERM for 20 s: kill -9");
+                pull.kill();
+              }
+            } else {
+              background_run limited{{"fetch", storage->config_path}, limit};
+              const auto [result, in_time]{limited.wait_for(std::chrono::seconds{60})};
+              pbt::note(tc, "fetch with the limit: " +
+                                (in_time ? result.describe() : std::string{"killed after 60 s"}));
+            }
+          }
+          pbt::note(tc, "fetch with space again");
+          fetch(tc, *storage);
+          require_storage_matches_server(tc, server.sql, server.info, *storage);
+        }
+      },
+      {.test_cases = 40U, .slow = true});
+}
+
+// 'fetch' that cannot write terminates (no crash, no hang); it may report
+// success (exit code 0) only if the storage holds a complete copy.
+BOOST_AUTO_TEST_CASE(DiskFullFetchSucceedsOnlyWhenCompleteMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        start_case(tc, server);
+        auto options{draw_options(tc)};
+        options.s3 = tc.draw("s3", gs::integers<int>({.min_value = 0, .max_value = 3})) == 0;
+        pbt::note(tc, "binlog_server: " + describe(options));
+        const auto storage{make_storage(options)};
+        if (tc.draw("fetch_with_space_first", gs::booleans())) {
+          pbt::note(tc, "workload, fetch with space:");
+          apply_all(tc, server.sql, draw_workload(tc, server.info, 4U));
+          fetch(tc, *storage);
+        }
+        pbt::note(tc, "workload:");
+        auto workload{draw_workload(tc, server.info, 6U)};
+        if (tc.draw("large_row", gs::booleans())) {
+          workload.push_back(operation{.kind = op_kind::large_row, .size = 70000U});
+        }
+        apply_all(tc, server.sql, workload);
+        const auto limit{draw_file_size_limit(tc)};
+        background_run limited{{"fetch", storage->config_path}, limit};
+        const auto [result, in_time]{limited.wait_for(std::chrono::seconds{60})};
+        pbt::note(tc, "fetch with the limit: " +
+                          (in_time ? result.describe() : std::string{"hangs"}));
+        if (!in_time || result.signaled) {
+          pbt::note(tc, "binlog_server log:" + log_tail(*storage));
+        }
+        pbt::require(in_time, "fetch did not terminate within 60 s on a full disk");
+        pbt::require(!result.signaled,
+                     "fetch crashed on a full disk (" + result.describe() + ")");
+        if (result.exit_code == 0) {
+          pbt::note(tc, "(fetch reported success: the storage must be complete)");
+          require_storage_matches_server(tc, server.sql, server.info, *storage);
+        }
+      },
+      {.test_cases = 40U, .slow = true});
+}
+
+// 'pull' that cannot write stops with a failure exit code (no crash, no
+// hang): with checkpoint_size 1 every transaction is written, so it exits
+// on its own; without checkpointing the data is written when it stops
+// (SIGTERM), and that failure must show in its exit code.
+BOOST_AUTO_TEST_CASE(DiskFullStopsPullMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        start_case(tc, server);
+        auto options{draw_options(tc)};
+        const bool checkpointing{tc.draw("checkpoint_every_transaction", gs::booleans())};
+        options.checkpoint_size = checkpointing ? std::optional<std::string>{"1"}
+                                                : std::nullopt;
+        options.checkpoint_interval.reset();
+        options.s3 = tc.draw("s3", gs::integers<int>({.min_value = 0, .max_value = 3})) == 0;
+        pbt::note(tc, "binlog_server: " + describe(options));
+        const auto storage{make_storage(options)};
+        pbt::note(tc, "workload before pull:");
+        apply_all(tc, server.sql, draw_workload(tc, server.info, 4U));
+        const auto limit{draw_file_size_limit(tc)};
+        pull_process pull{tc, *storage, limit};
+        // more than the limit has to be written: a 70000 byte row
+        pbt::note(tc, "workload while pull runs:");
+        auto workload{draw_workload(tc, server.info, 3U)};
+        workload.push_back(operation{.kind = op_kind::large_row, .size = 70000U});
+        apply_all(tc, server.sql, workload);
+        auto exited{pull.wait_for_exit(std::chrono::seconds{checkpointing ? 60 : 5})};
+        if (!exited && !checkpointing) {
+          pbt::note(tc, "SIGTERM pull (it writes when it stops)");
+          pull.send_term();
+          exited = pull.wait_for_exit(std::chrono::seconds{20});
+        }
+        if (!exited || exited->signaled || exited->exit_code == 0) {
+          pbt::note(tc, "binlog_server log:" + log_tail(*storage));
+        }
+        pbt::require(exited.has_value(), "pull did not stop on a full disk");
+        pbt::note(tc, "pull: " + exited->describe());
+        pbt::require(!exited->signaled,
+                     "pull crashed on a full disk (" + exited->describe() + ")");
+        pbt::require(exited->exit_code != 0,
+                     "pull reported success (exit code 0) although it could not "
+                     "write to the storage");
+      },
+      {.test_cases = 25U, .slow = true});
 }
