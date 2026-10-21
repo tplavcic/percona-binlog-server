@@ -1283,8 +1283,12 @@ walked_file walk(const std::string &data, const std::string &what) {
     const auto size{le32(data, offset + 9U)};
     const auto log_pos{le32(data, offset + 13U)};
     const bool has_footer{checksummed || type == format_description_event};
-    pbt::require(size >= header_size + (has_footer ? 5U : 0U) &&
-                     size <= data.size() - offset,
+    // footer: CRC32 (4 bytes); a FORMAT_DESCRIPTION also has the algorithm
+    // byte before it (a STOP event is just header + footer: 23 bytes)
+    const std::size_t minimum_size{
+        header_size + (has_footer ? 4U : 0U) +
+        (type == format_description_event ? 1U : 0U)};
+    pbt::require(size >= minimum_size && size <= data.size() - offset,
                  what + ": event size " + std::to_string(size) +
                      " at offset " + std::to_string(offset));
     pbt::require_equal(static_cast<std::size_t>(log_pos), offset + size,

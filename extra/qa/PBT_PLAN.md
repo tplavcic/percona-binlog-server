@@ -610,6 +610,11 @@ MySQL, so it no longer matches the event, while PBS recomputes it. Nobody
 verifies that field, because the event itself says the binlog has no
 checksums.
 
+QA run (Percona Server 8.4.10, asan+ubsan): all D15 / D16 properties pass.
+A test fix came out of it: the oracle's binlog reader required 24 bytes for
+every checksummed event, but only a FORMAT_DESCRIPTION has the extra
+algorithm byte; a STOP event (graceful server restart) is 23 bytes.
+
 ## 6. Open questions
 
 See the hand-over message; the answers will be folded in here.
