@@ -3834,3 +3834,149 @@ BOOST_AUTO_TEST_CASE(DiskFullStopsPullMySQL) {
       },
       {.test_cases = 25U, .slow = true});
 }
+
+// ===========================================================================
+// D18: several processes on one storage
+// ===========================================================================
+
+// PBS has no storage lock, and the README warns only about purge_binlogs
+// running while another instance fetches / pulls into the same storage. A
+// second writer (a cron 'fetch' while 'pull' runs, or a second 'pull')
+// therefore has to be either refused or harmless: neither process
+// crashes, and once both have stopped, a 'fetch' succeeds and the storage
+// matches the server.
+
+namespace {
+
+// a copy of the storage's configuration for a second process: its own log,
+// replication server_id (MySQL ends the older dump of a replica with the
+// same server_id) and listener port
+std::string second_config(const pbs_storage &storage) {
+  auto config{json::parse(read_file(storage.config_path)).as_object()};
+  config["logger"].as_object()["file"] =
+      (storage.directory.path() / "binsrv-second.log").string();
+  config["replication"].as_object()["server_id"] = 4243;
+  config["replication_source"].as_object()["port"] =
+      static_cast<unsigned>(listener_port()) + 1U;
+  const auto path{(storage.directory.path() / "config-second.json").string()};
+  std::ofstream{path} << json::serialize(config);
+  return path;
+}
+
+} // namespace
+
+BOOST_AUTO_TEST_CASE(SecondWriterKeepsStorageConsistentMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        start_case(tc, server);
+        const auto options{draw_options(tc)};
+        pbt::note(tc, "binlog_server: " + describe(options));
+        const auto storage{make_storage(options)};
+        const auto second_path{second_config(*storage)};
+        pbt::note(tc, "workload before:");
+        apply_all(tc, server.sql, draw_workload(tc, server.info, 4U));
+        pull_process pull{tc, *storage};
+        // mostly while the first one starts up and writes its first binlog
+        const auto delay{tc.draw("second_after_ms", gs::sampled_from<std::uint64_t>(
+                                                        {0U, 0U, 20U, 50U, 200U, 1500U}))};
+        wait_ms(delay);
+        const auto second_kind{tc.draw(
+            "second", gs::sampled_from<std::string>({"fetch", "pull"}))};
+        pbt::note(tc, "after " + std::to_string(delay) + " ms a second '" +
+                          second_kind + "' on the same storage; workload:");
+        background_run second{{second_kind, second_path}};
+        apply_all(tc, server.sql, draw_workload(tc, server.info, 4U));
+        if (second_kind == "pull") {
+          wait_ms(tc.draw("both_for_ms",
+                          gs::sampled_from<std::uint64_t>({100U, 1000U, 3000U})));
+          second.send(SIGTERM);
+        }
+        const auto [second_result, in_time]{second.wait_for(std::chrono::seconds{60})};
+        pbt::note(tc, "second " + second_kind + ": " +
+                          (in_time ? second_result.describe()
+                                   : std::string{"still running after 60 s"}));
+        pbt::require(in_time, "the second " + second_kind + " did not stop");
+        pbt::require(!second_result.signaled,
+                     "the second " + second_kind + " crashed (" +
+                         second_result.describe() + ")");
+        // the first one may have failed because of the second one: then it
+        // must have exited, not crashed
+        if (const auto exited{pull.wait_for_exit(std::chrono::seconds{0})}; exited) {
+          pbt::note(tc, "first pull exited: " + exited->describe());
+          pbt::require(!exited->signaled,
+                       "the first pull crashed (" + exited->describe() + ")");
+        } else {
+          pbt::note(tc, "SIGTERM the first pull");
+          pull.send_term();
+          const auto stopped{pull.wait_for_exit(std::chrono::seconds{20})};
+          pbt::require(stopped.has_value(), "the first pull did not stop on SIGTERM");
+          pbt::note(tc, "first pull: " + stopped->describe());
+          pbt::require(!stopped->signaled,
+                       "the first pull crashed (" + stopped->describe() + ")");
+        }
+        pbt::note(tc, "fetch alone");
+        fetch(tc, *storage);
+        require_storage_matches_server(tc, server.sql, server.info, *storage);
+      },
+      {.test_cases = 60U, .slow = true});
+}
+
+// 'list' while 'pull' writes (monitoring): every call succeeds and shows a
+// consistent prefix of the server's binary log: binlogs the server has, in
+// its order, none larger than on the server.
+BOOST_AUTO_TEST_CASE(ListDuringPullIsConsistentMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        start_case(tc, server);
+        const auto options{draw_options(tc)};
+        pbt::note(tc, "binlog_server: " + describe(options));
+        const auto storage{make_storage(options)};
+        pull_process pull{tc, *storage};
+        const auto rounds{tc.draw(
+            "rounds", gs::integers<std::size_t>({.min_value = 1U, .max_value = 6U}))};
+        std::size_t calls{0U};
+        for (std::size_t round{0U}; round < rounds; ++round) {
+          pbt::note(tc, "workload:");
+          apply_all(tc, server.sql, draw_workload(tc, server.info, 3U));
+          const auto polls{tc.draw("polls", gs::integers<std::size_t>(
+                                                {.min_value = 1U, .max_value = 5U}))};
+          for (std::size_t poll{0U}; poll < polls; ++poll) {
+            const auto result{run({"list", storage->config_path})};
+            ++calls;
+            if (result.signaled || result.exit_code != 0) {
+              pbt::note(tc, "list output: " + result.output);
+            }
+            pbt::require(!result.signaled && result.exit_code == 0,
+                         "list during pull failed (" + result.describe() + ")");
+            const auto response{json::parse(result.output).as_object()};
+            pbt::require_equal(std::string{response.at("status").as_string()},
+                               std::string{"success"}, "list status during pull");
+            const auto server_side{server_binlogs(server.sql)};
+            const auto &listed{response.at("result").as_array()};
+            pbt::require(listed.size() <= server_side.size(),
+                         "list during pull shows more binlogs than the server has");
+            for (std::size_t i{0U}; i < listed.size(); ++i) {
+              const auto &item{listed[i].as_object()};
+              const std::string name{item.at("name").as_string()};
+              // GTID mode may skip a leading binlog without transactions
+              const auto it{std::ranges::find(server_side, name, &server_binlog::name)};
+              pbt::require(it != server_side.end(),
+                           "list during pull shows " + name +
+                               ", which the server does not have");
+              pbt::require(item.at("size").to_number<std::uint64_t>() <= it->size,
+                           "list during pull: " + name + " larger than on the server");
+              if (i > 0U) {
+                const std::string previous{listed[i - 1U].as_object().at("name").as_string()};
+                pbt::require(previous < name, "list during pull: binlogs out of order");
+              }
+            }
+          }
+          pull.require_running();
+        }
+        pbt::note(tc, std::to_string(calls) + " list call(s) during pull");
+        pull.stop();
+      },
+      {.test_cases = 25U, .slow = true});
+}
