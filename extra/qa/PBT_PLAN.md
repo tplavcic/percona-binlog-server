@@ -207,6 +207,7 @@ walker (magic, sizes, log_pos, CRC32, GTID order).
 | D16 | network faults between PBS and MySQL (TCP proxy in the test: open connections closed, a connection cut after 0 / 1 / 4 / 19 / ... / 50000 bytes from the server, no delivery for 0.3-4 s, connections refused, the server killing its dump thread): `NetworkFaultsDuringPullMySQL` (README: pull never exits on network errors, reconnects; afterwards the storage matches the server, also after a fetch), `NetworkFaultDuringFetchMySQL` (fetch terminates within 60 s without crashing; an exit code 0 means a complete copy; a fetch over a healthy network afterwards completes the storage) | ✅ |
 | D17 | full disk (binlog_server runs with RLIMIT_FSIZE of 0 - 60000 bytes and SIGXFSZ ignored: writes beyond it fail like on a full disk; every file it writes is limited, file and S3 backends): `DiskFullLeavesStorageConsistentMySQL` (after a fetch / pull on a full disk, a fetch with space succeeds and the storage matches the server), `DiskFullFetchSucceedsOnlyWhenCompleteMySQL` (fetch terminates without crashing; exit code 0 only with a complete copy), `DiskFullStopsPullMySQL` (pull stops with a failure exit code, on its own with checkpoint_size 1, else at the latest on SIGTERM) | ✅ (PBT-038, PBT-039) |
 | D18 | several processes on one storage (PBS has no storage lock; the README warns only about `purge_binlogs` running concurrently): `SecondWriterKeepsStorageConsistentMySQL` (a second `fetch` or `pull` 0 - 1500 ms after `pull` started: no crash; after both stopped a fetch succeeds and the storage matches the server), `ListDuringPullIsConsistentMySQL` (`list` while `pull` writes always succeeds and shows a prefix of the server's binlogs, in order, none larger than on the server) | ✅ (PBT-040) |
+| D19 | the source fails over to its replica (the second server as a GTID replica of the source with auto-positioning and its own max_binlog_size; the storage is fetched from the source, then from the promoted replica): `FailoverRewriteModeContinuesMySQL` (rewrite mode, checksums verified because of PBT-022: the fetch from the new primary succeeds and the storage holds every GTID once, files well-formed, previous / added GTIDs consistent), `FailoverGtidModeIsCorrectOrRefusedMySQL` (plain GTID mode: correct as above, or refused with the storage unchanged), `FailoverToLaggingReplicaIsCorrectOrRefusedMySQL` (the replica lacks the storage's last transaction; MySQL accepts such a replica too, since a source refuses only GTIDs with its own UUID: correct or refused) | ✅ (PBT-041) |
 | D9 | `PurgeOnServerMySQL`: `PURGE BINARY LOGS TO` before / after the storage got the binlogs; fetch succeeds exactly when the server still has what the storage needs (position: its newest binlog; GTID: gtid_purged covered; empty storage), else exits 1 leaving the storage unchanged | ✅ |
 
 GTID auto-positioning: the server starts a GTID dump at the newest binlog
@@ -238,7 +239,7 @@ there is authoritative):
 | Severity | Issues |
 |---|---|
 | high | PBT-015, PBT-017, PBT-022, PBT-039, PBT-040 |
-| medium | PBT-001, PBT-002, PBT-004, PBT-012, PBT-013, PBT-016, PBT-019, PBT-026, PBT-029, PBT-030, PBT-031, PBT-032, PBT-033, PBT-035, PBT-036, PBT-037, PBT-038 |
+| medium | PBT-001, PBT-002, PBT-004, PBT-012, PBT-013, PBT-016, PBT-019, PBT-026, PBT-029, PBT-030, PBT-031, PBT-032, PBT-033, PBT-035, PBT-036, PBT-037, PBT-038, PBT-041 |
 | fixed | PBT-034 (upstream PBS-10) |
 | low | PBT-003, PBT-005, PBT-006, PBT-007, PBT-008, PBT-009, PBT-010, PBT-011, PBT-014, PBT-018, PBT-020, PBT-021, PBT-023, PBT-024, PBT-025, PBT-027, PBT-028 |
 
@@ -630,6 +631,13 @@ Two new findings:
 
 - [high] PBT-040: a second writer on the same storage corrupts it in every run (6 of 6 runs of 40 cases): an earlier binlog's metadata stuck at 4 bytes, an encrypted binlog's magic encrypted with the other process's key, or a storage the next start refuses. Both processes often exit with code 0. Timing-dependent, so Hegel reports it as flaky.
 - `list` while `pull` writes is consistent (no finding).
+
+### Failover (sandbox run)
+
+- Rewrite mode continues across a failover in every case (also when the replica is ahead of the storage). Without checksum verification it fails at the first transaction, which is the known PBT-022.
+- [medium] PBT-041: plain GTID mode either continues correctly (about half of the cases) or fails. When the new primary's binlog numbering is behind the old source's, the failing fetch first appends the new primary's binlog after the stored ones, and from then on neither server can resume the storage.
+- A replica that lacks the storage's last transaction is accepted or refused cleanly.
+- Not covered: position mode. The stored file:position has no meaning on another server, so failover there is unsupported by design; refusing it cleanly would be a separate check.
 
 ## 6. Open questions
 
