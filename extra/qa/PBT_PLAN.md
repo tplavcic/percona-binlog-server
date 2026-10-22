@@ -239,8 +239,8 @@ there is authoritative):
 | Severity | Issues |
 |---|---|
 | high | PBT-015, PBT-017, PBT-022, PBT-039, PBT-040 |
-| medium | PBT-001, PBT-002, PBT-004, PBT-012, PBT-013, PBT-016, PBT-019, PBT-026, PBT-029, PBT-030, PBT-031, PBT-032, PBT-033, PBT-035, PBT-036, PBT-037, PBT-038, PBT-041 |
-| fixed | PBT-034 (upstream PBS-10) |
+| medium | PBT-001, PBT-002, PBT-004, PBT-012, PBT-013, PBT-016, PBT-019, PBT-029, PBT-030, PBT-031, PBT-032, PBT-033, PBT-035, PBT-036, PBT-037, PBT-041 |
+| fixed | PBT-034 (upstream PBS-10), PBT-026 and PBT-038 (upstream PBS-59) |
 | low | PBT-003, PBT-005, PBT-006, PBT-007, PBT-008, PBT-009, PBT-010, PBT-011, PBT-014, PBT-018, PBT-020, PBT-021, PBT-023, PBT-024, PBT-025, PBT-027, PBT-028 |
 
 ### GTID sets (prototype run)
@@ -638,6 +638,10 @@ Two new findings:
 - [medium] PBT-041: plain GTID mode either continues correctly (about half of the cases) or fails. When the new primary's binlog numbering is behind the old source's, the failing fetch first appends the new primary's binlog after the stored ones, and from then on neither server can resume the storage.
 - A replica that lacks the storage's last transaction is accepted or refused cleanly.
 - Not covered: position mode. The stored file:position has no meaning on another server, so failover there is unsupported by design; refusing it cleanly would be a separate check.
+
+### After the rebase onto PBS-59 (QA run)
+
+Upstream PBS-59 (9989a4a) recovers, at startup, the objects that an interrupted binlog creation or purge leaves behind. `CrashWhileCreatingBinlogIsRecovered` and `DiskFullLeavesStorageConsistentMySQL` pass, including the saved failing examples, so PBT-026 and PBT-038 are marked `fixed`. Their rows now report a regression if the failures come back. PBT-040 (second writer) and PBT-041 (failover in plain GTID mode) are different problems and still fail.
 
 ## 6. Open questions
 
