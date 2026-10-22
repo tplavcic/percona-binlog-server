@@ -3890,6 +3890,17 @@ BOOST_AUTO_TEST_CASE(SecondWriterKeepsStorageConsistentMySQL) {
         if (second_kind == "pull") {
           wait_ms(tc.draw("both_for_ms",
                           gs::sampled_from<std::uint64_t>({100U, 1000U, 3000U})));
+          // a SIGTERM before the handlers are installed terminates any
+          // program: wait for the second pull to log them (or to exit)
+          const auto second_log{storage->directory.path() / "binsrv-second.log"};
+          const auto deadline{std::chrono::steady_clock::now() +
+                              std::chrono::seconds{20}};
+          while (read_file_if_exists(second_log)
+                         .find("set custom handlers for SIGINT and SIGTERM") ==
+                     std::string::npos &&
+                 !second.poll() && std::chrono::steady_clock::now() < deadline) {
+            wait_ms(10U);
+          }
           second.send(SIGTERM);
         }
         const auto [second_result, in_time]{second.wait_for(std::chrono::seconds{60})};
