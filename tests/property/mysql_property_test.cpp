@@ -3980,3 +3980,243 @@ BOOST_AUTO_TEST_CASE(ListDuringPullIsConsistentMySQL) {
       },
       {.test_cases = 25U, .slow = true});
 }
+
+// ===========================================================================
+// D19: the source fails over to its replica
+// ===========================================================================
+
+// The second private server becomes a GTID replica (SOURCE_AUTO_POSITION)
+// of the source, with its own max_binlog_size, so its binlogs hold the same
+// transactions in other files at other positions. The storage is fetched
+// from the source, then the replica is promoted (replication stopped and
+// reset, its own workload) and the storage is fetched from it: what PBS
+// sees when the primary fails over and binlog_server is pointed at the new
+// primary (a restart with another connection.port).
+//
+// The README does not describe a change of source. Rewrite mode exists for
+// storages whose layout does not follow the source's, so there the storage
+// has to continue. In plain GTID mode the stored binlogs are copies of the
+// source's files, which the new primary does not have: PBS may continue
+// correctly or refuse, but must not damage the storage.
+//
+// A lagging replica (it lacks the storage's last transactions) is accepted
+// by MySQL as well: a source refuses a replica's GTID set only for GTIDs
+// with its own server_uuid. So there too PBS may continue or refuse.
+// Continuing means: the storage holds what it held plus the new primary's
+// transactions, each once.
+
+namespace {
+
+// a copy of the storage's configuration that connects to another port
+std::string config_for_port(const pbs_storage &storage, std::uint16_t port) {
+  auto config{json::parse(read_file(storage.config_path)).as_object()};
+  config["connection"].as_object()["port"] = unsigned{port};
+  const auto path{(storage.directory.path() /
+                   ("config-port-" + std::to_string(port) + ".json"))
+                      .string()};
+  std::ofstream{path} << json::serialize(config);
+  return path;
+}
+
+std::uint16_t replica_port() {
+  const auto port{pbt::detail::env("PBT_MYSQL_REPLICA_PORT")};
+  if (!port) {
+    pbt::infrastructure_error("replica server not configured: PBT_MYSQL_REPLICA_PORT");
+  }
+  return static_cast<std::uint16_t>(std::stoul(*port));
+}
+
+// the replica server replicating from the source with auto-positioning
+void start_gtid_replication(hegel::TestCase &tc, sql_connection &replica) {
+  const auto source{settings()};
+  const auto max_binlog_size{tc.draw(
+      "replica_max_binlog_size",
+      gs::sampled_from<std::uint64_t>({4096U, 16384U, 1073741824U}))};
+  pbt::note(tc, "replica of the source (auto-positioning), max_binlog_size " +
+                    std::to_string(max_binlog_size));
+  replica.exec("SET GLOBAL max_binlog_size = " + std::to_string(max_binlog_size));
+  replica.exec("CHANGE REPLICATION SOURCE TO SOURCE_HOST = '127.0.0.1', "
+               "SOURCE_PORT = " + std::to_string(source.port) +
+               ", SOURCE_USER = '" + source.user + "', SOURCE_PASSWORD = '" +
+               source.password + "', SOURCE_AUTO_POSITION = 1, "
+               "GET_SOURCE_PUBLIC_KEY = 1, SOURCE_CONNECT_RETRY = 1");
+  replica.exec("START REPLICA");
+}
+
+// waits until the replica has applied everything the source has
+void wait_for_replica(hegel::TestCase &tc, sql_connection &source,
+                      sql_connection &replica) {
+  const auto expected{server_executed(source)};
+  const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{30}};
+  for (;;) {
+    const auto status{replica.first_row_named("SHOW REPLICA STATUS")};
+    const auto io_error{field(status, "Last_IO_Error")};
+    const auto sql_error{field(status, "Last_SQL_Error")};
+    if (!io_error.empty() || !sql_error.empty()) {
+      pbt::infrastructure_error("the replica failed: " + io_error + sql_error);
+    }
+    if (server_executed(replica) == expected) {
+      return;
+    }
+    if (std::chrono::steady_clock::now() >= deadline) {
+      pbt::note(tc, "replica: " + server_executed(replica).str() +
+                        ", source: " + expected.str());
+      pbt::infrastructure_error("the replica did not catch up with the source in 30 s");
+    }
+    wait_ms(100U);
+  }
+}
+
+// the storage's list result as text (to see that it did not change)
+std::string listed_text(hegel::TestCase &tc, const pbs_storage &storage) {
+  return json::serialize(list(tc, storage).at("result"));
+}
+
+// the union of the stored binlogs' added_gtids
+gtids::gtid_set stored_gtids(hegel::TestCase &tc, const pbs_storage &storage) {
+  gtids::gtid_set result;
+  const auto response{list(tc, storage)};
+  for (const auto &value : response.at("result").as_array()) {
+    result += gtids::gtid_set{
+        std::string_view{value.as_object().at("added_gtids").as_string()}};
+  }
+  return result;
+}
+
+// runs fetch with another configuration file
+run_result fetch_with(const std::string &config_path) {
+  return run({"fetch", config_path});
+}
+
+// the storage holds every GTID of 'expected' exactly once: the binlogs are
+// well-formed, each one's previous_gtids is the union of the earlier ones'
+// added_gtids, no GTID is added twice, no GTID_LOG event appears twice
+void require_storage_holds_once(hegel::TestCase &tc, const pbs_storage &storage,
+                                const gtids::gtid_set &expected) {
+  const auto response{list(tc, storage)};
+  gtids::gtid_set stored;
+  std::vector<std::string> events;
+  for (const auto &value : response.at("result").as_array()) {
+    const auto &item{value.as_object()};
+    const std::string name{item.at("name").as_string()};
+    const auto walked{walk(storage.plaintext(name), "stored " + name)};
+    events.insert(events.end(), walked.untagged_gtids.begin(),
+                  walked.untagged_gtids.end());
+    pbt::require_equal(
+        gtids::gtid_set{std::string_view{item.at("previous_gtids").as_string()}},
+        stored, "list: previous_gtids of " + name);
+    const gtids::gtid_set added{std::string_view{item.at("added_gtids").as_string()}};
+    pbt::require_equal(added - stored, added,
+                       "list: " + name + " adds GTIDs an earlier binlog has");
+    stored += added;
+  }
+  pbt::require_equal(stored, expected,
+                     "stored GTIDs = the stored ones before plus the new primary's");
+  auto sorted{events};
+  std::ranges::sort(sorted);
+  const auto duplicate{std::ranges::adjacent_find(sorted)};
+  pbt::require(duplicate == sorted.end(),
+               "a transaction is stored twice: " +
+                   (duplicate == sorted.end() ? std::string{} : *duplicate));
+}
+
+enum class failover_kind : std::uint8_t { up_to_date, lagging };
+
+void failover(hegel::TestCase &tc, bool rewrite, failover_kind kind) {
+  server_session server;
+  start_case(tc, server);
+  replica_session replica;
+  start_gtid_replication(tc, replica.sql());
+  auto options{draw_options(tc, true)};
+  if (rewrite) {
+    // without checksum verification rewrite mode is PBT-022
+    // (RewriteModeWithoutChecksumVerificationMySQL)
+    options.verify_checksum = true;
+    options.rewrite_file_size =
+        tc.draw("file_size", gs::sampled_from<std::string>({"1K", "4K", "64K"}));
+  }
+  pbt::note(tc, "binlog_server: " + describe(options));
+  const auto storage{make_storage(options)};
+  const auto new_primary_config{config_for_port(*storage, replica_port())};
+
+  // the storage follows the source; the replica keeps up (or, lagging,
+  // stops before the last transactions the storage gets)
+  const auto rounds{tc.draw("rounds", gs::integers<std::size_t>(
+                                          {.min_value = 1U, .max_value = 3U}))};
+  for (std::size_t round{0U}; round < rounds; ++round) {
+    pbt::note(tc, "source round " + std::to_string(round + 1U) + ":");
+    auto workload{draw_workload(tc, server.info, 4U)};
+    workload.push_back(operation{.kind = op_kind::insert_rows, .count = 1});
+    apply_all(tc, server.sql, workload);
+    wait_for_replica(tc, server.sql, replica.sql());
+    fetch(tc, *storage);
+  }
+  if (kind == failover_kind::lagging) {
+    pbt::note(tc, "the replica stops; the source writes more, the storage gets it:");
+    replica.sql().exec("STOP REPLICA");
+    apply_all(tc, server.sql,
+              {operation{.kind = op_kind::insert_rows, .count = 1}});
+    fetch(tc, *storage);
+  } else if (tc.draw("source_ahead_of_storage", gs::booleans())) {
+    pbt::note(tc, "the source writes more, the replica gets it, the storage not:");
+    apply_all(tc, server.sql, draw_workload(tc, server.info, 3U));
+    wait_for_replica(tc, server.sql, replica.sql());
+  }
+
+  pbt::note(tc, "failover: the replica becomes the primary; its workload:");
+  replica.sql().exec("STOP REPLICA");
+  replica.sql().exec("RESET REPLICA ALL");
+  server_info replica_info{inspect(replica.sql())};
+  apply_all(tc, replica.sql(), draw_workload(tc, replica_info, 4U));
+  const auto before{listed_text(tc, *storage)};
+  const auto stored_before{stored_gtids(tc, *storage)};
+  const auto result{fetch_with(new_primary_config)};
+  pbt::note(tc, "fetch from the new primary: " + result.describe());
+  if (result.signaled || (rewrite && kind == failover_kind::up_to_date &&
+                          result.exit_code != 0)) {
+    pbt::note(tc, "binlog_server log:" + log_tail(*storage));
+  }
+  pbt::require(!result.signaled,
+               "fetch from the new primary crashed (" + result.describe() + ")");
+  if (rewrite && kind == failover_kind::up_to_date) {
+    pbt::require(result.exit_code == 0, "rewrite mode: fetch from the new primary failed (" +
+                                            result.describe() + ")");
+  }
+  if (result.exit_code == 0) {
+    auto expected{stored_before};
+    expected += server_executed(replica.sql());
+    require_storage_holds_once(tc, *storage, expected);
+  } else {
+    pbt::note(tc, "(refused)");
+    const auto after{listed_text(tc, *storage)};
+    if (after != before) {
+      pbt::note(tc, "list before: " + before);
+      pbt::note(tc, "list after:  " + after);
+      pbt::note(tc, "binlog_server log:" + log_tail(*storage));
+    }
+    pbt::require(after == before, "the refused fetch left the storage as it was");
+  }
+}
+
+} // namespace
+
+BOOST_AUTO_TEST_CASE(FailoverRewriteModeContinuesMySQL) {
+  pbt::check([](hegel::TestCase &tc) {
+               failover(tc, true, failover_kind::up_to_date);
+             },
+             {.test_cases = 30U, .slow = true});
+}
+
+BOOST_AUTO_TEST_CASE(FailoverGtidModeIsCorrectOrRefusedMySQL) {
+  pbt::check([](hegel::TestCase &tc) {
+               failover(tc, false, failover_kind::up_to_date);
+             },
+             {.test_cases = 40U, .slow = true});
+}
+
+BOOST_AUTO_TEST_CASE(FailoverToLaggingReplicaIsCorrectOrRefusedMySQL) {
+  pbt::check([](hegel::TestCase &tc) {
+               failover(tc, tc.draw("rewrite", gs::booleans()), failover_kind::lagging);
+             },
+             {.test_cases = 20U, .slow = true});
+}
