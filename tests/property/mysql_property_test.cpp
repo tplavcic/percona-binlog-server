@@ -862,6 +862,11 @@ s3_location s3_location_for(const std::string &prefix,
           *filer + "/buckets/" + *bucket + "/" + prefix};
 }
 
+// properties without "S3" in their name draw the S3 backend only when an
+// endpoint is configured (run_property_tests.py starts SeaweedFS only for
+// properties named *S3*, and not at all with --s3 off)
+bool s3_available() { return pbt::detail::env("PBT_S3_ENDPOINT").has_value(); }
+
 struct pbs_storage {
   temporary_directory directory{"pbs-pbt-mysql"};
   pbs_options options;
@@ -1386,6 +1391,9 @@ std::string first_difference(const std::string &expected,
 struct tolerances {
   bool pbt_020{true};
   bool pbt_033{true};
+  // the storage was purged (purge_binlogs): the server's binlogs before the
+  // first stored one are not expected in it
+  bool storage_purged{false};
 };
 
 // the storage holds exactly the server's binlogs, byte for byte, and 'list'
@@ -1427,6 +1435,12 @@ void require_storage_matches_server(
       pbt::note(tc, "(" + binlog.name + " has no transaction and was not sent "
               "by the server: GTID auto-positioning)");
       return true;
+    });
+  }
+  if (tolerate.storage_purged && !stored_items.empty()) {
+    const std::string first{stored_items.front().at("name").as_string()};
+    std::erase_if(binlogs, [&first](const server_binlog &binlog) {
+      return binlog.name < first;
     });
   }
   const auto &stored{stored_items};
@@ -3703,7 +3717,7 @@ BOOST_AUTO_TEST_CASE(DiskFullLeavesStorageConsistentMySQL) {
         server_session server;
         start_case(tc, server);
         auto options{draw_options(tc)};
-        options.s3 = tc.draw("s3", gs::integers<int>({.min_value = 0, .max_value = 3})) == 0;
+        options.s3 = (tc.draw("s3", gs::integers<int>({.min_value = 0, .max_value = 3})) == 0) && s3_available();
         pbt::note(tc, "binlog_server: " + describe(options));
         const auto storage{make_storage(options)};
         const auto rounds{tc.draw(
@@ -3756,7 +3770,7 @@ BOOST_AUTO_TEST_CASE(DiskFullFetchSucceedsOnlyWhenCompleteMySQL) {
         server_session server;
         start_case(tc, server);
         auto options{draw_options(tc)};
-        options.s3 = tc.draw("s3", gs::integers<int>({.min_value = 0, .max_value = 3})) == 0;
+        options.s3 = (tc.draw("s3", gs::integers<int>({.min_value = 0, .max_value = 3})) == 0) && s3_available();
         pbt::note(tc, "binlog_server: " + describe(options));
         const auto storage{make_storage(options)};
         if (tc.draw("fetch_with_space_first", gs::booleans())) {
@@ -3803,7 +3817,7 @@ BOOST_AUTO_TEST_CASE(DiskFullStopsPullMySQL) {
         options.checkpoint_size = checkpointing ? std::optional<std::string>{"1"}
                                                 : std::nullopt;
         options.checkpoint_interval.reset();
-        options.s3 = tc.draw("s3", gs::integers<int>({.min_value = 0, .max_value = 3})) == 0;
+        options.s3 = (tc.draw("s3", gs::integers<int>({.min_value = 0, .max_value = 3})) == 0) && s3_available();
         pbt::note(tc, "binlog_server: " + describe(options));
         const auto storage{make_storage(options)};
         pbt::note(tc, "workload before pull:");
@@ -4133,12 +4147,14 @@ void require_storage_holds_once(hegel::TestCase &tc, const pbs_storage &storage,
 
 enum class failover_kind : std::uint8_t { up_to_date, lagging };
 
-void failover(hegel::TestCase &tc, bool rewrite, failover_kind kind) {
+// position_mode: a position-mode storage (no rewrite)
+void failover(hegel::TestCase &tc, bool rewrite, failover_kind kind,
+              bool position_mode = false) {
   server_session server;
   start_case(tc, server);
   replica_session replica;
   start_gtid_replication(tc, replica.sql());
-  auto options{draw_options(tc, true)};
+  auto options{draw_options(tc, !position_mode)};
   if (rewrite) {
     // without checksum verification rewrite mode is PBT-022
     // (RewriteModeWithoutChecksumVerificationMySQL)
@@ -4180,7 +4196,9 @@ void failover(hegel::TestCase &tc, bool rewrite, failover_kind kind) {
   server_info replica_info{inspect(replica.sql())};
   apply_all(tc, replica.sql(), draw_workload(tc, replica_info, 4U));
   const auto before{listed_text(tc, *storage)};
-  const auto stored_before{stored_gtids(tc, *storage)};
+  // position mode: list has no GTIDs
+  const auto stored_before{position_mode ? gtids::gtid_set{}
+                                         : stored_gtids(tc, *storage)};
   const auto result{fetch_with(new_primary_config)};
   pbt::note(tc, "fetch from the new primary: " + result.describe());
   if (result.signaled || (rewrite && kind == failover_kind::up_to_date &&
@@ -4189,6 +4207,21 @@ void failover(hegel::TestCase &tc, bool rewrite, failover_kind kind) {
   }
   pbt::require(!result.signaled,
                "fetch from the new primary crashed (" + result.describe() + ")");
+  if (position_mode) {
+    // the stored binlog name / position is a place in the old source's
+    // files: on another server it means nothing, so following it would
+    // splice unrelated data into the storage
+    const auto after{listed_text(tc, *storage)};
+    if (result.exit_code == 0 || after != before) {
+      pbt::note(tc, "list before: " + before);
+      pbt::note(tc, "list after:  " + after);
+      pbt::note(tc, "binlog_server log:" + log_tail(*storage));
+    }
+    pbt::require(result.exit_code != 0,
+                 "a position-mode storage followed a failover to another server");
+    pbt::require(after == before, "the refused fetch left the storage as it was");
+    return;
+  }
   if (rewrite && kind == failover_kind::up_to_date) {
     pbt::require(result.exit_code == 0, "rewrite mode: fetch from the new primary failed (" +
                                             result.describe() + ")");
@@ -4230,4 +4263,345 @@ BOOST_AUTO_TEST_CASE(FailoverToLaggingReplicaIsCorrectOrRefusedMySQL) {
                failover(tc, tc.draw("rewrite", gs::booleans()), failover_kind::lagging);
              },
              {.test_cases = 20U, .slow = true});
+}
+
+// ===========================================================================
+// D20: recovery after an interrupted operation (README "Storage consistency
+// checks", upstream PBS-59)
+// ===========================================================================
+
+// README: binlog.index defines the set of binlog files. Objects left by an
+// interrupted operation are garbage and removed when the storage is opened
+// by fetch / pull / purge_binlogs: the binlog file (and its metadata) that
+// follows the last indexed one (interrupted rotation), binlog files with
+// the same base name as the first indexed one and a smaller sequence number
+// (interrupted purge), a single binlog file without binlog.index
+// (interrupted creation of the first binlog), *.tmp objects. Any other
+// unindexed object makes the storage inconsistent: the operation fails and
+// nothing is removed.
+
+namespace {
+
+std::vector<std::string> listed_names(hegel::TestCase &tc, const pbs_storage &storage) {
+  std::vector<std::string> result;
+  const auto response{list(tc, storage)};
+  for (const auto &item : response.at("result").as_array()) {
+    result.emplace_back(item.as_object().at("name").as_string());
+  }
+  return result;
+}
+
+std::string joined(const std::vector<std::string> &names) {
+  std::string result;
+  for (const auto &name : names) {
+    result += name + " ";
+  }
+  return result;
+}
+
+// the objects of a file storage (name and size), sorted
+std::vector<std::string> vault_objects(const pbs_storage &storage) {
+  std::vector<std::string> result;
+  for (const auto &entry : fs::directory_iterator{storage.vault()}) {
+    result.push_back(entry.path().filename().string() + "(" +
+                     std::to_string(entry.is_regular_file() ? entry.file_size() : 0U) + ")");
+  }
+  std::ranges::sort(result);
+  return result;
+}
+
+// a file storage holds exactly metadata.json, binlog.index and the listed
+// binlogs with their metadata: no garbage left behind
+void require_no_leftovers(hegel::TestCase &tc, const pbs_storage &storage) {
+  if (storage.options.s3) {
+    return;
+  }
+  std::vector<std::string> expected{"binlog.index", "metadata.json"};
+  for (const auto &name : listed_names(tc, storage)) {
+    expected.push_back(name);
+    expected.push_back(name + ".json");
+  }
+  std::ranges::sort(expected);
+  std::vector<std::string> actual;
+  for (const auto &entry : fs::directory_iterator{storage.vault()}) {
+    actual.push_back(entry.path().filename().string());
+  }
+  std::ranges::sort(actual);
+  pbt::require_equal(joined(actual), joined(expected),
+                     "storage objects: the indexed binlogs and nothing else");
+}
+
+std::string binlog_name(std::uint64_t sequence) {
+  auto text{std::to_string(sequence)};
+  text.insert(0U, text.size() < 6U ? 6U - text.size() : 0U, '0');
+  return "binlog." + text;
+}
+
+std::uint64_t sequence_of(const std::string &name) {
+  return std::stoull(name.substr(name.rfind('.') + 1U));
+}
+
+// how long binlog_server takes to start and exit ('version', the fastest
+// of three runs), measured once per test process: kill delays are drawn
+// around it, so that they hit an operation's work, also in slow (ASan)
+// builds
+std::uint64_t startup_ms() {
+  static const std::uint64_t value{[]() {
+    std::uint64_t best{1000U};
+    for (int i{0}; i < 3; ++i) {
+      const auto start{std::chrono::steady_clock::now()};
+      std::ignore = run({"version"});
+      const auto elapsed{std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - start)};
+      best = std::min(best, static_cast<std::uint64_t>(elapsed.count()));
+    }
+    return best;
+  }()};
+  return value;
+}
+
+// a workload that leaves at least three binlogs
+void apply_multi_binlog_workload(hegel::TestCase &tc, server_session &server) {
+  auto workload{draw_workload(tc, server.info, 5U)};
+  for (int i{0}; i < 2; ++i) {
+    workload.push_back(operation{.kind = op_kind::insert_rows, .count = 1});
+    workload.push_back(operation{.kind = op_kind::flush});
+  }
+  workload.push_back(operation{.kind = op_kind::insert_rows, .count = 1});
+  apply_all(tc, server.sql, workload);
+}
+
+} // namespace
+
+// purge_binlogs interrupted (kill -9 at a random moment, or a full disk):
+// the next fetch opens the storage; it then holds either all binlogs (the
+// purge did not commit) or all but the purged ones (it committed) - nothing
+// in between - matching the server, without leftover objects; a purge that
+// reported success has committed; the storage keeps working.
+BOOST_AUTO_TEST_CASE(InterruptedPurgeIsRecoveredMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        start_case(tc, server);
+        auto options{draw_options(tc)};
+        options.s3 = (tc.draw("s3", gs::integers<int>({.min_value = 0, .max_value = 2})) == 0) && s3_available();
+        pbt::note(tc, "binlog_server: " + describe(options));
+        const auto storage{make_storage(options)};
+        pbt::note(tc, "workload:");
+        apply_multi_binlog_workload(tc, server);
+        fetch(tc, *storage);
+        const auto before{listed_names(tc, *storage)};
+        pbt::require(before.size() >= 2U, "the workload left several stored binlogs");
+        const auto target_index{tc.draw(
+            "target", gs::integers<std::size_t>({.max_value = before.size() - 2U}))};
+        const auto &target{before[target_index]};
+        const std::vector<std::string> after_commit(
+            before.begin() + static_cast<std::ptrdiff_t>(target_index) + 1, before.end());
+        bool reported_success{false};
+        if (tc.draw("disk_full", gs::booleans())) {
+          const auto limit{tc.draw("file_size_limit", gs::sampled_from<std::uint64_t>(
+                                                          {0U, 4U, 16U, 32U, 64U}))};
+          pbt::note(tc, "purge_binlogs " + target + " with at most " +
+                            std::to_string(limit) + " bytes per file");
+          const auto result{run({"purge_binlogs", storage->config_path, target}, limit)};
+          pbt::note(tc, "purge_binlogs: " + result.describe() + ", " + result.output);
+          pbt::require(!result.signaled, "purge_binlogs crashed (" + result.describe() + ")");
+          reported_success = result.exit_code == 0 &&
+                             result.output.find("\"status\":\"success\"") != std::string::npos;
+        } else {
+          // around the end of the startup: the purge itself takes a few ms
+          const auto offset{tc.draw("kill_offset_percent", gs::sampled_from<int>(
+                                                               {100, 110, 120, 130, 140, 150,
+                                                                160, 180, 200, 50, 0}))};
+          // an S3 purge spends most of its time like 'list' (SDK, listing):
+          // timed on this storage
+          std::uint64_t base{startup_ms()};
+          if (options.s3) {
+            const auto start{std::chrono::steady_clock::now()};
+            std::ignore = run({"list", storage->config_path});
+            base = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - start)
+                    .count());
+          }
+          const auto delay{base * static_cast<std::uint64_t>(offset) / 100U};
+          pbt::note(tc, "purge_binlogs " + target + ", kill -9 after " +
+                            std::to_string(delay) + " ms");
+          background_run purge{{"purge_binlogs", storage->config_path, target}};
+          wait_ms(delay);
+          purge.send(SIGKILL);
+          pbt::note(tc, "purge_binlogs: " + purge.wait().describe());
+        }
+        pbt::note(tc, "fetch (opens and repairs the storage)");
+        fetch(tc, *storage);
+        const auto after{listed_names(tc, *storage)};
+        pbt::note(tc, "binlogs before: " + joined(before) + "; after: " + joined(after));
+        pbt::require(after == before || after == after_commit,
+                     "after an interrupted purge the storage holds all binlogs or "
+                     "all but the purged ones");
+        if (reported_success) {
+          pbt::require(after == after_commit,
+                       "purge_binlogs reported success but the binlogs are still there");
+        }
+        require_storage_matches_server(tc, server.sql, server.info, *storage,
+                                       {.storage_purged = true});
+        require_no_leftovers(tc, *storage);
+        pbt::note(tc, "more workload, fetch:");
+        apply_all(tc, server.sql, draw_workload(tc, server.info, 3U));
+        fetch(tc, *storage);
+        require_storage_matches_server(tc, server.sql, server.info, *storage,
+                                       {.storage_purged = true});
+      },
+      {.test_cases = 40U, .slow = true});
+}
+
+// fetch into an empty storage killed (kill -9) early, possibly several
+// times: the next fetch repairs the storage (an interrupted creation of the
+// first binlog) and the storage matches the server, without leftovers.
+BOOST_AUTO_TEST_CASE(KilledFirstFetchIsRecoveredMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        start_case(tc, server);
+        auto options{draw_options(tc)};
+        options.s3 = (tc.draw("s3", gs::booleans())) && s3_available();
+        pbt::note(tc, "binlog_server: " + describe(options));
+        const auto storage{make_storage(options)};
+        pbt::note(tc, "workload:");
+        auto workload{draw_workload(tc, server.info, 6U)};
+        workload.push_back(operation{.kind = op_kind::insert_rows, .count = 1});
+        apply_all(tc, server.sql, workload);
+        const auto kills{tc.draw("kills", gs::integers<std::size_t>(
+                                              {.min_value = 1U, .max_value = 3U}))};
+        for (std::size_t kill{0U}; kill < kills; ++kill) {
+          const auto delay{tc.draw("kill_after_ms", gs::sampled_from<std::uint64_t>(
+                                                        {0U, 2U, 5U, 10U, 20U, 40U, 80U, 150U}))};
+          background_run killed{{"fetch", storage->config_path}};
+          wait_ms(delay);
+          killed.send(SIGKILL);
+          const auto result{killed.wait()};
+          pbt::note(tc, "fetch, kill -9 after " + std::to_string(delay) + " ms: " +
+                            result.describe() +
+                            (storage->options.s3 ? std::string{}
+                                                 : "; storage: " + joined(vault_objects(*storage))));
+        }
+        pbt::note(tc, "fetch (opens and repairs the storage)");
+        fetch(tc, *storage);
+        require_storage_matches_server(tc, server.sql, server.info, *storage);
+        require_no_leftovers(tc, *storage);
+      },
+      {.test_cases = 40U, .slow = true});
+}
+
+// An object the storage does not index (file backend): one of the
+// README's garbage objects is removed and fetch continues; any other object
+// makes fetch fail and nothing is removed; without it, fetch works again.
+// 'list' (read-only) works either way.
+BOOST_AUTO_TEST_CASE(UnindexedObjectsFollowTheRulesMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        start_case(tc, server);
+        auto options{draw_options(tc)};
+        pbt::note(tc, "binlog_server: " + describe(options));
+        const auto storage{make_storage(options)};
+        pbt::note(tc, "workload:");
+        apply_multi_binlog_workload(tc, server);
+        fetch(tc, *storage);
+        if (tc.draw("purge_first", gs::booleans())) {
+          // the first binlog then has a predecessor that an interrupted
+          // purge could leave behind
+          const auto stored{listed_names(tc, *storage)};
+          pbt::note(tc, "purge_binlogs " + stored.front());
+          const auto purged{run({"purge_binlogs", storage->config_path, stored.front()})};
+          pbt::require(!purged.signaled && purged.exit_code == 0,
+                       "purge_binlogs failed (" + purged.describe() + "): " + purged.output);
+        }
+        const auto names{listed_names(tc, *storage)};
+        const auto first{sequence_of(names.front())};
+        const auto last{sequence_of(names.back())};
+        std::vector<std::string> kinds{"next_binlog", "next_binlog_with_metadata",
+                                       "gap_binlog", "next_metadata_only",
+                                       "foreign_file", "other_base_name",
+                                       "binlog_bak"};
+        if (first > 1U) {
+          // the interrupted-purge garbage: as likely as the rest together
+          kinds.insert(kinds.end(), kinds.size(), "older_binlog");
+        }
+        const auto kind{tc.draw("unindexed", gs::sampled_from(kinds))};
+        const bool garbage{kind == "next_binlog" || kind == "next_binlog_with_metadata" ||
+                           kind == "older_binlog"};
+        std::vector<std::string> objects;
+        if (kind == "next_binlog" || kind == "next_binlog_with_metadata") {
+          objects.push_back(binlog_name(last + 1U));
+          if (kind == "next_binlog_with_metadata") {
+            objects.push_back(binlog_name(last + 1U) + ".json");
+          }
+        } else if (kind == "older_binlog") {
+          objects.push_back(binlog_name(first - 1U));
+          objects.push_back(binlog_name(first - 1U) + ".json");
+        } else if (kind == "gap_binlog") {
+          objects.push_back(binlog_name(last + 2U));
+        } else if (kind == "next_metadata_only") {
+          objects.push_back(binlog_name(last + 1U) + ".json");
+        } else if (kind == "foreign_file") {
+          objects.emplace_back("notes.txt");
+        } else if (kind == "other_base_name") {
+          objects.emplace_back("other.000001");
+        } else {
+          objects.push_back(names.back() + ".bak");
+        }
+        const auto content{tc.draw("content", gs::sampled_from<std::string>(
+                                                  {"", std::string{"\xFE" "bin"}, "garbage"}))};
+        for (const auto &object : objects) {
+          std::ofstream{storage->vault() / object, std::ios::binary} << content;
+        }
+        pbt::note(tc, "unindexed object(s) (" + kind + "): " + joined(objects) +
+                          "with " + std::to_string(content.size()) + " byte(s)");
+        const auto before{vault_objects(*storage)};
+        const auto listed{run({"list", storage->config_path})};
+        pbt::require(!listed.signaled && listed.exit_code == 0,
+                     "list (read-only) failed with an unindexed object (" +
+                         listed.describe() + ")");
+        pbt::note(tc, "more workload:");
+        apply_all(tc, server.sql, draw_workload(tc, server.info, 3U));
+        const auto result{run({"fetch", storage->config_path})};
+        pbt::note(tc, "fetch: " + result.describe());
+        pbt::require(!result.signaled, "fetch crashed (" + result.describe() + ")");
+        if (garbage) {
+          if (result.exit_code != 0) {
+            pbt::note(tc, "binlog_server log:" + log_tail(*storage));
+          }
+          pbt::require(result.exit_code == 0,
+                       "fetch did not remove a garbage object (README) and continue");
+          require_storage_matches_server(tc, server.sql, server.info, *storage,
+                                       {.storage_purged = true});
+          require_no_leftovers(tc, *storage);
+          return;
+        }
+        pbt::require(result.exit_code != 0,
+                     "fetch accepted a storage with an unindexed object that is "
+                     "not garbage (README: inconsistent)");
+        pbt::require_equal(joined(vault_objects(*storage)), joined(before),
+                           "nothing removed from an inconsistent storage");
+        for (const auto &object : objects) {
+          fs::remove(storage->vault() / object);
+        }
+        pbt::note(tc, "without the object: fetch");
+        fetch(tc, *storage);
+        require_storage_matches_server(tc, server.sql, server.info, *storage,
+                                       {.storage_purged = true});
+        require_no_leftovers(tc, *storage);
+      },
+      {.test_cases = 40U, .slow = true});
+}
+
+// A position-mode storage cannot follow a failover: the stored binlog name
+// and position are a place in the old source's files. Pointed at the new
+// primary, fetch must refuse and leave the storage as it was.
+BOOST_AUTO_TEST_CASE(FailoverPositionModeIsRefusedMySQL) {
+  pbt::check([](hegel::TestCase &tc) {
+               failover(tc, false, failover_kind::up_to_date, true);
+             },
+             {.test_cases = 30U, .slow = true});
 }
