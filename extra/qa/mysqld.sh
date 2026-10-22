@@ -136,6 +136,10 @@ start() {
   fi
   pbt_require_in_workdir "${MYSQLD_DIR}"
   mkdir -p "${run_dir}" "${tmp_dir}"
+  # not running: a socket / lock file left by a killed server is stale (the
+  # PID in the lock file may belong to another process after a reboot, and
+  # mysqld then refuses to start: "Unable to setup unix socket lock file")
+  rm -f "${socket}" "${socket}.lock"
   local -a options
   mapfile -t options < <(server_options "${mysqld}")
   if [[ ! -d "${data_dir}/mysql" ]]; then
