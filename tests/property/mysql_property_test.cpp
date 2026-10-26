@@ -2550,6 +2550,8 @@ public:
         }()} {
     sql_.exec("STOP REPLICA");
     sql_.exec("RESET REPLICA ALL");
+    // the default (D21 lowers it)
+    sql_.exec("SET GLOBAL replica_net_timeout = 60");
     server_info info{inspect(sql_)};
     set_gtid_mode(sql_, info, gtid_mode);
     sql_.exec(info.reset_statement());
@@ -4666,4 +4668,640 @@ BOOST_AUTO_TEST_CASE(FailoverPositionModeIsRefusedMySQL) {
                failover(tc, false, failover_kind::up_to_date, true);
              },
              {.test_cases = 30U, .slow = true});
+}
+
+// ===========================================================================
+// D21: live clients of the replication source listener
+// ===========================================================================
+//
+// Downstream clients follow 'pull' while it collects: blocking binlog dumps
+// (libmysqlclient MYSQL_RPL, COM_BINLOG_DUMP without the non-blocking flag,
+// like a replica's I/O thread) and optionally a real MySQL replica, each
+// through its own TCP proxy in the test. During the workload clients join
+// at random points (an empty binlog name = the first binlog, the first
+// binlog, any stored event, the end of the newest binlog), their
+// connections are cut (closed, or cut after a few bytes: inside an event),
+// 'pull' is stopped or killed and restarted, and the stream idles for
+// longer than a client's read timeout (the listener sends no heartbeats).
+// A client reconnects after every error from the end of the last complete
+// event it received, as a replica does.
+//
+// Properties: every client keeps up with the storage while pull runs (it
+// reaches the end of what the storage held once pull caught up); pull stops
+// within 20 s on SIGTERM with clients connected; the storage matches the
+// server; at the end, the events each client received, across all its
+// sessions, are exactly the stored events from its start point on, in
+// order, without gaps or duplicates, byte for byte; a real replica reaches
+// the source's gtid_executed and table checksums.
+
+namespace {
+
+constexpr std::uint16_t artificial_event_flag{0x20U};
+
+struct received_event {
+  std::string file;
+  std::uint64_t offset{};
+  std::string bytes;
+};
+
+class live_dump_client {
+public:
+  live_dump_client(std::string name, std::string file, std::uint64_t position)
+      : name_{std::move(name)}, proxy_{listener_port()}, start_file_{file},
+        start_position_{position}, resume_file_{std::move(file)},
+        resume_position_{position} {
+    thread_ = std::thread{[this]() { run(); }};
+  }
+  live_dump_client(const live_dump_client &) = delete;
+  live_dump_client &operator=(const live_dump_client &) = delete;
+  live_dump_client(live_dump_client &&) = delete;
+  live_dump_client &operator=(live_dump_client &&) = delete;
+  ~live_dump_client() { stop(); }
+
+  void stop() {
+    stop_ = true;
+    proxy_.drop_connections();
+    if (thread_.joinable()) {
+      thread_.join();
+    }
+  }
+
+  [[nodiscard]] const std::string &name() const { return name_; }
+  [[nodiscard]] tcp_proxy &proxy() { return proxy_; }
+  [[nodiscard]] const std::string &start_file() const { return start_file_; }
+  [[nodiscard]] std::uint64_t start_position() const { return start_position_; }
+
+  [[nodiscard]] std::vector<received_event> events() const {
+    const std::scoped_lock lock{mutex_};
+    return events_;
+  }
+  // where the next session starts: the end of the last complete event
+  [[nodiscard]] std::pair<std::string, std::uint64_t> resume_point() const {
+    const std::scoped_lock lock{mutex_};
+    return {resume_file_, resume_position_};
+  }
+  [[nodiscard]] std::string state() const {
+    const std::scoped_lock lock{mutex_};
+    std::string text{name_ + ": " + std::to_string(sessions_) + " session(s), " +
+                     std::to_string(events_.size()) + " event(s), at " +
+                     (resume_file_.empty() ? std::string{"(no binlog yet)"}
+                                           : resume_file_) +
+                     ":" + std::to_string(resume_position_)};
+    if (!protocol_error_.empty()) {
+      text += "; protocol error: " + protocol_error_;
+    }
+    if (!last_error_.empty()) {
+      text += "; last session ended with: " + last_error_;
+    }
+    return text;
+  }
+  [[nodiscard]] std::string protocol_error() const {
+    const std::scoped_lock lock{mutex_};
+    return protocol_error_;
+  }
+
+private:
+  void run() {
+    ::mysql_thread_init();
+    while (!stop_) {
+      session();
+      for (int i{0}; i < 10 && !stop_; ++i) {
+        wait_ms(10U);
+      }
+    }
+    ::mysql_thread_end();
+  }
+
+  void session() {
+    MYSQL *handle{::mysql_init(nullptr)};
+    if (handle == nullptr) {
+      return;
+    }
+    // the read timeout ends a session that receives nothing for 3 s (no
+    // heartbeats): the client reconnects, like a replica after
+    // replica_net_timeout
+    const unsigned connect_timeout{3U};
+    const unsigned read_timeout{3U};
+    ::mysql_options(handle, MYSQL_OPT_CONNECT_TIMEOUT, &connect_timeout);
+    ::mysql_options(handle, MYSQL_OPT_READ_TIMEOUT, &read_timeout);
+    const bool get_public_key{true};
+    ::mysql_options(handle, MYSQL_OPT_GET_SERVER_PUBLIC_KEY, &get_public_key);
+    ::mysql_options(handle, MYSQL_DEFAULT_AUTH, "caching_sha2_password");
+    const auto end_session{[&](const std::string &what) {
+      const std::scoped_lock lock{mutex_};
+      last_error_ = what + ": " + ::mysql_error(handle);
+    }};
+    if (::mysql_real_connect(handle, "127.0.0.1", "replica", "replica-password",
+                             nullptr, proxy_.port(), nullptr, 0) == nullptr) {
+      end_session("connect");
+      ::mysql_close(handle);
+      return;
+    }
+    const std::string statement{
+        "SET @source_binlog_checksum = 'CRC32', @master_binlog_checksum = 'CRC32'"};
+    if (::mysql_real_query(handle, statement.data(), statement.size()) != 0) {
+      end_session("SET @source_binlog_checksum");
+      ::mysql_close(handle);
+      return;
+    }
+    std::string file;
+    std::uint64_t position{};
+    {
+      const std::scoped_lock lock{mutex_};
+      file = resume_file_;
+      position = resume_position_;
+      ++sessions_;
+    }
+    MYSQL_RPL rpl{.file_name_length = file.size(),
+                  .file_name = file.c_str(),
+                  .start_position = position,
+                  .server_id = 6262U,
+                  .flags = MYSQL_RPL_SKIP_HEARTBEAT,
+                  .gtid_set_encoded_size = 0U,
+                  .fix_gtid_set = nullptr,
+                  .gtid_set_arg = nullptr,
+                  .size = 0U,
+                  .buffer = nullptr};
+    if (::mysql_binlog_open(handle, &rpl) != 0) {
+      end_session("mysql_binlog_open");
+      ::mysql_close(handle);
+      return;
+    }
+    // the binlog the events belong to: named by the ROTATE at the start
+    std::string current;
+    while (!stop_) {
+      if (::mysql_binlog_fetch(handle, &rpl) != 0) {
+        end_session("mysql_binlog_fetch");
+        break;
+      }
+      if (rpl.size == 0U) {
+        end_session("end of a blocking dump");
+        break;
+      }
+      // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+      const auto *bytes{reinterpret_cast<const char *>(rpl.buffer)};
+      if (!record(current, std::string{bytes, rpl.size})) {
+        break;
+      }
+    }
+    ::mysql_binlog_close(handle, &rpl);
+    ::mysql_close(handle);
+  }
+
+  // false: a protocol error (the session ends; kept for the oracle)
+  bool record(std::string &current, const std::string &packet) {
+    const std::scoped_lock lock{mutex_};
+    const auto fail{[this](const std::string &what) {
+      if (protocol_error_.empty()) {
+        protocol_error_ = what;
+      }
+      return false;
+    }};
+    constexpr std::size_t header_size{19U};
+    if (packet.empty() || packet[0] != 0) {
+      return fail("event packet without the 0x00 prefix");
+    }
+    const auto event{packet.substr(1U)};
+    if (event.size() < header_size || le32(event, 9U) != event.size()) {
+      return fail("event size field " +
+                  (event.size() < header_size ? std::string{"missing"}
+                                              : std::to_string(le32(event, 9U))) +
+                  " for a " + std::to_string(event.size()) + " byte event");
+    }
+    const auto type{static_cast<std::uint8_t>(event[4])};
+    const auto log_pos{le32(event, 13U)};
+    const auto flags{static_cast<std::uint16_t>(
+        static_cast<unsigned>(static_cast<unsigned char>(event[17])) |
+        (static_cast<unsigned>(static_cast<unsigned char>(event[18])) << 8U))};
+    const bool artificial{log_pos == 0U || (flags & artificial_event_flag) != 0U};
+    std::string rotate_to;
+    std::uint64_t rotate_position{};
+    if (type == rotate_event) {
+      // post header: position (8); body: the name; CRC32 footer (the
+      // session asked for CRC32)
+      if (event.size() < header_size + 8U + 4U + 1U) {
+        return fail("ROTATE event of " + std::to_string(event.size()) + " bytes");
+      }
+      for (std::size_t i{0U}; i < 8U; ++i) {
+        rotate_position |= static_cast<std::uint64_t>(
+                               static_cast<unsigned char>(event[header_size + i]))
+                           << (8U * i);
+      }
+      rotate_to = event.substr(header_size + 8U, event.size() - header_size - 8U - 4U);
+    }
+    if (artificial) {
+      if (type == rotate_event) {
+        current = rotate_to;
+        resume_file_ = rotate_to;
+        resume_position_ = rotate_position;
+      }
+      return true;  // the artificial FORMAT_DESCRIPTION after it: nothing to keep
+    }
+    if (current.empty()) {
+      return fail("an event (" + describe_event(event) +
+                  ") before the artificial ROTATE that names the binlog");
+    }
+    if (log_pos < event.size()) {
+      return fail("log_pos " + std::to_string(log_pos) + " before the end of a " +
+                  std::to_string(event.size()) + " byte event");
+    }
+    events_.push_back({current, log_pos - event.size(), event});
+    resume_file_ = current;
+    resume_position_ = log_pos;
+    if (type == rotate_event) {
+      // the next binlog follows (the listener starts it with an artificial
+      // ROTATE)
+      resume_file_ = rotate_to;
+      resume_position_ = rotate_position;
+    }
+    return true;
+  }
+
+  std::string name_;
+  tcp_proxy proxy_;
+  std::string start_file_;
+  std::uint64_t start_position_;
+  std::atomic<bool> stop_{false};
+  mutable std::mutex mutex_;
+  std::string resume_file_;
+  std::uint64_t resume_position_;
+  std::size_t sessions_{0U};
+  std::vector<received_event> events_;
+  std::string protocol_error_;
+  std::string last_error_;
+  std::thread thread_;
+};
+
+// list while pull writes: retried, 'list' can fail when it reads a binlog's
+// metadata while pull renames it (PBT-042)
+std::vector<std::pair<std::string, std::uint64_t>>
+listed_binlogs(hegel::TestCase &tc, const pbs_storage &storage) {
+  for (int attempt{0};; ++attempt) {
+    const auto result{run({"list", storage.config_path})};
+    try {
+      const auto parsed{json::parse(result.output).as_object()};
+      if (!result.signaled && result.exit_code == 0 &&
+          parsed.at("status").as_string() == "success") {
+        std::vector<std::pair<std::string, std::uint64_t>> binlogs;
+        for (const auto &item : parsed.at("result").as_array()) {
+          binlogs.emplace_back(std::string{item.at("name").as_string()},
+                               item.at("size").to_number<std::uint64_t>());
+        }
+        return binlogs;
+      }
+    } catch (const std::exception &) {
+    }
+    pbt::require(attempt < 5, "list failed 6 times in a row while pull ran: " +
+                                  result.output);
+    pbt::note(tc, "(list failed while pull ran, retried: PBT-042)");
+    wait_ms(50U);
+  }
+}
+
+// (binlog, position) order: binlog names share the base name and have
+// 6-digit sequence numbers
+bool at_or_after(const std::pair<std::string, std::uint64_t> &point,
+                 const std::pair<std::string, std::uint64_t> &target) {
+  return point.first != target.first ? point.first > target.first
+                                     : point.second >= target.second;
+}
+
+// waits until every client's resume point is at the end of 'binlogs' (the
+// newest one's size); false on timeout
+bool wait_for_clients(std::vector<std::unique_ptr<live_dump_client>> &clients,
+                      const std::vector<std::pair<std::string, std::uint64_t>> &binlogs,
+                      std::chrono::seconds timeout, pull_process &pull) {
+  if (binlogs.empty()) {
+    return true;
+  }
+  const auto deadline{std::chrono::steady_clock::now() + timeout};
+  for (;;) {
+    pull.require_running();
+    if (std::ranges::all_of(clients, [&binlogs](const auto &client) {
+          return !client->resume_point().first.empty() &&
+                 at_or_after(client->resume_point(), binlogs.back());
+        })) {
+      return true;
+    }
+    if (std::chrono::steady_clock::now() >= deadline) {
+      return false;
+    }
+    wait_ms(100U);
+  }
+}
+
+std::string table_checksums(sql_connection &sql) {
+  std::string result;
+  for (const auto &table : sql.query("SELECT table_name FROM information_schema.tables "
+                                     "WHERE table_schema = 'pbt' ORDER BY table_name")) {
+    const auto name{table.at(0).value_or("")};
+    result += name + "=" +
+              sql.query("CHECKSUM TABLE pbt." + name).at(0).at(1).value_or("NULL") + " ";
+  }
+  return result;
+}
+
+void live_clients_follow_pull(hegel::TestCase &tc, bool s3) {
+  server_session server;
+  start_case(tc, server);
+  auto options{draw_options(tc)};
+  options.s3 = s3;
+  // rewrite mode is not drawn by draw_options: the storage is a byte copy
+  pbt::note(tc, "binlog_server: " + describe(options));
+  const auto storage{make_storage(options)};
+
+  // a real replica needs a GTID-mode storage (the listener reports the
+  // storage's GTID_MODE; the replica runs with gtid_mode = ON)
+  std::unique_ptr<replica_session> replica;
+  std::unique_ptr<tcp_proxy> replica_proxy;
+  if (options.gtid_mode && tc.draw("replica", gs::booleans())) {
+    replica = std::make_unique<replica_session>();
+    replica_proxy = std::make_unique<tcp_proxy>(listener_port());
+  }
+
+  pull_process pull{tc, *storage};
+  pull.wait_until_listening();
+  std::vector<std::unique_ptr<live_dump_client>> clients;
+
+  const auto add_client{[&]() {
+    const auto start{tc.draw("client_start",
+                             gs::sampled_from<std::string>(
+                                 {"empty name", "first binlog", "stored event",
+                                  "end of the newest binlog"}))};
+    // the binlog and event are drawn as fractions: what the storage holds
+    // at this point depends on timing, the choices must not
+    const auto binlog_pick{tc.draw("client_binlog", gs::integers<std::size_t>(
+                                                        {.max_value = 999U}))};
+    const auto event_pick{tc.draw("client_event", gs::integers<std::size_t>(
+                                                      {.max_value = 999U}))};
+    std::string file;
+    std::uint64_t position{4U};
+    const auto binlogs{start == "empty name"
+                           ? std::vector<std::pair<std::string, std::uint64_t>>{}
+                           : listed_binlogs(tc, *storage)};
+    if (start == "first binlog" && !binlogs.empty()) {
+      file = binlogs.front().first;
+    } else if (start == "end of the newest binlog" && !binlogs.empty()) {
+      std::tie(file, position) = binlogs.back();
+      position = std::max<std::uint64_t>(position, 4U);
+    } else if (start == "stored event" && !binlogs.empty()) {
+      const auto &[name, size]{binlogs[binlog_pick * binlogs.size() / 1000U]};
+      file = name;
+      if (size > 4U) {
+        const auto walked{walk(storage->plaintext(name).substr(0U, size),
+                               "stored " + name)};
+        position = walked.offsets[event_pick * walked.offsets.size() / 1000U];
+      }
+    }
+    const auto client_name{"client " + std::to_string(clients.size() + 1U)};
+    pbt::note(tc, client_name + " joins at " +
+                      (file.empty() ? std::string{"''"} : file) + ":" +
+                      std::to_string(position) + " (" + start + ")");
+    clients.push_back(std::make_unique<live_dump_client>(client_name, file, position));
+  }};
+  add_client();
+
+  if (replica) {
+    const bool empty_name{tc.draw("replica_empty_name", gs::booleans())};
+    const auto net_timeout{tc.draw("replica_net_timeout",
+                                   gs::sampled_from<int>({60, 2}))};
+    pbt::note(tc, std::string{"MySQL replica joins at "} +
+                      (empty_name ? "'' (empty name)" : "the server's first binlog") +
+                      ", replica_net_timeout " + std::to_string(net_timeout));
+    replica->sql().exec("SET GLOBAL replica_net_timeout = " + std::to_string(net_timeout));
+    std::string source{"CHANGE REPLICATION SOURCE TO SOURCE_HOST = '127.0.0.1', "
+                       "SOURCE_PORT = " + std::to_string(replica_proxy->port()) +
+                       ", SOURCE_USER = 'replica', SOURCE_PASSWORD = "
+                       "'replica-password', GET_SOURCE_PUBLIC_KEY = 1, "
+                       "SOURCE_CONNECT_RETRY = 1, SOURCE_RETRY_COUNT = 100000"};
+    if (net_timeout < 60) {
+      source += ", SOURCE_HEARTBEAT_PERIOD = 1";
+    }
+    if (!empty_name) {
+      source += ", SOURCE_LOG_FILE = '" + server_binlogs(server.sql).front().name +
+                "', SOURCE_LOG_POS = 4";
+    }
+    replica->sql().exec(source);
+    replica->sql().exec("START REPLICA");
+  }
+
+  const auto steps{tc.draw("steps", gs::integers<std::size_t>({.min_value = 2U,
+                                                               .max_value = 9U}))};
+  for (std::size_t step{0U}; step < steps; ++step) {
+    const auto action{tc.draw(
+        "action", gs::sampled_from<std::string>({"workload", "workload", "workload",
+                                                 "new client", "cut", "pause",
+                                                 "restart pull"}))};
+    if (action == "workload") {
+      pbt::note(tc, "workload:");
+      apply_all(tc, server.sql, draw_workload(tc, server.info, 4U));
+    } else if (action == "new client") {
+      if (clients.size() < 4U) {
+        add_client();
+      }
+    } else if (action == "cut") {
+      const auto targets{clients.size() + (replica ? 1U : 0U)};
+      const auto target{tc.draw(
+          "cut_target", gs::integers<std::size_t>({.max_value = targets - 1U}))};
+      auto &proxy{target < clients.size() ? clients[target]->proxy() : *replica_proxy};
+      const auto who{target < clients.size() ? clients[target]->name()
+                                             : std::string{"the replica"}};
+      const auto after{tc.draw("cut_after", gs::sampled_from<std::int64_t>(
+                                                {-1, 0, 1, 7, 19, 100, 5000}))};
+      if (after < 0) {
+        pbt::note(tc, "close the connection of " + who);
+        proxy.drop_connections();
+      } else {
+        pbt::note(tc, "cut the connection of " + who + " after its next " +
+                          std::to_string(after) + " byte(s)");
+        proxy.cut_after(after);
+      }
+    } else if (action == "pause") {
+      const auto delay{tc.draw("pause_ms", gs::sampled_from<std::uint64_t>(
+                                               {200U, 1000U, 3500U}))};
+      pbt::note(tc, "no workload for " + std::to_string(delay) + " ms");
+      wait_ms(delay);
+    } else {
+      const bool kill{tc.draw("kill", gs::booleans())};
+      pbt::note(tc, kill ? "kill -9 pull and restart it"
+                         : "SIGTERM pull (clients connected) and restart it");
+      if (kill) {
+        pull.kill();
+      } else {
+        pull.stop();
+      }
+      pull.launch();
+      pull.wait_until_listening();
+    }
+  }
+
+  // the newest binlog ends with a transaction (PBT-020: a binlog without
+  // one may be stored as the magic only)
+  apply_all(tc, server.sql, {operation{.kind = op_kind::insert_rows, .count = 1}});
+  for (int attempt{0}; attempt < 3; ++attempt) {
+    const auto newest{server_binlogs(server.sql).back().name};
+    if (walk(server_file(server.info, newest), "server " + newest).transactions != 0U) {
+      break;
+    }
+    apply_all(tc, server.sql, {operation{.kind = op_kind::insert_rows, .count = 1}});
+  }
+
+  const auto report_clients{[&]() {
+    for (const auto &client : clients) {
+      pbt::note(tc, client->state());
+    }
+  }};
+  const auto note_if_stuck_on_magic_only{
+      [&](const std::vector<std::pair<std::string, std::uint64_t>> &binlogs) {
+        for (const auto &client : clients) {
+          const auto [file, position]{client->resume_point()};
+          const auto it{std::ranges::find(
+              binlogs, file, [](const auto &binlog) { return binlog.first; })};
+          if (it != binlogs.end() && it->second == 4U && std::next(it) != binlogs.end()) {
+            pbt::note(tc, "(" + client->name() + " is at " + file +
+                              ", stored as the 4-byte magic only (PBT-020) "
+                              "with newer binlogs after it)");
+          }
+        }
+      }};
+
+  // live: every client reaches the end of what the storage holds once pull
+  // has caught up, while pull runs
+  wait_until_pull_caught_up(tc, server.sql, pull);
+  {
+    const auto binlogs{listed_binlogs(tc, *storage)};
+    if (!wait_for_clients(clients, binlogs, std::chrono::seconds{20}, pull)) {
+      report_clients();
+      note_if_stuck_on_magic_only(binlogs);
+      pbt::note(tc, "binlog_server log:" + log_tail(*storage));
+      pbt::fail("a client of the listener did not reach the end of the storage "
+                "(" + binlogs.back().first + ":" +
+                std::to_string(binlogs.back().second) + ") in 20 s while pull ran");
+    }
+  }
+  pbt::note(tc, "SIGTERM pull (clients connected), compare the storage");
+  pull.stop();
+  require_storage_matches_server(tc, server.sql, server.info, *storage);
+
+  // pull again (nothing new to collect): the clients reach the end of the
+  // final storage
+  pull.launch();
+  pull.wait_until_listening();
+  const auto final_binlogs{listed_binlogs(tc, *storage)};
+  if (!wait_for_clients(clients, final_binlogs, std::chrono::seconds{30}, pull)) {
+    report_clients();
+    note_if_stuck_on_magic_only(final_binlogs);
+    pbt::note(tc, "binlog_server log:" + log_tail(*storage));
+    pbt::fail("a client of the listener did not reach the end of the final "
+              "storage in 30 s");
+  }
+  if (replica) {
+    const auto expected{server_executed(server.sql)};
+    const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{60}};
+    while (server_executed(replica->sql()) != expected) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        const auto status{replica->sql().first_row_named("SHOW REPLICA STATUS")};
+        for (const auto *column : {"Replica_IO_Running", "Replica_SQL_Running",
+                                   "Last_IO_Error", "Last_SQL_Error",
+                                   "Source_Log_File", "Read_Source_Log_Pos"}) {
+          pbt::note(tc, std::string{column} + ": " + field(status, column));
+        }
+        pbt::note(tc, "binlog_server log:" + log_tail(*storage));
+        pbt::fail("the replica did not reach the source's gtid_executed in 60 s");
+      }
+      pull.require_running();
+      wait_ms(200U);
+    }
+    pbt::require_equal(table_checksums(replica->sql()), table_checksums(server.sql),
+                       "CHECKSUM TABLE of the pbt tables on the replica and the source");
+  }
+  for (auto &client : clients) {
+    client->stop();
+  }
+  pull.stop();
+
+  // the events of every client: the stored events from its start point on
+  struct stored_event {
+    std::string file;
+    std::uint64_t offset;
+    std::uint64_t size;
+  };
+  std::vector<stored_event> stored_events;
+  std::vector<std::pair<std::string, std::string>> contents;
+  for (const auto &[name, size] : final_binlogs) {
+    contents.emplace_back(name, storage->plaintext(name));
+    if (size <= 4U) {
+      continue;
+    }
+    const auto walked{walk(contents.back().second, "stored " + name)};
+    for (std::size_t i{0U}; i < walked.offsets.size(); ++i) {
+      const auto end{i + 1U < walked.offsets.size() ? walked.offsets[i + 1U]
+                                                    : contents.back().second.size()};
+      stored_events.push_back({name, walked.offsets[i], end - walked.offsets[i]});
+    }
+  }
+  const auto content_of{[&contents](const std::string &name) -> const std::string & {
+    return std::ranges::find(contents, name, [](const auto &item) { return item.first; })
+        ->second;
+  }};
+  for (const auto &client : clients) {
+    pbt::require(client->protocol_error().empty(),
+                 client->name() + " received an invalid event packet: " +
+                     client->protocol_error());
+    // its start point: the first stored event at or after it
+    std::size_t first{0U};
+    if (!client->start_file().empty()) {
+      const std::pair<std::string, std::uint64_t> start{client->start_file(),
+                                                        client->start_position()};
+      while (first < stored_events.size() &&
+             !at_or_after({stored_events[first].file, stored_events[first].offset},
+                          start)) {
+        ++first;
+      }
+    }
+    const auto received{client->events()};
+    const auto expected_count{stored_events.size() - first};
+    const auto common{std::min(received.size(), expected_count)};
+    for (std::size_t i{0U}; i < common; ++i) {
+      const auto &want{stored_events[first + i]};
+      const auto &got{received[i]};
+      if (got.file != want.file || got.offset != want.offset) {
+        pbt::note(tc, client->state());
+        pbt::fail(client->name() + ": event " + std::to_string(i) + " received at " +
+                  got.file + ":" + std::to_string(got.offset) + " (" +
+                  describe_event(got.bytes) + "), expected the stored event at " +
+                  want.file + ":" + std::to_string(want.offset) +
+                  (got.file == want.file && got.offset > want.offset
+                       ? " (events skipped)"
+                       : got.file == want.file ? " (an event received twice)" : ""));
+      }
+      const auto stored{content_of(want.file).substr(want.offset, want.size)};
+      if (!same_event(stored, got.bytes)) {
+        pbt::note(tc, "stored " + describe_event(stored) + "; received " +
+                          describe_event(got.bytes) + "; " +
+                          first_difference(stored, got.bytes));
+        pbt::fail(client->name() + ": the event at " + want.file + ":" +
+                  std::to_string(want.offset) + " differs from the stored one");
+      }
+    }
+    if (received.size() != expected_count) {
+      pbt::note(tc, client->state());
+    }
+    pbt::require_equal(received.size(), expected_count,
+                       client->name() + ": number of events received (all "
+                                        "sessions) vs stored from its start point");
+  }
+}
+
+} // namespace
+
+BOOST_AUTO_TEST_CASE(LiveClientsFollowPullMySQL) {
+  pbt::check([](hegel::TestCase &tc) { live_clients_follow_pull(tc, false); },
+             {.test_cases = 20U, .slow = true});
+}
+
+// The same with the S3 storage backend (SeaweedFS).
+BOOST_AUTO_TEST_CASE(LiveClientsFollowPullOnS3MySQL) {
+  pbt::check([](hegel::TestCase &tc) { live_clients_follow_pull(tc, true); },
+             {.test_cases = 10U, .slow = true});
 }
