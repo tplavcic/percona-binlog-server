@@ -240,7 +240,7 @@ there is authoritative):
 | Severity | Issues |
 |---|---|
 | high | PBT-015, PBT-017, PBT-022, PBT-039, PBT-040 |
-| medium | PBT-001, PBT-002, PBT-004, PBT-012, PBT-013, PBT-016, PBT-019, PBT-029, PBT-030, PBT-031, PBT-032, PBT-033, PBT-035, PBT-036, PBT-037, PBT-041 |
+| medium | PBT-001, PBT-002, PBT-004, PBT-012, PBT-013, PBT-016, PBT-019, PBT-029, PBT-030, PBT-031, PBT-032, PBT-033, PBT-035, PBT-036, PBT-037, PBT-041, PBT-042 |
 | fixed | PBT-034 (upstream PBS-10), PBT-026 and PBT-038 (upstream PBS-59), PBT-025 (upstream PBS-29) |
 | low | PBT-003, PBT-005, PBT-006, PBT-007, PBT-008, PBT-009, PBT-010, PBT-011, PBT-014, PBT-018, PBT-020, PBT-021, PBT-023, PBT-024, PBT-027, PBT-028 |
 
@@ -631,7 +631,7 @@ Two new findings:
 ### Several processes on one storage (sandbox run)
 
 - [high] PBT-040: a second writer on the same storage corrupts it in every run (6 of 6 runs of 40 cases): an earlier binlog's metadata stuck at 4 bytes, an encrypted binlog's magic encrypted with the other process's key, or a storage the next start refuses. Both processes often exit with code 0. Timing-dependent, so Hegel reports it as flaky.
-- `list` while `pull` writes is consistent (no finding).
+- `list` while `pull` writes: consistent results, but about 1 in 5000 calls fails, because the file backend lists a `*.tmp` object that `pull` renames before `list` reads its size. That is PBT-042 (medium), first seen in QA run 20261026-124550.
 
 ### Failover (sandbox run)
 
