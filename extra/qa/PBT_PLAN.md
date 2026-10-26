@@ -241,8 +241,8 @@ there is authoritative):
 |---|---|
 | high | PBT-015, PBT-017, PBT-022, PBT-039, PBT-040 |
 | medium | PBT-001, PBT-002, PBT-004, PBT-012, PBT-013, PBT-016, PBT-019, PBT-029, PBT-030, PBT-031, PBT-032, PBT-033, PBT-035, PBT-036, PBT-037, PBT-041 |
-| fixed | PBT-034 (upstream PBS-10), PBT-026 and PBT-038 (upstream PBS-59) |
-| low | PBT-003, PBT-005, PBT-006, PBT-007, PBT-008, PBT-009, PBT-010, PBT-011, PBT-014, PBT-018, PBT-020, PBT-021, PBT-023, PBT-024, PBT-025, PBT-027, PBT-028 |
+| fixed | PBT-034 (upstream PBS-10), PBT-026 and PBT-038 (upstream PBS-59), PBT-025 (upstream PBS-29) |
+| low | PBT-003, PBT-005, PBT-006, PBT-007, PBT-008, PBT-009, PBT-010, PBT-011, PBT-014, PBT-018, PBT-020, PBT-021, PBT-023, PBT-024, PBT-027, PBT-028 |
 
 ### GTID sets (prototype run)
 
@@ -647,6 +647,12 @@ Upstream PBS-59 (9989a4a) recovers, at startup, the objects that an interrupted 
 ### Recovery after interrupted operations (sandbox run)
 
 No new finding. With the PBS-59 recovery, purges killed before or after the commit, and on a full disk, leave either all binlogs or all but the purged ones, with no leftovers. A fetch killed while it creates the first binlog is repaired; the states seen were no objects, only `metadata.json`, a `metadata.json.tmp`, and a binlog with `binlog.index.tmp`. Unindexed objects are handled as the README describes.
+
+### After the rebase onto PBS-29 part 1 (sandbox run)
+
+Upstream c31c880 changed two storage APIs: `fetch_event_block()` now returns a result type (full, truncated, EOF of an older binlog, EOF of the newest one) and throws for invalid requests, and `indexed_event_block`'s accessors were renamed. `storage_property_test` was adapted, and `FetchEventBlockFollowsContract` now models the new contract. The same commit fixed PBT-025: an event size below the common header is now rejected with an exception.
+
+PBT-041 now also shows up in `FailoverToLaggingReplicaIsCorrectOrRefusedMySQL`, in a worse form: the fetch from the lagging new primary reports success after appending an out-of-order binlog, `list` then reports an empty storage, and no later fetch works.
 
 ## 6. Open questions
 
