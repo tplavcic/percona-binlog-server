@@ -1054,6 +1054,58 @@ int run_curl(const std::string &arguments) {
   return std::system(command.c_str());
 }
 
+// the storage's objects with their sizes, for failure notes: the vault
+// directory, or the S3 prefix listed through the SeaweedFS filer
+std::string storage_objects_text(const pbs_storage &storage) {
+  std::string result;
+  if (!storage.s3) {
+    std::error_code error;
+    std::vector<std::string> names;
+    for (const auto &entry : fs::directory_iterator{storage.vault(), error}) {
+      names.push_back(entry.path().filename().string() + "(" +
+                      std::to_string(entry.is_regular_file() ? entry.file_size() : 0U) +
+                      ")");
+    }
+    std::ranges::sort(names);
+    for (const auto &name : names) {
+      result += name + " ";
+    }
+    return result;
+  }
+  const std::string command{"curl --silent --max-time 30 -H 'Accept: application/json' '" +
+                            storage.s3->filer + "/?limit=1000' 2>/dev/null"};
+  // NOLINTNEXTLINE(cert-env33-c)
+  FILE *pipe{::popen(command.c_str(), "r")};
+  if (pipe == nullptr) {
+    return "(cannot list the S3 prefix)";
+  }
+  std::string output;
+  std::array<char, 4096> chunk{};
+  while (const auto count{std::fread(chunk.data(), 1U, chunk.size(), pipe)}) {
+    output.append(chunk.data(), count);
+  }
+  ::pclose(pipe);
+  try {
+    const auto listing{json::parse(output).as_object()};
+    if (const auto *entries{listing.if_contains("Entries")};
+        entries != nullptr && entries->is_array()) {
+      for (const auto &entry : entries->as_array()) {
+        const auto &object{entry.as_object()};
+        std::string name{object.at("FullPath").as_string()};
+        name = name.substr(name.rfind('/') + 1U);
+        std::uint64_t size{0U};
+        if (const auto *size_value{object.if_contains("FileSize")}; size_value != nullptr) {
+          size = size_value->to_number<std::uint64_t>();
+        }
+        result += name + "(" + std::to_string(size) + ") ";
+      }
+    }
+  } catch (const std::exception &) {
+    return "(S3 listing: " + output.substr(0U, 300U) + ")";
+  }
+  return result.empty() ? std::string{"(no objects)"} : result;
+}
+
 std::string pbs_storage::stored(const std::string &name) const {
   if (!s3) {
     return read_file(vault() / name);
@@ -1508,6 +1560,9 @@ void require_storage_matches_server(
                     std::to_string(item.at("size").to_number<std::uint64_t>()) +
                     ") ";
   }
+  if (stored_names != server_names) {
+    pbt::note(tc, "storage objects: " + storage_objects_text(storage));
+  }
   pbt::require_equal(stored_names, server_names,
                      "list: the server's binlogs with their sizes");
 
@@ -1709,6 +1764,13 @@ private:
 // written only when pull stops, so the server's view is the only one.
 void wait_until_pull_caught_up(hegel::TestCase &tc, sql_connection &sql,
                                pull_process &pull) {
+  // a dump thread of a killed earlier pull (or of a connection a fault
+  // closed) can stay in "has sent all binlog" until the server writes
+  // again: end every dump thread first, so that only the one of the
+  // current pull's next connection counts (pull reconnects after
+  // idle_time, a network error for it)
+  kill_dump_threads(sql);
+  wait_ms(300U);
   const auto deadline{std::chrono::steady_clock::now() +
                       std::chrono::seconds{60}};
   const auto all_sent{[&sql]() {
