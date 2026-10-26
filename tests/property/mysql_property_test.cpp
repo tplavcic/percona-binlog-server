@@ -891,8 +891,12 @@ struct pbs_storage {
 };
 
 std::uint16_t listener_port() {
-  // replication_source listener of 'pull'; one per test process
-  return static_cast<std::uint16_t>(20000U + static_cast<unsigned>(::getpid()) % 20000U);
+  // replication_source listener of 'pull'; one per test process (D18's
+  // second process uses the next port). Below Linux's ephemeral port range
+  // (32768-60999 by default): a port in it can be in use by any outgoing
+  // connection on the host, and pull then fails with "bind: Address already
+  // in use"
+  return static_cast<std::uint16_t>(20000U + static_cast<unsigned>(::getpid()) % 12000U);
 }
 
 // one RSA key per test process for the listener (openssl genrsa)
@@ -2444,9 +2448,11 @@ BOOST_AUTO_TEST_CASE(ListenerServesServerEventsOnS3MySQL) {
 // "binlog truncated in the middle of event"), not with a dropped
 // connection and not with an empty, successful dump. A replica stops on
 // the error; on a lost connection it retries for ever.
-BOOST_AUTO_TEST_CASE(ListenerRejectsInvalidDumpRequestsMySQL) {
-  pbt::check(
-      [](hegel::TestCase &tc) {
+namespace {
+
+// answer: the error answer is checked (the process may have died: that is
+// ListenerSurvivesInvalidDumpRequestsMySQL); else only that pull survives
+void invalid_dump_request(hegel::TestCase &tc, bool answer) {
         server_session server;
         start_case(tc, server);
         const auto options{draw_options(tc)};
@@ -2504,8 +2510,15 @@ BOOST_AUTO_TEST_CASE(ListenerRejectsInvalidDumpRequestsMySQL) {
         pbt::note(tc, "listener: " + (served.error.empty() ? std::string{"no error"}
                                                           : served.error) +
                           ", " + std::to_string(served.events.size()) + " events");
-        pull.require_running();
-        pull.stop();
+        if (!answer) {
+          // a request ends at most its own session, never the process
+          // (and so the collection and every other client)
+          pull.require_running();
+          pull.stop();
+          return;
+        }
+        pull.send_term();
+        std::ignore = pull.wait_for_exit(std::chrono::seconds{20});
         // one requirement for both wrong answers (an empty, successful dump
         // or a dropped connection): which of the two a request inside an
         // event gets depends on timing
@@ -2513,8 +2526,20 @@ BOOST_AUTO_TEST_CASE(ListenerRejectsInvalidDumpRequestsMySQL) {
                          served.error.find("Lost connection") == std::string::npos,
                      "the listener did not answer an invalid dump request "
                      "with an error (" + request + ")");
-      },
-      {.test_cases = 30U, .slow = true});
+}
+
+} // namespace
+
+BOOST_AUTO_TEST_CASE(ListenerRejectsInvalidDumpRequestsMySQL) {
+  pbt::check([](hegel::TestCase &tc) { invalid_dump_request(tc, true); },
+             {.test_cases = 30U, .slow = true});
+}
+
+// The same requests never end the 'pull' process: an invalid request from
+// one client must not stop the collection and every other client.
+BOOST_AUTO_TEST_CASE(ListenerSurvivesInvalidDumpRequestsMySQL) {
+  pbt::check([](hegel::TestCase &tc) { invalid_dump_request(tc, false); },
+             {.test_cases = 30U, .slow = true});
 }
 
 // ===========================================================================
