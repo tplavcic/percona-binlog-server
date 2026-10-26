@@ -584,14 +584,20 @@ void check_reported_state(const binsrv::storage &storage,
 // what is persisted must be exactly the flushed data
 void check_fetched_binlog(const binsrv::storage &storage,
                           const model_file &file) {
-  auto name{file.name};
-  // length 0 for a file without events (offset == size would continue into
-  // the next file)
-  util::byte_range range{binsrv::events::magic_binlog_offset,
-                         file.flushed.size() -
-                             binsrv::events::magic_binlog_offset};
+  const auto name{file.name};
+  const util::byte_range range{binsrv::events::magic_binlog_offset,
+                               file.flushed.size() -
+                                   binsrv::events::magic_binlog_offset};
   util::dynamic_byte_buffer buffer;
-  pbt::require(storage.fetch_event_block(name, range, buffer),
+  const auto result{storage.fetch_event_block(name, range, buffer)};
+  // a binlog without events: the offset is its end, which is EOF (of the
+  // active binlog or of an older one)
+  const bool expected_result{
+      file.flushed.size() == binsrv::events::magic_binlog_offset
+          ? (result == binsrv::storage_fetch_result_type::active_file_eof ||
+             result == binsrv::storage_fetch_result_type::non_active_file_eof)
+          : result == binsrv::storage_fetch_result_type::success_full};
+  pbt::require(expected_result,
                "fetch_event_block() of a whole binlog succeeds");
   const bytes payload(file.flushed.begin() + 4, file.flushed.end());
   pbt::require_equal(hex(to_bytes(buffer)), hex(payload),
@@ -792,11 +798,12 @@ void run_storage_model(hegel::TestCase &tc, const storage_settings &base,
               "fetch_length",
               gs::integers<std::uint64_t>(
                   {.min_value = 1U, .max_value = file.flushed.size() - offset}))};
-          auto name{file.name};
-          util::byte_range range{offset, length};
+          const auto name{file.name};
+          const util::byte_range range{offset, length};
           util::dynamic_byte_buffer buffer;
-          pbt::require(storage->fetch_event_block(name, range, buffer),
-                       "fetch_event_block() of a range succeeds");
+          pbt::require(storage->fetch_event_block(name, range, buffer) ==
+                           binsrv::storage_fetch_result_type::success_full,
+                       "fetch_event_block() of a range succeeds (success_full)");
           const auto first{file.flushed.begin() +
                            static_cast<std::ptrdiff_t>(offset)};
           pbt::require_equal(
@@ -834,61 +841,83 @@ std::ostream &operator<<(std::ostream &output, const fetch_request &obj) {
   return output << "}";
 }
 
-struct fetch_result {
-  bool success{};
-  std::string name;
-  std::uint64_t offset{};
-  std::uint64_t length{};
-  bytes data;
+enum class fetch_outcome : std::uint8_t {
+  throws,
+  success_full,
+  success_truncated,
+  non_active_file_eof,
+  active_file_eof
 };
 
-// The contract documented in storage_core.hpp, applied to the model files.
+std::string to_string(fetch_outcome outcome) {
+  switch (outcome) {
+  case fetch_outcome::throws:
+    return "throws std::runtime_error";
+  case fetch_outcome::success_full:
+    return "success_full";
+  case fetch_outcome::success_truncated:
+    return "success_truncated";
+  case fetch_outcome::non_active_file_eof:
+    return "non_active_file_eof";
+  case fetch_outcome::active_file_eof:
+    return "active_file_eof";
+  }
+  return "?";
+}
+
+fetch_outcome to_outcome(binsrv::storage_fetch_result_type result) {
+  switch (result) {
+  case binsrv::storage_fetch_result_type::success_full:
+    return fetch_outcome::success_full;
+  case binsrv::storage_fetch_result_type::success_truncated:
+    return fetch_outcome::success_truncated;
+  case binsrv::storage_fetch_result_type::non_active_file_eof:
+    return fetch_outcome::non_active_file_eof;
+  case binsrv::storage_fetch_result_type::active_file_eof:
+    return fetch_outcome::active_file_eof;
+  }
+  return fetch_outcome::throws;
+}
+
+struct fetch_result {
+  fetch_outcome outcome{};
+  bytes data;  // the buffer afterwards (untouched when it throws)
+};
+
+// The contract documented in storage_core.hpp (fetch_event_block()),
+// applied to the model files: the name and range are not modified, a call
+// never reads across binlog files.
 fetch_result expected_fetch(const std::vector<model_file> &files,
                             const fetch_request &request) {
-  fetch_result unchanged{false, request.name, request.offset,
-                         request.length.value_or(0U), {}};
-  if (request.offset < binsrv::events::magic_binlog_offset) {
-    return unchanged;
+  const fetch_result throws{fetch_outcome::throws, {}};
+  if (request.name.empty() || !request.length ||
+      request.offset < binsrv::events::magic_binlog_offset) {
+    return throws;
   }
-  if (!request.length) {
-    return unchanged;
+  const auto found{std::ranges::find_if(files, [&](const model_file &file) {
+    return file.name.str() == request.name;
+  })};
+  if (found == files.end()) {
+    return throws;
   }
-  if (request.name.empty() &&
-      request.offset != binsrv::events::magic_binlog_offset) {
-    return unchanged;
+  const auto &file{*found};
+  const std::uint64_t size{file.flushed.size()};
+  if (request.offset > size) {
+    return throws;
   }
-  if (files.empty()) {
-    return {true, request.name, binsrv::events::magic_binlog_offset, 0U, {}};
-  }
-  std::size_t index{0U};
-  if (!request.name.empty()) {
-    const auto found{std::ranges::find_if(files, [&](const model_file &file) {
-      return file.name.str() == request.name;
-    })};
-    if (found == files.end()) {
-      return unchanged;
-    }
-    index = static_cast<std::size_t>(found - files.begin());
+  if (request.offset == size) {
+    // even for an empty range; the buffer is cleared
+    return {std::next(found) == files.end() ? fetch_outcome::active_file_eof
+                                            : fetch_outcome::non_active_file_eof,
+            {}};
   }
   if (*request.length == 0U) {
-    return {true, files[index].name.str(), request.offset, 0U, {}};
+    return {fetch_outcome::success_full, {}};
   }
-  auto offset{request.offset};
-  if (offset > files[index].flushed.size()) {
-    return unchanged;
-  }
-  if (offset == files[index].flushed.size()) {
-    ++index;
-    if (index == files.size()) {
-      return {true, request.name, offset, 0U, {}};
-    }
-    offset = binsrv::events::magic_binlog_offset;
-  }
-  const auto &file{files[index]};
-  const auto length{std::min<std::uint64_t>(*request.length,
-                                            file.flushed.size() - offset)};
-  const auto first{file.flushed.begin() + static_cast<std::ptrdiff_t>(offset)};
-  return {true, file.name.str(), offset, length,
+  const auto length{std::min<std::uint64_t>(*request.length, size - request.offset)};
+  const auto first{file.flushed.begin() + static_cast<std::ptrdiff_t>(request.offset)};
+  return {length == *request.length ? fetch_outcome::success_full
+                                    : fetch_outcome::success_truncated,
           bytes(first, first + static_cast<std::ptrdiff_t>(length))};
 }
 
@@ -898,8 +927,10 @@ fetch_result expected_fetch(const std::vector<model_file> &files,
 // search operations) follows the rules documented in storage_core.hpp for
 // every combination of binlog name (empty, existing, missing), offset
 // (before / inside / at / after the end of a file) and length (none, 0,
-// more than available), including continuing into the next file; on
-// failure the arguments are left untouched.
+// more than available): invalid requests throw std::runtime_error and leave
+// the buffer untouched; at the end of a binlog the result is EOF (of the
+// active binlog or of an older one); otherwise the result says whether the
+// whole range was read or it was truncated at the end of the binlog.
 BOOST_AUTO_TEST_CASE(FetchEventBlockFollowsContract) {
   pbt::check(
       [](hegel::TestCase &tc) {
@@ -951,28 +982,28 @@ BOOST_AUTO_TEST_CASE(FetchEventBlockFollowsContract) {
           const auto wanted{expected_fetch(expected.files, request)};
           std::ostringstream request_text;
           request_text << request;
-          tc.note("fetch " + request_text.str());
+          tc.note("fetch " + request_text.str() + ", expected " +
+                  to_string(wanted.outcome));
 
           binsrv::events::composite_binlog_name name{};
           if (!request.name.empty()) {
             name = binsrv::events::composite_binlog_name::parse(request.name);
           }
-          util::byte_range range{request.offset, request.length};
+          const util::byte_range range{request.offset, request.length};
           util::dynamic_byte_buffer buffer{std::byte{0x5A}};
-          const bool success{storage->fetch_event_block(name, range, buffer)};
-          pbt::require_equal(success, wanted.success, "return value");
-          pbt::require_equal(name.is_empty() ? std::string{} : name.str(),
-                             wanted.name, "binlog_name after the call");
-          pbt::require_equal(range.get_offset(), wanted.offset,
-                             "range offset after the call");
-          if (success) {
-            pbt::require_equal(range.get_length(), wanted.length,
-                               "range length after the call");
-            pbt::require_equal(hex(to_bytes(buffer)), hex(wanted.data),
-                               "data");
-          } else {
+          fetch_outcome outcome{fetch_outcome::throws};
+          try {
+            outcome = to_outcome(storage->fetch_event_block(name, range, buffer));
+          } catch (const std::runtime_error &) {
+            outcome = fetch_outcome::throws;
+          }
+          pbt::require_equal(to_string(outcome), to_string(wanted.outcome),
+                             "result");
+          if (outcome == fetch_outcome::throws) {
             pbt::require_equal(hex(to_bytes(buffer)), std::string{"5a"},
-                               "buffer untouched on failure");
+                               "buffer untouched when the request is rejected");
+          } else {
+            pbt::require_equal(hex(to_bytes(buffer)), hex(wanted.data), "data");
           }
         }
       },
@@ -1213,19 +1244,19 @@ BOOST_AUTO_TEST_CASE(IndexedEventBlockSplitsCompleteEvents) {
     const binsrv::indexed_event_block indexed{to_buffer(block)};
     pbt::require_equal(indexed.get_number_of_events(), sizes.size(),
                        "number of complete events");
-    pbt::require_equal(indexed.get_actual_size(), complete_size,
+    pbt::require_equal(indexed.get_parsed_size(), complete_size,
                        "size of the parsed part");
     std::size_t offset{0U};
     for (std::size_t i{0U}; i < sizes.size(); ++i) {
       const auto event{indexed.get_event(i)};
       pbt::require_equal(std::size(event), sizes[i], "event size");
       pbt::require(std::data(event) ==
-                       std::data(indexed.get_unparsed_tail()) -
+                       std::data(indexed.get_unparsed_tail_span()) -
                            static_cast<std::ptrdiff_t>(complete_size - offset),
                    "event position");
       offset += sizes[i];
     }
-    pbt::require_equal(std::size(indexed.get_unparsed_tail()), tail_length,
+    pbt::require_equal(std::size(indexed.get_unparsed_tail_span()), tail_length,
                        "unparsed tail size");
   });
 }
@@ -1275,7 +1306,7 @@ BOOST_AUTO_TEST_CASE(IndexedEventBlockTerminatesOnAnyInput) {
           int code{child_ok};
           try {
             const binsrv::indexed_event_block indexed{buffer};
-            if (indexed.get_actual_size() > buffer.size()) {
+            if (indexed.get_parsed_size() > buffer.size()) {
               code = child_beyond_block;
             }
             for (std::size_t i{0U}; i < indexed.get_number_of_events(); ++i) {
