@@ -758,6 +758,11 @@ struct pbs_options {
     std::string data_cipher;
   };
   std::optional<encryption_options> encryption;
+  // connection: another MySQL account and the 'ssl' / 'tls' sections (D22)
+  std::optional<std::string> mysql_user;
+  std::optional<std::string> mysql_password;
+  std::optional<json::object> ssl;
+  std::optional<json::object> tls;
 };
 
 std::string describe(const pbs_options &options) {
@@ -781,6 +786,15 @@ std::string describe(const pbs_options &options) {
   if (options.encryption) {
     result += ", encrypted (KEK " + options.encryption->kek_cipher + ", data " +
               options.encryption->data_cipher + ")";
+  }
+  if (options.mysql_user) {
+    result += ", MySQL user " + *options.mysql_user;
+  }
+  if (options.ssl) {
+    result += ", ssl " + json::serialize(*options.ssl);
+  }
+  if (options.tls) {
+    result += ", tls " + json::serialize(*options.tls);
   }
   return result;
 }
@@ -931,11 +945,17 @@ std::unique_ptr<pbs_storage> make_storage(const pbs_options &options) {
                                       {"port", options.mysql_port
                                                    ? unsigned{*options.mysql_port}
                                                    : server.port},
-                                      {"user", server.user},
-                                      {"password", server.password},
+                                      {"user", options.mysql_user.value_or(server.user)},
+                                      {"password", options.mysql_password.value_or(server.password)},
                                       {"connect_timeout", 10},
                                       {"read_timeout", 1},
                                       {"write_timeout", 10}};
+  if (options.ssl) {
+    config["connection"].as_object()["ssl"] = *options.ssl;
+  }
+  if (options.tls) {
+    config["connection"].as_object()["tls"] = *options.tls;
+  }
   json::object replication{{"server_id", 4242},
                            {"idle_time", 1},
                            {"verify_checksum", options.verify_checksum},
@@ -5329,4 +5349,466 @@ BOOST_AUTO_TEST_CASE(LiveClientsFollowPullMySQL) {
 BOOST_AUTO_TEST_CASE(LiveClientsFollowPullOnS3MySQL) {
   pbt::check([](hegel::TestCase &tc) { live_clients_follow_pull(tc, true); },
              {.test_cases = 10U, .slow = true});
+}
+
+// ===========================================================================
+// D22: TLS connections to MySQL (connection.ssl / connection.tls)
+// ===========================================================================
+//
+// The server uses the test PKI of extra/qa/mysqld.sh (PBT_MYSQL_TLS_DIR).
+// Per case the server's TLS setup is switched at runtime (ALTER INSTANCE
+// RELOAD TLS): the normal certificate (subjectAltName IP:127.0.0.1), a
+// certificate for another name signed by the same CA, or no TLS at all;
+// and its tls_version. A fresh account 'pbt_tls' has REQUIRE NONE / SSL /
+// X509. PBS gets a drawn 'ssl' section (mode, the right / an unrelated / no
+// CA, a client certificate or not, TLS 1.2 ciphers) and 'tls' section
+// (versions, TLS 1.3 cipher suites), or none.
+//
+// The expected outcome follows the MySQL client library (--ssl-mode etc.,
+// which the README links): disabled never encrypts; preferred encrypts when
+// the server has TLS; required / verify_ca / verify_identity fail without
+// TLS; verify_ca / verify_identity need the server's CA, and a configured CA
+// is checked in every mode (libmysqlclient); verify_identity
+// also needs the server's certificate to name the host (127.0.0.1); the
+// negotiated version is the highest one both sides allow (none: failure);
+// an account with REQUIRE SSL / X509 needs TLS / a client certificate.
+//
+// Properties: fetch succeeds exactly when expected, and the storage then
+// matches the server; a failing fetch exits with a failure code within
+// 60 s, without a crash, and stores nothing; the session PBS opens on the
+// server (performance_schema.status_by_thread of the account's thread,
+// while 'pull' runs) is encrypted exactly when expected, with the expected
+// TLS version and a cipher from the configured list.
+
+namespace {
+
+fs::path tls_dir() {
+  const auto dir{pbt::detail::env("PBT_MYSQL_TLS_DIR")};
+  if (!dir) {
+    pbt::infrastructure_error(
+        "no test certificates: PBT_MYSQL_TLS_DIR (extra/qa/mysqld.sh start "
+        "generates them; eval \"$(extra/qa/mysqld.sh env)\")");
+  }
+  return fs::path{*dir};
+}
+
+enum class server_tls_kind : std::uint8_t { normal, wrong_name, off };
+
+std::string describe(server_tls_kind kind) {
+  switch (kind) {
+  case server_tls_kind::normal:
+    return "TLS with a certificate for 127.0.0.1";
+  case server_tls_kind::wrong_name:
+    return "TLS with a certificate for wrong.invalid (same CA)";
+  case server_tls_kind::off:
+    return "no TLS";
+  }
+  return "?";
+}
+
+// the server's TLS setup, switched at runtime; restored to the start
+// configuration (extra/qa/mysqld.sh) when the case ends
+class server_tls_setup {
+public:
+  server_tls_setup(sql_connection &sql, server_tls_kind kind,
+                   const std::string &versions)
+      : sql_{sql} {
+    apply(kind, versions);
+  }
+  server_tls_setup(const server_tls_setup &) = delete;
+  server_tls_setup &operator=(const server_tls_setup &) = delete;
+  server_tls_setup(server_tls_setup &&) = delete;
+  server_tls_setup &operator=(server_tls_setup &&) = delete;
+  ~server_tls_setup() {
+    try {
+      apply(server_tls_kind::normal, "TLSv1.2,TLSv1.3");
+    } catch (const std::exception &) {
+    }
+  }
+
+private:
+  void apply(server_tls_kind kind, const std::string &versions) {
+    const auto dir{tls_dir()};
+    if (sql_.scalar("SELECT @@GLOBAL.performance_schema") != "1") {
+      pbt::infrastructure_error("the TLS properties need performance_schema "
+                                "(a server started by extra/qa/mysqld.sh "
+                                "before it enabled it: mysqld.sh restart)");
+    }
+    const std::string name{kind == server_tls_kind::normal       ? "server"
+                           : kind == server_tls_kind::wrong_name ? "wrong-name"
+                                                                 : "missing"};
+    sql_.exec("SET GLOBAL ssl_ca = '" + (dir / "ca.pem").string() +
+              "', ssl_cert = '" + (dir / (name + "-cert.pem")).string() +
+              "', ssl_key = '" + (dir / (name + "-key.pem")).string() +
+              "', tls_version = '" + versions + "'");
+    // a certificate that cannot be loaded and NO ROLLBACK ON ERROR: TLS
+    // is disabled for new connections
+    sql_.exec(kind == server_tls_kind::off
+                  ? "ALTER INSTANCE RELOAD TLS NO ROLLBACK ON ERROR"
+                  : "ALTER INSTANCE RELOAD TLS");
+    const auto enabled{sql_.scalar(
+        "SELECT VALUE FROM performance_schema.tls_channel_status WHERE "
+        "CHANNEL = 'mysql_main' AND PROPERTY = 'Enabled'")};
+    if (enabled != (kind == server_tls_kind::off ? "No" : "Yes")) {
+      pbt::infrastructure_error("switching the server's TLS setup to '" +
+                                describe(kind) + "' failed (Enabled = '" +
+                                enabled + "')");
+    }
+  }
+
+  sql_connection &sql_;
+};
+
+constexpr std::string_view tls_account{"pbt_tls"};
+constexpr std::string_view tls_password{"pbt-tls-password"};
+
+// a fresh account (DROP USER also removes it from the caching_sha2_password
+// cache)
+void create_tls_account(sql_connection &sql, const std::string &require) {
+  const std::string account{"'" + std::string{tls_account} + "'@'127.0.0.1'"};
+  sql.exec("DROP USER IF EXISTS " + account);
+  sql.exec("CREATE USER " + account + " IDENTIFIED BY '" +
+           std::string{tls_password} + "' REQUIRE " + require);
+  sql.exec("GRANT ALL PRIVILEGES ON *.* TO " + account);
+}
+
+// one login with the server's RSA public key (or over TLS) puts the account
+// into the server's caching_sha2_password cache; later logins without TLS
+// then use the fast path. The first login without TLS needs the RSA key,
+// which PBS does not ask for: UnencryptedFirstLoginWorksMySQL
+void prime_auth_cache(bool client_certificate) {
+  MYSQL *handle{::mysql_init(nullptr)};
+  if (handle == nullptr) {
+    return;
+  }
+  const unsigned timeout{10U};
+  ::mysql_options(handle, MYSQL_OPT_CONNECT_TIMEOUT, &timeout);
+  const bool get_public_key{true};
+  ::mysql_options(handle, MYSQL_OPT_GET_SERVER_PUBLIC_KEY, &get_public_key);
+  const auto dir{tls_dir()};
+  const auto cert{(dir / "client-cert.pem").string()};
+  const auto key{(dir / "client-key.pem").string()};
+  if (client_certificate) {
+    ::mysql_options(handle, MYSQL_OPT_SSL_CERT, cert.c_str());
+    ::mysql_options(handle, MYSQL_OPT_SSL_KEY, key.c_str());
+  }
+  const auto server{settings()};
+  std::ignore = ::mysql_real_connect(handle, server.host.c_str(),
+                                     std::string{tls_account}.c_str(),
+                                     std::string{tls_password}.c_str(), nullptr,
+                                     server.port, nullptr, 0);
+  ::mysql_close(handle);
+}
+
+struct tls_client {
+  std::optional<std::string> mode;  // no 'ssl' section: the default (preferred)
+  std::string ca;                   // "right" / "unrelated" / "none"
+  bool client_certificate{};
+  std::vector<std::string> ciphers;  // ssl.cipher (TLS 1.2); empty: not set
+  std::vector<std::string> versions; // tls.version; empty: not set
+  std::vector<std::string> suites;   // tls.ciphersuites (TLS 1.3); empty: not set
+};
+
+std::string joined_list(const std::vector<std::string> &items, char separator) {
+  std::string result;
+  for (const auto &item : items) {
+    result += (result.empty() ? "" : std::string{separator}) + item;
+  }
+  return result;
+}
+
+// a non-empty subset of 'candidates', in their order
+std::vector<std::string> draw_subset(hegel::TestCase &tc, const std::string &label,
+                                     const std::vector<std::string> &candidates) {
+  std::vector<std::string> result;
+  for (const auto &candidate : candidates) {
+    if (tc.draw(label, gs::booleans())) {
+      result.push_back(candidate);
+    }
+  }
+  if (result.empty()) {
+    result.push_back(candidates[tc.draw(
+        label + "_one", gs::integers<std::size_t>({.max_value = candidates.size() - 1U}))]);
+  }
+  return result;
+}
+
+tls_client draw_tls_client(hegel::TestCase &tc) {
+  tls_client client;
+  if (tc.draw("has_ssl", gs::integers<int>({.min_value = 0, .max_value = 5})) != 0) {
+    client.mode = tc.draw("ssl_mode", gs::sampled_from<std::string>(
+                                          {"disabled", "preferred", "required",
+                                           "verify_ca", "verify_identity"}));
+    client.ca = tc.draw("ssl_ca", gs::sampled_from<std::string>(
+                                      {"right", "right", "unrelated", "none"}));
+    client.client_certificate = tc.draw("ssl_cert", gs::booleans());
+    if (tc.draw("has_cipher", gs::booleans())) {
+      // TLS 1.2 ciphers both ends accept (MySQL 8.0 / 8.4 defaults)
+      client.ciphers = draw_subset(tc, "cipher", {"ECDHE-RSA-AES128-GCM-SHA256",
+                                                  "ECDHE-RSA-AES256-GCM-SHA384"});
+    }
+  } else {
+    client.ca = "none";
+  }
+  if (tc.draw("has_tls", gs::booleans())) {
+    if (tc.draw("has_tls_version", gs::booleans())) {
+      client.versions = draw_subset(tc, "tls_version", {"TLSv1.2", "TLSv1.3"});
+    }
+    if (tc.draw("has_ciphersuites", gs::booleans())) {
+      client.suites = draw_subset(tc, "ciphersuite",
+                                  {"TLS_AES_128_GCM_SHA256", "TLS_AES_256_GCM_SHA384",
+                                   "TLS_CHACHA20_POLY1305_SHA256"});
+    }
+  }
+  return client;
+}
+
+void apply_tls_client(pbs_options &options, const tls_client &client) {
+  options.mysql_user = std::string{tls_account};
+  options.mysql_password = std::string{tls_password};
+  const auto dir{tls_dir()};
+  if (client.mode) {
+    json::object ssl{{"mode", *client.mode}};
+    if (client.ca != "none") {
+      ssl["ca"] = (dir / (client.ca == "right" ? "ca.pem" : "other-ca.pem")).string();
+    }
+    if (client.client_certificate) {
+      ssl["cert"] = (dir / "client-cert.pem").string();
+      ssl["key"] = (dir / "client-key.pem").string();
+    }
+    if (!client.ciphers.empty()) {
+      ssl["cipher"] = joined_list(client.ciphers, ':');
+    }
+    options.ssl = ssl;
+  }
+  if (!client.versions.empty() || !client.suites.empty()) {
+    json::object tls;
+    if (!client.versions.empty()) {
+      tls["version"] = joined_list(client.versions, ',');
+    }
+    if (!client.suites.empty()) {
+      tls["ciphersuites"] = joined_list(client.suites, ':');
+    }
+    options.tls = tls;
+  }
+}
+
+struct tls_expectation {
+  bool success{};
+  bool encrypted{};
+  std::string version;  // when encrypted
+  std::string reason;   // why it must fail / how it must connect
+};
+
+tls_expectation expected_tls_outcome(server_tls_kind server,
+                                     const std::vector<std::string> &server_versions,
+                                     const std::string &require,
+                                     const tls_client &client) {
+  const auto mode{client.mode.value_or("preferred")};
+  const bool verifying{mode == "verify_ca" || mode == "verify_identity"};
+  const bool server_tls{server != server_tls_kind::off};
+  const auto fail{[](std::string reason) {
+    return tls_expectation{.success = false, .encrypted = false, .version = {},
+                           .reason = std::move(reason)};
+  }};
+  if (verifying && client.ca == "none") {
+    return fail("ssl.mode " + mode + " without ssl.ca");
+  }
+  if (!server_tls && mode != "disabled" && mode != "preferred") {
+    return fail("ssl.mode " + mode + " and a server without TLS");
+  }
+  const bool encrypted{server_tls && mode != "disabled"};
+  std::string version;
+  if (encrypted) {
+    const auto &allowed{client.versions.empty()
+                            ? std::vector<std::string>{"TLSv1.2", "TLSv1.3"}
+                            : client.versions};
+    for (const auto *candidate : {"TLSv1.3", "TLSv1.2"}) {
+      if (std::ranges::find(allowed, candidate) != allowed.end() &&
+          std::ranges::find(server_versions, candidate) != server_versions.end()) {
+        version = candidate;
+        break;
+      }
+    }
+    if (version.empty()) {
+      return fail("no TLS version both sides allow");
+    }
+    // libmysqlclient verifies the certificate chain whenever a CA is set,
+    // also in the preferred / required modes (the mysql command line
+    // client drops the CA there, with a warning)
+    if (client.ca == "unrelated") {
+      return fail("ssl.ca is not the CA of the server's certificate");
+    }
+    if (mode == "verify_identity" && server == server_tls_kind::wrong_name) {
+      return fail("the server's certificate does not name 127.0.0.1");
+    }
+  }
+  if (require != "NONE" && !encrypted) {
+    return fail("the account requires TLS (REQUIRE " + require + ")");
+  }
+  if (require == "X509" && !client.client_certificate) {
+    return fail("the account requires a client certificate (REQUIRE X509)");
+  }
+  return {.success = true, .encrypted = encrypted, .version = version,
+          .reason = encrypted ? "encrypted, " + version : "not encrypted"};
+}
+
+// Ssl_version / Ssl_cipher of the account's session on the server, while
+// 'pull' is connected (performance_schema.status_by_thread); nullopt: no
+// session within 15 s
+std::optional<std::pair<std::string, std::string>>
+pbs_session_tls(sql_connection &sql, pull_process &pull) {
+  const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{15}};
+  while (std::chrono::steady_clock::now() < deadline) {
+    pull.require_running();
+    const auto rows{sql.query(
+        "SELECT s.VARIABLE_NAME, s.VARIABLE_VALUE FROM performance_schema.threads t "
+        "JOIN performance_schema.status_by_thread s ON s.THREAD_ID = t.THREAD_ID "
+        "WHERE t.PROCESSLIST_USER = '" + std::string{tls_account} +
+        "' AND s.VARIABLE_NAME IN ('Ssl_version', 'Ssl_cipher')")};
+    if (rows.size() == 2U) {
+      std::pair<std::string, std::string> result;
+      for (const auto &item : rows) {
+        (item.at(0).value_or("") == "Ssl_version" ? result.first : result.second) =
+            item.at(1).value_or("");
+      }
+      return result;
+    }
+    wait_ms(50U);
+  }
+  return std::nullopt;
+}
+
+// fetch with a time limit: a refused connection must end it
+run_result fetch_within(hegel::TestCase &tc, const pbs_storage &storage,
+                        std::chrono::seconds limit) {
+  background_run process{{"fetch", storage.config_path}};
+  const auto [result, in_time]{process.wait_for(limit)};
+  if (!in_time) {
+    pbt::note(tc, "binlog_server log:" + log_tail(storage));
+  }
+  pbt::require(in_time, "fetch did not end within " +
+                            std::to_string(limit.count()) + " s");
+  return result;
+}
+
+} // namespace
+
+BOOST_AUTO_TEST_CASE(TlsSettingsAreHonouredMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        start_case(tc, server);
+        const auto kind{tc.draw("server_tls", gs::sampled_from<server_tls_kind>(
+                                                  {server_tls_kind::normal,
+                                                   server_tls_kind::normal,
+                                                   server_tls_kind::wrong_name,
+                                                   server_tls_kind::off}))};
+        const auto server_versions{draw_subset(tc, "server_tls_version",
+                                               {"TLSv1.2", "TLSv1.3"})};
+        const auto require{tc.draw("require", gs::sampled_from<std::string>(
+                                                  {"NONE", "SSL", "X509"}))};
+        pbt::note(tc, "server: " + describe(kind) + ", tls_version " +
+                          joined_list(server_versions, ',') +
+                          "; account REQUIRE " + require);
+        const server_tls_setup setup{server.sql, kind, joined_list(server_versions, ',')};
+        create_tls_account(server.sql, require);
+        const auto client{draw_tls_client(tc)};
+        auto options{draw_options(tc)};
+        apply_tls_client(options, client);
+        pbt::note(tc, "binlog_server: " + describe(options));
+        const auto expected{expected_tls_outcome(kind, server_versions, require, client)};
+        pbt::note(tc, std::string{"expected: "} + (expected.success ? "success, " : "failure: ") +
+                          expected.reason);
+        const auto storage{make_storage(options)};
+        apply_all(tc, server.sql, {operation{.kind = op_kind::insert_rows, .count = 2}});
+        // logins without TLS take the fast path (see prime_auth_cache)
+        prime_auth_cache(client.client_certificate);
+
+        const auto result{fetch_within(tc, *storage, std::chrono::seconds{60})};
+        pbt::note(tc, "fetch: " + result.describe());
+        pbt::require(!result.signaled, "fetch crashed (" + result.describe() + ")");
+        if (!expected.success) {
+          if (result.exit_code == 0) {
+            pbt::note(tc, "binlog_server log:" + log_tail(*storage));
+          }
+          pbt::require(result.exit_code != 0,
+                       "fetch succeeded although it must fail: " + expected.reason);
+          const auto listing{list(tc, *storage)};
+          pbt::require(listing.at("result").as_array().empty(),
+                       "a refused fetch stored binlogs");
+          return;
+        }
+        if (result.exit_code != 0) {
+          pbt::note(tc, "binlog_server log:" + log_tail(*storage));
+        }
+        pbt::require(result.exit_code == 0,
+                     "fetch failed although it must connect (" + expected.reason + ")");
+        require_storage_matches_server(tc, server.sql, server.info, *storage);
+
+        // the session PBS opens on the server
+        pull_process pull{tc, *storage};
+        const auto session{pbs_session_tls(server.sql, pull)};
+        if (!session) {
+          pbt::note(tc, "binlog_server log:" + log_tail(*storage));
+        }
+        pbt::require(session.has_value(),
+                     "no server session of the account while pull ran (15 s)");
+        pull.stop();
+        const auto &[version, cipher]{*session};
+        pbt::note(tc, "PBS session: Ssl_version '" + version + "', Ssl_cipher '" +
+                          cipher + "'");
+        if (!expected.encrypted) {
+          pbt::require(version.empty(), "the connection is encrypted (" + version +
+                                            ") although it must not be (" +
+                                            expected.reason + ")");
+          return;
+        }
+        pbt::require(!version.empty() && !cipher.empty(),
+                     "the connection is not encrypted although it must be");
+        pbt::require_equal(version, expected.version, "negotiated TLS version");
+        const auto &allowed{version == "TLSv1.3" ? client.suites : client.ciphers};
+        pbt::require(allowed.empty() || std::ranges::find(allowed, cipher) != allowed.end(),
+                     "cipher " + cipher + " is not in the configured list " +
+                         joined_list(allowed, ':'));
+      },
+      {.test_cases = 60U, .slow = true});
+}
+
+// The first login of an account (not in the server's caching_sha2_password
+// cache, the default authentication plugin) without TLS - ssl.mode
+// disabled, or preferred against a server without TLS - works like in the
+// mysql client with --get-server-public-key: the README offers these modes,
+// and MySQL creates such accounts by default.
+BOOST_AUTO_TEST_CASE(UnencryptedFirstLoginWorksMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        start_case(tc, server);
+        const bool server_tls{tc.draw("server_tls", gs::booleans())};
+        const auto kind{server_tls ? server_tls_kind::normal : server_tls_kind::off};
+        const server_tls_setup setup{server.sql, kind, "TLSv1.2,TLSv1.3"};
+        create_tls_account(server.sql, "NONE");
+        tls_client client;
+        client.ca = "none";
+        if (server_tls) {
+          client.mode = "disabled";
+        } else if (tc.draw("ssl_section", gs::booleans())) {
+          client.mode = "preferred";
+        }
+        auto options{draw_options(tc)};
+        apply_tls_client(options, client);
+        pbt::note(tc, "server: " + describe(kind) + "; binlog_server: " + describe(options));
+        const auto storage{make_storage(options)};
+        apply_all(tc, server.sql, {operation{.kind = op_kind::insert_rows, .count = 1}});
+        const auto result{fetch_within(tc, *storage, std::chrono::seconds{60})};
+        if (result.signaled || result.exit_code != 0) {
+          pbt::note(tc, "binlog_server log:" + log_tail(*storage));
+        }
+        pbt::require(!result.signaled && result.exit_code == 0,
+                     "fetch without TLS could not log in as a new "
+                     "caching_sha2_password account (" + result.describe() + ")");
+        require_storage_matches_server(tc, server.sql, server.info, *storage);
+      },
+      {.test_cases = 10U, .slow = true});
 }

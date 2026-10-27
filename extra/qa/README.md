@@ -203,6 +203,18 @@ directory outside `/var/lib/mysql`; use a tarball then. Tagged GTIDs are
 part of the workload only with MySQL 8.3 or newer. Settings: `MYSQLD_*` in
 `pbt_env.sh`.
 
+TLS (`TlsSettingsAreHonouredMySQL`, `UnencryptedFirstLoginWorksMySQL`):
+the first `mysqld.sh start` generates a test PKI with `openssl` in
+`$WORKDIR/mysql-pbt/tls` (a CA, a server certificate for 127.0.0.1, one for
+another name, a client certificate and an unrelated CA;
+`PBT_MYSQL_TLS_DIR`), and the server starts with it. The properties switch
+the server's certificate, its `tls_version` or TLS itself at runtime
+(`ALTER INSTANCE RELOAD TLS`) and restore it afterwards. They read the TLS
+state of PBS's session from `performance_schema`, which is therefore ON
+(statement history and digests off). Delete the `tls` directory to
+regenerate the certificates; a server started by an older `mysqld.sh`
+needs a restart (`mysqld.sh restart`).
+
 Properties named `*OnS3MySQL` need both servers: they store the binlogs
 on SeaweedFS and read the objects back through its filer
 (`PBT_S3_FILER`, printed by `seaweedfs.sh env`), so they need SeaweedFS
