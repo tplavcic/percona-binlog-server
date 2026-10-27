@@ -33,6 +33,14 @@
 #
 # mysqld: $MYSQLD_BASEDIR/bin/mysqld, else $WORKDIR/mysql/bin/mysqld, else
 # mysqld from PATH or /usr/sbin/mysqld. Settings: MYSQLD_* in pbt_env.sh.
+#
+# TLS: the first start generates a test PKI in $MYSQLD_DIR/tls (openssl):
+# ca.pem (the test CA), server-cert.pem / server-key.pem (signed by it,
+# subjectAltName IP:127.0.0.1, DNS:localhost; the server starts with it),
+# wrong-name-cert.pem / wrong-name-key.pem (signed by the CA, name
+# wrong.invalid only), client-cert.pem / client-key.pem (signed by the CA)
+# and other-ca.pem (an unrelated CA). The TLS properties switch the
+# server between them at runtime (ALTER INSTANCE RELOAD TLS).
 
 set -euo pipefail
 # shellcheck source=extra/qa/pbt_env.sh
@@ -55,6 +63,7 @@ pid_file="${run_dir}/mysqld.pid"
 log_file="${run_dir}/mysqld.log"
 socket="${run_dir}/mysqld.sock"
 init_file="${run_dir}/init.sql"
+tls_dir="${MYSQLD_DIR}/tls"
 
 find_mysqld() {
   local candidate
@@ -93,6 +102,41 @@ fail_start() {
   pbt_die "$1 (log: ${log_file})"
 }
 
+# the test PKI (see the header); generated once, kept with the instance
+make_tls() {
+  [[ -f "${tls_dir}/complete" ]] && return 0
+  command -v openssl >/dev/null 2>&1 || pbt_die "openssl is needed to generate the test certificates"
+  pbt_require_in_workdir "${tls_dir}"
+  rm -rf "${tls_dir}"
+  mkdir -p "${tls_dir}"
+  local ca_ext=(-addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign")
+  # a CA: name, subject
+  make_ca() {
+    openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj "/CN=$2" \
+      "${ca_ext[@]}" -keyout "${tls_dir}/$1-key.pem" -out "${tls_dir}/$1.pem" 2>/dev/null
+  }
+  # a certificate signed by the test CA: name, subject, subjectAltName
+  make_cert() {
+    local ext="${tls_dir}/$1.ext"
+    printf 'basicConstraints=CA:FALSE\n%s' "${3:+subjectAltName=$3}" > "${ext}"
+    openssl req -newkey rsa:2048 -nodes -subj "/CN=$2" \
+      -keyout "${tls_dir}/$1-key.pem" -out "${tls_dir}/$1.csr" 2>/dev/null
+    openssl x509 -req -in "${tls_dir}/$1.csr" -CA "${tls_dir}/ca.pem" \
+      -CAkey "${tls_dir}/ca-key.pem" -CAcreateserial -days 3650 \
+      -extfile "${ext}" -out "${tls_dir}/$1-cert.pem" 2>/dev/null
+    rm -f "${tls_dir}/$1.csr" "${ext}"
+  }
+  make_ca ca "PBT test CA" &&
+    make_ca other-ca "PBT unrelated CA" &&
+    make_cert server 127.0.0.1 "IP:127.0.0.1,DNS:localhost" &&
+    make_cert wrong-name wrong.invalid "DNS:wrong.invalid" &&
+    make_cert client pbt-client "" ||
+    pbt_die "generating the test certificates in ${tls_dir} failed"
+  chmod 644 "${tls_dir}"/*.pem
+  touch "${tls_dir}/complete"
+  pbt_log "generated the test certificates in ${tls_dir}"
+}
+
 server_options() {
   local mysqld="$1" basedir
   basedir="$(cd "$(dirname "${mysqld}")/.." && pwd)"
@@ -117,7 +161,16 @@ server_options() {
     --innodb-buffer-pool-size=64M \
     --innodb-redo-log-capacity=64M \
     --max-connections=100 \
-    --performance-schema=OFF
+    "--ssl-ca=${tls_dir}/ca.pem" \
+    "--ssl-cert=${tls_dir}/server-cert.pem" \
+    "--ssl-key=${tls_dir}/server-key.pem" \
+    --performance-schema=ON \
+    --performance-schema-consumer-events-statements-current=OFF \
+    --performance-schema-consumer-events-statements-history=OFF \
+    --performance-schema-consumer-events-transactions-current=OFF \
+    --performance-schema-consumer-statements-digest=OFF \
+    --performance-schema-max-digest-length=0 \
+    --performance-schema-max-sql-text-length=0
   # mysqld refuses to run as root without an explicit --user
   if [[ ${EUID} -eq 0 ]]; then
     printf '%s\n' --user=root
@@ -140,6 +193,7 @@ start() {
   # PID in the lock file may belong to another process after a reboot, and
   # mysqld then refuses to start: "Unable to setup unix socket lock file")
   rm -f "${socket}" "${socket}.lock"
+  make_tls
   local -a options
   mapfile -t options < <(server_options "${mysqld}")
   if [[ ! -d "${data_dir}/mysql" ]]; then
@@ -226,6 +280,7 @@ export PBT_MYSQL_USER='${MYSQLD_USER}'
 export PBT_MYSQL_PASSWORD='${MYSQLD_PASSWORD}'
 export PBT_MYSQLD_CTL='$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/mysqld.sh'
 export PBT_MYSQLD_WORKDIR='${WORKDIR}'
+export PBT_MYSQL_TLS_DIR='${tls_dir}'
 EOF
     fi
     ;;
@@ -234,5 +289,5 @@ EOF
     pbt_require_in_workdir "${MYSQLD_DIR}"
     rm -rf "${MYSQLD_DIR}"
     pbt_log "mysqld instance removed" ;;
-  *) sed -n '17,36p' "$0"; exit 2 ;;
+  *) sed -n '17,44p' "$0"; exit 2 ;;
 esac
