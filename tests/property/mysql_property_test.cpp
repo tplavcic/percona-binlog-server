@@ -90,10 +90,15 @@
 #include <boost/json/serialize.hpp>
 #include <boost/json/value.hpp>
 
+#include "binsrv/events/code_type.hpp"
+#include "binsrv/events/gtid_tagged_log_body_impl.hpp"
+#include "binsrv/gtids/gtid.hpp"
 #include "binsrv/gtids/gtid_set.hpp"
 
 #include "common/binlog_server_process.hpp"
 #include "common/pbt_helpers.hpp"
+
+#include "util/byte_span.hpp"
 
 namespace {
 
@@ -763,6 +768,10 @@ struct pbs_options {
   std::optional<std::string> mysql_password;
   std::optional<json::object> ssl;
   std::optional<json::object> tls;
+  // replication_source: the listener's certificate and key (its 'ssl'
+  // section) and require_secure_transport (D25)
+  std::optional<std::pair<std::string, std::string>> listener_certificate;
+  bool listener_requires_tls{false};
 };
 
 std::string describe(const pbs_options &options) {
@@ -973,13 +982,18 @@ std::unique_ptr<pbs_storage> make_storage(const pbs_options &options) {
       {"server_id", 142},
       {"server_uuid", "00000000-0000-0000-0000-00000000008e"},
       {"auth_rsa_private_key", listener_rsa_key().string()},
-      // README: true needs the 'ssl' section (listener TLS, not tested yet)
-      {"require_secure_transport", false},
+      // README: true needs the 'ssl' section (D25)
+      {"require_secure_transport", options.listener_requires_tls},
       {"read_timeout", 5},
       {"write_timeout", 5},
       {"authentication", json::object{{"user", "replica"},
                                       {"password", "replica-password"},
                                       {"plugin", "caching_sha2_password"}}}};
+  if (options.listener_certificate) {
+    config["replication_source"].as_object()["ssl"] =
+        json::object{{"cert", options.listener_certificate->first},
+                     {"key", options.listener_certificate->second}};
+  }
   json::object storage{{"backend", "file"},
                        {"uri", "file://" + result->vault().generic_string()}};
   if (options.s3) {
@@ -5813,4 +5827,903 @@ BOOST_AUTO_TEST_CASE(UnencryptedFirstLoginWorksMySQL) {
         require_storage_matches_server(tc, server.sql, server.info, *storage);
       },
       {.test_cases = 10U, .slow = true});
+}
+
+// ===========================================================================
+// D23 - D25: GTID dumps, heartbeats and TLS of the replication source
+// listener (upstream PBS-29 part 2, PBS-30, PBS-31 part 1)
+// ===========================================================================
+
+namespace {
+
+constexpr std::uint8_t heartbeat_event{27U};
+constexpr std::uint8_t heartbeat_v2_event{41U};
+// mysql.h: USE_HEARTBEAT_EVENT_V2; the non-blocking flag of COM_BINLOG_DUMP
+constexpr unsigned use_heartbeat_event_v2_flag{1U << 1U};
+constexpr unsigned non_blocking_dump_flag{1U};
+
+std::int64_t steady_ms() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+std::uint8_t event_type(const std::string &event) {
+  return event.size() > 4U ? static_cast<std::uint8_t>(event[4]) : 0U;
+}
+
+bool is_heartbeat(const std::string &event) {
+  return event_type(event) == heartbeat_event ||
+         event_type(event) == heartbeat_v2_event;
+}
+
+// an event the listener generated (artificial ROTATE / FORMAT_DESCRIPTION:
+// log_pos 0 or LOG_EVENT_ARTIFICIAL_F) or a heartbeat: not stored
+bool is_generated(const std::string &event) {
+  if (event.size() < 19U || is_heartbeat(event)) {
+    return true;
+  }
+  const auto flags{static_cast<unsigned>(static_cast<unsigned char>(event[17])) |
+                   (static_cast<unsigned>(static_cast<unsigned char>(event[18])) << 8U)};
+  return le32(event, 13U) == 0U || (flags & 0x20U) != 0U;
+}
+
+struct dump_options {
+  std::uint16_t port{};
+  std::string file;
+  std::uint64_t position{4U};
+  bool blocking{false};
+  // COM_BINLOG_DUMP_GTID with this set (file name empty, like a replica with
+  // SOURCE_AUTO_POSITION = 1)
+  std::optional<gtids::gtid_set> gtids;
+  std::uint64_t heartbeat_period_ns{0U};  // SET @source_heartbeat_period
+  bool heartbeat_v2{true};                // USE_HEARTBEAT_EVENT_V2
+  std::optional<unsigned> ssl_mode;       // MYSQL_OPT_SSL_MODE (SSL_MODE_*)
+  std::string ssl_ca;
+  // a blocking dump ends this long after the last event that is not a
+  // heartbeat
+  std::chrono::milliseconds idle_window{3000};
+};
+
+struct timed_event {
+  std::string bytes;  // without the 0x00 packet prefix
+  std::int64_t at_ms{};
+};
+
+struct dump_outcome {
+  bool connected{};
+  std::string cipher;  // TLS cipher of the connection; empty: not encrypted
+  std::vector<timed_event> events;
+  std::string error;  // empty: the dump ended normally
+  unsigned error_number{};
+};
+
+// a binlog dump client (libmysqlclient MYSQL_RPL, as a replica's I/O
+// thread uses it), through a TCP proxy so that a blocking dump can be ended
+// once it has been idle long enough
+dump_outcome run_dump(const dump_options &options) {
+  dump_outcome outcome;
+  tcp_proxy proxy{options.port};
+  std::atomic<bool> finished{false};
+  std::atomic<bool> ended_by_test{false};
+  std::atomic<std::int64_t> last_event_ms{steady_ms()};
+  std::thread watchdog;
+  if (options.blocking) {
+    watchdog = std::thread{[&]() {
+      while (!finished) {
+        if (steady_ms() - last_event_ms > options.idle_window.count()) {
+          ended_by_test = true;
+          proxy.drop_connections();
+          return;
+        }
+        wait_ms(10U);
+      }
+    }};
+  }
+  const auto finish{[&]() {
+    finished = true;
+    if (watchdog.joinable()) {
+      watchdog.join();
+    }
+  }};
+  MYSQL *handle{::mysql_init(nullptr)};
+  if (handle == nullptr) {
+    finish();
+    throw std::runtime_error{"mysql_init failed"};
+  }
+  const unsigned timeout{10U};
+  ::mysql_options(handle, MYSQL_OPT_CONNECT_TIMEOUT, &timeout);
+  ::mysql_options(handle, MYSQL_OPT_READ_TIMEOUT, &timeout);
+  const bool get_public_key{true};
+  ::mysql_options(handle, MYSQL_OPT_GET_SERVER_PUBLIC_KEY, &get_public_key);
+  ::mysql_options(handle, MYSQL_DEFAULT_AUTH, "caching_sha2_password");
+  if (options.ssl_mode) {
+    ::mysql_options(handle, MYSQL_OPT_SSL_MODE, &*options.ssl_mode);
+  }
+  if (!options.ssl_ca.empty()) {
+    ::mysql_options(handle, MYSQL_OPT_SSL_CA, options.ssl_ca.c_str());
+  }
+  const auto fail{[&](const std::string &what) {
+    if (!(options.blocking && ended_by_test)) {
+      outcome.error = what + ": " + ::mysql_error(handle);
+      outcome.error_number = ::mysql_errno(handle);
+    }
+  }};
+  if (::mysql_real_connect(handle, "127.0.0.1", "replica", "replica-password",
+                           nullptr, proxy.port(), nullptr, 0) == nullptr) {
+    fail("connect");
+    ::mysql_close(handle);
+    finish();
+    return outcome;
+  }
+  outcome.connected = true;
+  if (const char *cipher{::mysql_get_ssl_cipher(handle)}; cipher != nullptr) {
+    outcome.cipher = cipher;
+  }
+  std::vector<std::string> statements{
+      "SET @source_binlog_checksum = 'CRC32', @master_binlog_checksum = 'CRC32'"};
+  if (options.heartbeat_period_ns != 0U) {
+    statements.push_back("SET @source_heartbeat_period = " +
+                         std::to_string(options.heartbeat_period_ns));
+  }
+  for (const auto &statement : statements) {
+    if (::mysql_real_query(handle, statement.data(), statement.size()) != 0) {
+      fail(statement);
+      ::mysql_close(handle);
+      finish();
+      return outcome;
+    }
+  }
+  std::vector<unsigned char> encoded_gtids;
+  if (options.gtids) {
+    encoded_gtids.resize(options.gtids->calculate_encoded_size());
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    util::byte_span destination{reinterpret_cast<std::byte *>(encoded_gtids.data()),
+                                encoded_gtids.size()};
+    options.gtids->encode_to(destination);
+  }
+  MYSQL_RPL rpl{.file_name_length = options.file.size(),
+                .file_name = options.file.c_str(),
+                .start_position = options.position,
+                .server_id = 6363U,
+                .flags = (options.blocking ? 0U : non_blocking_dump_flag) |
+                         (options.gtids ? MYSQL_RPL_GTID : 0U) |
+                         (options.heartbeat_v2 ? use_heartbeat_event_v2_flag : 0U),
+                .gtid_set_encoded_size = encoded_gtids.size(),
+                .fix_gtid_set = nullptr,
+                .gtid_set_arg = encoded_gtids.empty() ? nullptr : encoded_gtids.data(),
+                .size = 0U,
+                .buffer = nullptr};
+  if (::mysql_binlog_open(handle, &rpl) != 0) {
+    fail("mysql_binlog_open");
+    ::mysql_close(handle);
+    finish();
+    return outcome;
+  }
+  last_event_ms = steady_ms();
+  for (;;) {
+    if (::mysql_binlog_fetch(handle, &rpl) != 0) {
+      fail("mysql_binlog_fetch");
+      break;
+    }
+    if (rpl.size == 0U) {
+      break;  // end of a non-blocking dump
+    }
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    const auto *bytes{reinterpret_cast<const char *>(rpl.buffer)};
+    if (bytes[0] != 0) {
+      outcome.error = "event packet without the 0x00 prefix";
+      break;
+    }
+    timed_event event{.bytes = std::string{bytes + 1, rpl.size - 1U}, .at_ms = steady_ms()};
+    if (!is_heartbeat(event.bytes)) {
+      last_event_ms = event.at_ms;
+    }
+    outcome.events.push_back(std::move(event));
+  }
+  ::mysql_binlog_close(handle, &rpl);
+  ::mysql_close(handle);
+  finish();
+  return outcome;
+}
+
+// the stored events of a storage, in binlog order
+struct stored_event {
+  std::string file;
+  std::size_t offset{};
+  std::string bytes;
+};
+
+std::vector<stored_event> stored_events_of(hegel::TestCase &tc,
+                                           const pbs_storage &storage) {
+  std::vector<stored_event> result;
+  const auto listing{list(tc, storage)};
+  for (const auto &item : listing.at("result").as_array()) {
+    const std::string name{item.at("name").as_string()};
+    const auto content{storage.plaintext(name)};
+    if (content.size() <= 4U) {
+      continue;
+    }
+    const auto walked{walk(content, "stored " + name)};
+    for (std::size_t i{0U}; i < walked.offsets.size(); ++i) {
+      const auto end{i + 1U < walked.offsets.size() ? walked.offsets[i + 1U]
+                                                    : content.size()};
+      result.push_back({name, walked.offsets[i],
+                        content.substr(walked.offsets[i], end - walked.offsets[i])});
+    }
+  }
+  return result;
+}
+
+// the events a dump sent that are stored events (not generated by the
+// listener) must be exactly 'expected', in order and byte for byte
+void require_same_events(hegel::TestCase &tc, const dump_outcome &outcome,
+                         const std::vector<const stored_event *> &expected,
+                         const std::string &what) {
+  std::vector<const std::string *> received;
+  for (const auto &event : outcome.events) {
+    if (!is_generated(event.bytes)) {
+      received.push_back(&event.bytes);
+    }
+  }
+  const auto common{std::min(received.size(), expected.size())};
+  for (std::size_t i{0U}; i < common; ++i) {
+    if (!same_event(expected[i]->bytes, *received[i])) {
+      pbt::note(tc, what + ": event " + std::to_string(i) + ": expected the stored " +
+                        expected[i]->file + ":" + std::to_string(expected[i]->offset) +
+                        " (" + describe_event(expected[i]->bytes) + "), received " +
+                        describe_event(*received[i]));
+      pbt::fail(what + ": the dump sent an event that differs from the stored one");
+    }
+  }
+  pbt::require_equal(received.size(), expected.size(),
+                     what + ": number of stored events the dump sent");
+}
+
+// the GTID of a transaction's first event (GTID_LOG / GTID_TAGGED_LOG), as
+// a one-element set; nullopt for ANONYMOUS_GTID_LOG. CRC32 footers.
+std::optional<gtids::gtid_set> transaction_gtid(const std::string &event) {
+  if (event_type(event) == gtid_event) {
+    // post header: flags (1), uuid (16), gno (8)
+    std::uint64_t gno{0U};
+    for (std::size_t i{0U}; i < 8U; ++i) {
+      gno |= static_cast<std::uint64_t>(static_cast<unsigned char>(event[19U + 17U + i]))
+             << (8U * i);
+    }
+    return gtids::gtid_set{uuid_text(event, 20U) + ":" + std::to_string(gno)};
+  }
+  if (event_type(event) == gtid_tagged_event) {
+    const binsrv::events::generic_body_impl<binsrv::events::code_type::gtid_tagged_log>
+        body{util::as_const_byte_span(event).subspan(19U, event.size() - 19U - 4U)};
+    return gtids::gtid_set{body.get_gtid()};
+  }
+  return std::nullopt;
+}
+
+bool starts_transaction(std::uint8_t type) {
+  return type == gtid_event || type == anonymous_gtid_event || type == gtid_tagged_event;
+}
+
+bool ends_transactions(std::uint8_t type) {
+  return type == rotate_event || type == stop_event ||
+         type == format_description_event || type == previous_gtids_event;
+}
+
+struct stored_transaction {
+  std::optional<gtids::gtid_set> gtid;
+  std::vector<const stored_event *> events;
+};
+
+std::vector<stored_transaction> transactions_of(const std::vector<stored_event> &events) {
+  std::vector<stored_transaction> result;
+  bool inside{false};
+  for (const auto &event : events) {
+    const auto type{event_type(event.bytes)};
+    if (starts_transaction(type)) {
+      result.push_back({transaction_gtid(event.bytes), {}});
+      inside = true;
+    } else if (ends_transactions(type)) {
+      inside = false;
+    }
+    if (inside) {
+      result.back().events.push_back(&event);
+    }
+  }
+  return result;
+}
+
+} // namespace
+
+// ---------------------------------------------------------------------------
+// D23: GTID dumps (COM_BINLOG_DUMP_GTID, upstream PBS-29 part 2)
+// ---------------------------------------------------------------------------
+
+// A COM_BINLOG_DUMP_GTID with the GTID set S the client already has sends
+// exactly the stored transactions whose GTID is not in S, in storage order,
+// byte for byte (MySQL: the source skips the transactions in S); S is
+// empty, a prefix of the stored transactions or any subset of them.
+BOOST_AUTO_TEST_CASE(GtidDumpSendsMissingTransactionsMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        start_case(tc, server);
+        const auto options{draw_options(tc, true)};
+        pbt::note(tc, "binlog_server: " + describe(options));
+        const auto storage{make_storage(options)};
+        pbt::note(tc, "workload:");
+        auto workload{draw_workload(tc, server.info, 10U)};
+        workload.push_back(operation{.kind = op_kind::insert_rows, .count = 1});
+        apply_all(tc, server.sql, workload);
+        fetch(tc, *storage);
+        require_storage_matches_server(tc, server.sql, server.info, *storage);
+        const auto events{stored_events_of(tc, *storage)};
+        const auto transactions{transactions_of(events)};
+
+        // the client's set: drawn per transaction (fractions: the number of
+        // transactions follows from the workload)
+        const auto kind{tc.draw("client_set", gs::sampled_from<std::string>(
+                                                  {"empty", "prefix", "subset"}))};
+        const auto cut{tc.draw("prefix_length", gs::integers<std::size_t>({.max_value = 1000U}))};
+        gtids::gtid_set client;
+        std::vector<bool> has(transactions.size(), false);
+        for (std::size_t i{0U}; i < transactions.size(); ++i) {
+          const bool pick{kind == "prefix" ? i < cut * transactions.size() / 1000U
+                          : kind == "subset" ? tc.draw("has_transaction", gs::booleans())
+                                             : false};
+          if (pick && transactions[i].gtid) {
+            client.add(*transactions[i].gtid);
+            has[i] = true;
+          }
+        }
+        pbt::note(tc, "client GTID set (" + kind + "): '" + client.str() + "' of " +
+                          std::to_string(transactions.size()) + " stored transactions");
+        std::vector<const stored_event *> expected;
+        for (std::size_t i{0U}; i < transactions.size(); ++i) {
+          if (!has[i]) {
+            expected.insert(expected.end(), transactions[i].events.begin(),
+                            transactions[i].events.end());
+          }
+        }
+
+        pull_process pull{tc, *storage};
+        pull.wait_until_listening();
+        const auto outcome{run_dump({.port = listener_port(), .gtids = client})};
+        pull.require_running();
+        pull.stop();
+        if (!outcome.error.empty()) {
+          pbt::note(tc, "binlog_server log:" + log_tail(*storage));
+        }
+        pbt::require(outcome.error.empty(), "GTID dump failed: " + outcome.error);
+        // the transactions it sent (events outside transactions - ROTATE,
+        // FORMAT_DESCRIPTION, PREVIOUS_GTIDS_LOG, STOP - are left out)
+        dump_outcome transactions_only{outcome};
+        std::erase_if(transactions_only.events, [](const timed_event &event) {
+          return ends_transactions(event_type(event.bytes));
+        });
+        require_same_events(tc, transactions_only, expected,
+                            "GTID dump with '" + client.str() + "'");
+      },
+      {.test_cases = 40U, .slow = true});
+}
+
+// A MySQL replica with SOURCE_AUTO_POSITION = 1 (GTID auto-positioning) of
+// the listener catches up with the source (gtid_executed, CHECKSUM TABLE),
+// also when it is stopped and started again (it then resumes by GTID set)
+// and when pull is stopped or killed and restarted meanwhile.
+BOOST_AUTO_TEST_CASE(GtidReplicaOfListenerMatchesSourceMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        replica_session replica;
+        start_case(tc, server);
+        const auto options{draw_options(tc, true)};
+        pbt::note(tc, "binlog_server: " + describe(options));
+        const auto storage{make_storage(options)};
+        pull_process pull{tc, *storage};
+        pull.wait_until_listening();
+        replica.sql().exec(
+            "CHANGE REPLICATION SOURCE TO SOURCE_HOST = '127.0.0.1', "
+            "SOURCE_PORT = " + std::to_string(listener_port()) +
+            ", SOURCE_USER = 'replica', SOURCE_PASSWORD = 'replica-password', "
+            "SOURCE_AUTO_POSITION = 1, GET_SOURCE_PUBLIC_KEY = 1, "
+            "SOURCE_CONNECT_RETRY = 1, SOURCE_RETRY_COUNT = 100000");
+        replica.sql().exec("START REPLICA");
+        const auto steps{tc.draw("steps", gs::integers<std::size_t>({.min_value = 1U,
+                                                                     .max_value = 6U}))};
+        for (std::size_t step{0U}; step < steps; ++step) {
+          const auto action{tc.draw("action", gs::sampled_from<std::string>(
+                                                  {"workload", "workload", "restart replica",
+                                                   "restart pull", "pause"}))};
+          if (action == "workload") {
+            pbt::note(tc, "workload:");
+            apply_all(tc, server.sql, draw_workload(tc, server.info, 4U));
+          } else if (action == "restart replica") {
+            pbt::note(tc, "STOP REPLICA, START REPLICA (resumes by GTID set)");
+            replica.sql().exec("STOP REPLICA");
+            replica.sql().exec("START REPLICA");
+          } else if (action == "restart pull") {
+            const bool kill{tc.draw("kill", gs::booleans())};
+            pbt::note(tc, kill ? "kill -9 pull and restart it" : "SIGTERM pull and restart it");
+            if (kill) {
+              pull.kill();
+            } else {
+              pull.stop();
+            }
+            pull.launch();
+            pull.wait_until_listening();
+          } else {
+            pbt::note(tc, "no workload for 1500 ms");
+            wait_ms(1500U);
+          }
+        }
+        apply_all(tc, server.sql, {operation{.kind = op_kind::insert_rows, .count = 1}});
+        const auto expected{server_executed(server.sql)};
+        const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{60}};
+        while (server_executed(replica.sql()) != expected) {
+          if (std::chrono::steady_clock::now() >= deadline) {
+            const auto status{replica.sql().first_row_named("SHOW REPLICA STATUS")};
+            for (const auto *column : {"Replica_IO_Running", "Replica_SQL_Running",
+                                       "Last_IO_Error", "Last_SQL_Error",
+                                       "Retrieved_Gtid_Set", "Executed_Gtid_Set"}) {
+              pbt::note(tc, std::string{column} + ": " + field(status, column));
+            }
+            pbt::note(tc, "source gtid_executed: " + expected.str());
+            pbt::note(tc, "binlog_server log:" + log_tail(*storage));
+            pbt::fail("the GTID replica did not reach the source's gtid_executed in 60 s");
+          }
+          pull.require_running();
+          wait_ms(200U);
+        }
+        const auto status{replica.sql().first_row_named("SHOW REPLICA STATUS")};
+        pbt::require(field(status, "Last_SQL_Error").empty(),
+                     "replica SQL thread error: " + field(status, "Last_SQL_Error"));
+        pbt::require_equal(table_checksums(replica.sql()), table_checksums(server.sql),
+                           "CHECKSUM TABLE of the pbt tables on the replica and the source");
+        pull.stop();
+      },
+      {.test_cases = 20U, .slow = true});
+}
+
+// ---------------------------------------------------------------------------
+// D24: heartbeats on idle blocking dumps (upstream PBS-30)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// MySQL's packed integer (net_field_length): < 251 one byte, 252 + 2 bytes,
+// 253 + 3 bytes, 254 + 8 bytes; false when truncated or 251 / 255
+bool read_packed(const std::string &data, std::size_t &offset, std::uint64_t &value) {
+  if (offset >= data.size()) {
+    return false;
+  }
+  const auto first{static_cast<unsigned char>(data[offset])};
+  std::size_t width{0U};
+  if (first < 251U) {
+    value = first;
+    ++offset;
+    return true;
+  }
+  width = first == 252U ? 2U : first == 253U ? 3U : first == 254U ? 8U : 0U;
+  if (width == 0U || data.size() - offset - 1U < width) {
+    return false;
+  }
+  value = 0U;
+  for (std::size_t i{0U}; i < width; ++i) {
+    value |= static_cast<std::uint64_t>(static_cast<unsigned char>(data[offset + 1U + i]))
+             << (8U * i);
+  }
+  offset += 1U + width;
+  return true;
+}
+
+struct heartbeat_content {
+  std::string file;
+  std::uint64_t position{};
+  std::string problem;  // empty: well-formed
+};
+
+// an independent decoder (CRC32 footer: the session asked for CRC32).
+// HEARTBEAT_LOG_EVENT: header log_pos = position, body = file name.
+// HEARTBEAT_LOG_EVENT_V2: body = <type> <length> <value> fields (packed
+// integers; 1 = file name, 2 = position, 0 = end), see MySQL
+// libs/mysql/binlog/event/codecs/binary.h
+heartbeat_content decode_heartbeat(const std::string &event) {
+  heartbeat_content result;
+  if (event.size() < 19U + 4U || le32(event, 9U) != event.size()) {
+    result.problem = "malformed event header / size";
+    return result;
+  }
+  const auto *bytes{reinterpret_cast<const Bytef *>(event.data())};
+  if (static_cast<std::uint32_t>(
+          ::crc32(0UL, bytes, static_cast<uInt>(event.size() - 4U))) !=
+      le32(event, event.size() - 4U)) {
+    result.problem = "wrong CRC32";
+    return result;
+  }
+  const auto body{event.substr(19U, event.size() - 19U - 4U)};
+  if (event_type(event) == heartbeat_event) {
+    result.file = body;
+    result.position = le32(event, 13U);
+    return result;
+  }
+  std::size_t offset{0U};
+  while (offset < body.size()) {
+    std::uint64_t type{};
+    std::uint64_t length{};
+    if (!read_packed(body, offset, type)) {
+      result.problem = "malformed field type";
+      return result;
+    }
+    if (type == 0U) {
+      break;
+    }
+    if (!read_packed(body, offset, length) || length > body.size() - offset) {
+      result.problem = "malformed field length";
+      return result;
+    }
+    if (type == 1U) {
+      result.file = body.substr(offset, length);
+      offset += length;
+    } else if (type == 2U) {
+      auto inner{offset};
+      if (!read_packed(body, inner, result.position) || inner != offset + length) {
+        result.problem = "malformed position field";
+        return result;
+      }
+      offset += length;
+    } else {
+      offset += length;
+    }
+  }
+  return result;
+}
+
+} // namespace
+
+// A blocking dump that is idle at the end of the storage gets a heartbeat
+// about every @source_heartbeat_period (none with 0): from 2 below to 1
+// above (idle time) / (period), never two within 80 % of the period, each a
+// well-formed HEARTBEAT_LOG_EVENT_V2 (the client sets USE_HEARTBEAT_EVENT_V2)
+// with a valid CRC32 that names the binlog and position the dump reached
+// (the end of the newest stored binlog). The stored events before are
+// unaffected.
+BOOST_AUTO_TEST_CASE(IdleDumpSendsHeartbeatsMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        start_case(tc, server);
+        const auto options{draw_options(tc)};
+        pbt::note(tc, "binlog_server: " + describe(options));
+        const auto storage{make_storage(options)};
+        pbt::note(tc, "workload:");
+        auto workload{draw_workload(tc, server.info, 6U)};
+        workload.push_back(operation{.kind = op_kind::insert_rows, .count = 1});
+        apply_all(tc, server.sql, workload);
+        fetch(tc, *storage);
+        require_storage_matches_server(tc, server.sql, server.info, *storage);
+        const auto events{stored_events_of(tc, *storage)};
+        const auto period_ms{tc.draw("heartbeat_period_ms", gs::sampled_from<std::uint64_t>(
+                                                                {0U, 250U, 500U, 1000U}))};
+        const bool from_start{tc.draw("from_first_binlog", gs::booleans())};
+        const auto &newest{events.back()};
+        const auto end_position{newest.offset + newest.bytes.size()};
+        dump_options dump{.port = listener_port(),
+                          .file = from_start ? events.front().file : newest.file,
+                          .position = from_start ? 4U : end_position,
+                          .blocking = true,
+                          .heartbeat_period_ns = period_ms * 1000000U,
+                          .heartbeat_v2 = true,
+                          .idle_window = std::chrono::milliseconds{3000}};
+        pbt::note(tc, "blocking dump from " + dump.file + ":" + std::to_string(dump.position) +
+                          ", heartbeat period " + std::to_string(period_ms) +
+                          " ms, idle for 3000 ms");
+        std::vector<const stored_event *> expected;
+        for (const auto &event : events) {
+          if (from_start) {
+            expected.push_back(&event);
+          }
+        }
+
+        pull_process pull{tc, *storage};
+        pull.wait_until_listening();
+        const auto outcome{run_dump(dump)};
+        pull.require_running();
+        pull.stop();
+        pbt::require(outcome.error.empty(), "the dump failed: " + outcome.error);
+        require_same_events(tc, outcome, expected, "blocking dump");
+
+        std::vector<const timed_event *> heartbeats;
+        std::int64_t idle_since{0};
+        for (const auto &event : outcome.events) {
+          if (is_heartbeat(event.bytes)) {
+            heartbeats.push_back(&event);
+          } else {
+            idle_since = event.at_ms;
+          }
+        }
+        pbt::note(tc, std::to_string(heartbeats.size()) + " heartbeat(s)");
+        if (period_ms == 0U) {
+          pbt::require(heartbeats.empty(),
+                       "heartbeats although the client asked for none (period 0)");
+          return;
+        }
+        const auto idle_ms{outcome.events.empty()
+                               ? std::int64_t{3000}
+                               : (heartbeats.empty() ? std::int64_t{3000}
+                                                     : std::max<std::int64_t>(
+                                                           3000, heartbeats.back()->at_ms - idle_since))};
+        const auto nominal{static_cast<std::int64_t>(idle_ms) /
+                           static_cast<std::int64_t>(period_ms)};
+        pbt::require(static_cast<std::int64_t>(heartbeats.size()) >= std::max<std::int64_t>(1, nominal - 2) &&
+                         static_cast<std::int64_t>(heartbeats.size()) <= nominal + 1,
+                     "heartbeats in " + std::to_string(idle_ms) + " ms idle with a " +
+                         std::to_string(period_ms) + " ms period: " +
+                         std::to_string(heartbeats.size()));
+        for (std::size_t i{0U}; i < heartbeats.size(); ++i) {
+          const auto &bytes{heartbeats[i]->bytes};
+          pbt::require_equal(static_cast<unsigned>(event_type(bytes)),
+                             unsigned{heartbeat_v2_event},
+                             "event type of a heartbeat (USE_HEARTBEAT_EVENT_V2 set)");
+          const auto content{decode_heartbeat(bytes)};
+          pbt::require(content.problem.empty(), "heartbeat " + std::to_string(i) + ": " +
+                                                    content.problem);
+          pbt::require_equal(content.file, newest.file, "binlog named by a heartbeat");
+          pbt::require_equal(content.position, std::uint64_t{end_position},
+                             "position in a heartbeat (end of the newest binlog)");
+          if (i != 0U) {
+            pbt::require(heartbeats[i]->at_ms - heartbeats[i - 1U]->at_ms >=
+                             static_cast<std::int64_t>(period_ms * 8U / 10U),
+                         "two heartbeats " +
+                             std::to_string(heartbeats[i]->at_ms - heartbeats[i - 1U]->at_ms) +
+                             " ms apart with a " + std::to_string(period_ms) + " ms period");
+          }
+        }
+      },
+      {.test_cases = 20U, .slow = true});
+}
+
+// MySQL sends HEARTBEAT_LOG_EVENT_V2 only to clients that set
+// USE_HEARTBEAT_EVENT_V2 in the dump request (replicas from 8.0.26 on), and
+// HEARTBEAT_LOG_EVENT to the others (sql/rpl_binlog_sender.cc), which do
+// not know the new event.
+BOOST_AUTO_TEST_CASE(HeartbeatVersionFollowsDumpFlagMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        start_case(tc, server);
+        const auto options{draw_options(tc)};
+        const auto storage{make_storage(options)};
+        apply_all(tc, server.sql, {operation{.kind = op_kind::insert_rows, .count = 1}});
+        fetch(tc, *storage);
+        const auto events{stored_events_of(tc, *storage)};
+        const bool v2{tc.draw("use_heartbeat_event_v2", gs::booleans())};
+        pbt::note(tc, std::string{"binlog_server: "} + describe(options) +
+                          "; dump flag USE_HEARTBEAT_EVENT_V2 " + (v2 ? "set" : "not set"));
+        const auto &newest{events.back()};
+        pull_process pull{tc, *storage};
+        pull.wait_until_listening();
+        const auto outcome{run_dump({.port = listener_port(),
+                                     .file = newest.file,
+                                     .position = newest.offset + newest.bytes.size(),
+                                     .blocking = true,
+                                     .heartbeat_period_ns = 200000000U,
+                                     .heartbeat_v2 = v2,
+                                     .idle_window = std::chrono::milliseconds{1000}})};
+        pull.stop();
+        pbt::require(outcome.error.empty(), "the dump failed: " + outcome.error);
+        std::size_t count{0U};
+        for (const auto &event : outcome.events) {
+          if (is_heartbeat(event.bytes)) {
+            ++count;
+            pbt::require_equal(static_cast<unsigned>(event_type(event.bytes)),
+                               unsigned{v2 ? heartbeat_v2_event : heartbeat_event},
+                               std::string{"heartbeat event type with USE_HEARTBEAT_EVENT_V2 "} +
+                                   (v2 ? "set" : "not set"));
+            const auto content{decode_heartbeat(event.bytes)};
+            pbt::require(content.problem.empty(), "malformed heartbeat: " + content.problem);
+          }
+        }
+        pbt::require(count != 0U, "no heartbeat in 1000 ms idle with a 200 ms period");
+      },
+      {.test_cases = 6U, .slow = true});
+}
+
+// A MySQL replica of the listener with SOURCE_HEARTBEAT_PERIOD below its
+// replica_net_timeout stays connected while the source is idle: it
+// receives heartbeats (performance_schema.replication_connection_status)
+// and does not reconnect (no new listener session), and it still catches up
+// afterwards.
+BOOST_AUTO_TEST_CASE(ReplicaReceivesHeartbeatsMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        replica_session replica;
+        start_case(tc, server);
+        const auto options{draw_options(tc, true)};
+        const auto period{tc.draw("heartbeat_period", gs::sampled_from<std::string>({"0.5", "1"}))};
+        pbt::note(tc, "binlog_server: " + describe(options) + "; SOURCE_HEARTBEAT_PERIOD " +
+                          period + ", replica_net_timeout 3");
+        const auto storage{make_storage(options)};
+        pull_process pull{tc, *storage};
+        pull.wait_until_listening();
+        replica.sql().exec("SET GLOBAL replica_net_timeout = 3");
+        replica.sql().exec(
+            "CHANGE REPLICATION SOURCE TO SOURCE_HOST = '127.0.0.1', "
+            "SOURCE_PORT = " + std::to_string(listener_port()) +
+            ", SOURCE_USER = 'replica', SOURCE_PASSWORD = 'replica-password', "
+            "SOURCE_LOG_FILE = '" + server_binlogs(server.sql).front().name +
+            "', SOURCE_LOG_POS = 4, GET_SOURCE_PUBLIC_KEY = 1, "
+            "SOURCE_CONNECT_RETRY = 1, SOURCE_HEARTBEAT_PERIOD = " + period);
+        replica.sql().exec("START REPLICA");
+        apply_all(tc, server.sql, draw_workload(tc, server.info, 4U));
+        apply_all(tc, server.sql, {operation{.kind = op_kind::insert_rows, .count = 1}});
+        const auto wait_caught_up{[&]() {
+          const auto expected{server_executed(server.sql)};
+          const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{30}};
+          while (server_executed(replica.sql()) != expected) {
+            pull.require_running();
+            if (std::chrono::steady_clock::now() >= deadline) {
+              const auto status{replica.sql().first_row_named("SHOW REPLICA STATUS")};
+              pbt::note(tc, "Last_IO_Error: " + field(status, "Last_IO_Error"));
+              pbt::fail("the replica did not catch up in 30 s");
+            }
+            wait_ms(100U);
+          }
+        }};
+        wait_caught_up();
+        const auto heartbeats{[&]() {
+          return std::stoull(replica.sql().scalar(
+              "SELECT COUNT_RECEIVED_HEARTBEATS FROM "
+              "performance_schema.replication_connection_status"));
+        }};
+        const auto sessions{[&]() {
+          const auto text{read_file_if_exists(storage->log())};
+          std::size_t count{0U};
+          for (auto at{text.find("net    : accepted connection")}; at != std::string::npos;
+               at = text.find("net    : accepted connection", at + 1U)) {
+            ++count;
+          }
+          return count;
+        }};
+        const auto before{heartbeats()};
+        const auto sessions_before{sessions()};
+        pbt::note(tc, "idle for 8 s");
+        wait_ms(8000U);
+        const auto received{heartbeats() - before};
+        const auto new_sessions{sessions() - sessions_before};
+        pbt::note(tc, std::to_string(received) + " heartbeat(s), " +
+                          std::to_string(new_sessions) + " new listener session(s)");
+        const auto minimum{period == "1" ? 5U : 10U};
+        pbt::require(received >= minimum, "the replica received " + std::to_string(received) +
+                                              " heartbeats in 8 s idle with a " + period +
+                                              " s period");
+        pbt::require_equal(new_sessions, std::size_t{0U},
+                           "listener sessions opened while idle (the replica reconnected)");
+        apply_all(tc, server.sql, {operation{.kind = op_kind::insert_rows, .count = 1}});
+        wait_caught_up();
+        pull.stop();
+      },
+      {.test_cases = 6U, .slow = true});
+}
+
+// ---------------------------------------------------------------------------
+// D25: TLS of the replication source listener (upstream PBS-31 part 1)
+// ---------------------------------------------------------------------------
+
+// replication_source.ssl (the test PKI's certificate for 127.0.0.1) or
+// none, and a client dumps with ssl-mode disabled / preferred / required /
+// verify_ca / verify_identity (CA: the test CA). Expected as with a MySQL
+// server: with a certificate the connection is encrypted unless the client
+// disables TLS; without one it is not encrypted, and required / verify_*
+// fail on the client side. A dump that connects receives exactly the
+// stored events; pull keeps running.
+BOOST_AUTO_TEST_CASE(ListenerTlsIsHonouredMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        start_case(tc, server);
+        auto options{draw_options(tc)};
+        // require_secure_transport: ListenerRequiresSecureTransportMySQL
+        const auto listener{tc.draw("listener_tls", gs::sampled_from<std::string>(
+                                                       {"none", "certificate"}))};
+        const auto dir{tls_dir()};
+        if (listener != "none") {
+          options.listener_certificate = std::pair{(dir / "server-cert.pem").string(),
+                                                   (dir / "server-key.pem").string()};
+        }
+        const auto mode{tc.draw("client_ssl_mode", gs::sampled_from<std::string>(
+                                                      {"disabled", "preferred", "required",
+                                                       "verify_ca", "verify_identity"}))};
+        pbt::note(tc, "binlog_server: " + describe(options) + "; listener: " + listener +
+                          "; client ssl-mode " + mode);
+        const auto storage{make_storage(options)};
+        apply_all(tc, server.sql, {operation{.kind = op_kind::insert_rows, .count = 2}});
+        fetch(tc, *storage);
+        const auto events{stored_events_of(tc, *storage)};
+        std::vector<const stored_event *> expected;
+        for (const auto &event : events) {
+          expected.push_back(&event);
+        }
+        const std::map<std::string, unsigned> modes{
+            {"disabled", SSL_MODE_DISABLED}, {"preferred", SSL_MODE_PREFERRED},
+            {"required", SSL_MODE_REQUIRED}, {"verify_ca", SSL_MODE_VERIFY_CA},
+            {"verify_identity", SSL_MODE_VERIFY_IDENTITY}};
+        const bool listener_tls{listener != "none"};
+        const bool needs_tls{mode != "disabled" && mode != "preferred"};
+        const bool must_connect{listener_tls ? !(mode == "disabled" && options.listener_requires_tls)
+                                             : !needs_tls};
+        const bool must_encrypt{listener_tls && mode != "disabled"};
+
+        pull_process pull{tc, *storage};
+        pull.wait_until_listening();
+        const auto outcome{run_dump({.port = listener_port(),
+                                     .file = events.front().file,
+                                     .position = 4U,
+                                     .ssl_mode = modes.at(mode),
+                                     .ssl_ca = (dir / "ca.pem").string()})};
+        pbt::note(tc, std::string{"client: "} + (outcome.connected ? "connected" : "not connected") +
+                          (outcome.cipher.empty() ? "" : ", cipher " + outcome.cipher) +
+                          (outcome.error.empty() ? "" : ", " + outcome.error));
+        if (!outcome.error.empty() || !outcome.connected) {
+          pbt::note(tc, "binlog_server log:" + log_tail(*storage));
+        }
+        pull.require_running();
+        pull.stop();
+        if (!must_connect) {
+          pbt::require(!outcome.connected || !outcome.error.empty(),
+                       "the dump succeeded although it must be refused");
+          return;
+        }
+        pbt::require(outcome.connected && outcome.error.empty(),
+                     "the dump failed although the listener must accept it: " + outcome.error);
+        pbt::require(outcome.cipher.empty() != must_encrypt,
+                     must_encrypt ? "the connection is not encrypted although the listener "
+                                    "has a certificate and the client did not disable TLS"
+                                  : "the connection is encrypted although it must not be");
+        require_same_events(tc, outcome, expected, "dump");
+      },
+      {.test_cases = 40U, .slow = true});
+}
+
+// README: with require_secure_transport the listener "requires secure
+// transport": like a MySQL server with require_secure_transport = ON it
+// refuses a client that does not use TLS (MySQL: error 3159, "Connections
+// using insecure transport are prohibited ..."), without sending it any
+// event; pull keeps running.
+BOOST_AUTO_TEST_CASE(ListenerRequiresSecureTransportMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        start_case(tc, server);
+        auto options{draw_options(tc)};
+        const auto dir{tls_dir()};
+        options.listener_certificate = std::pair{(dir / "server-cert.pem").string(),
+                                                 (dir / "server-key.pem").string()};
+        options.listener_requires_tls = true;
+        pbt::note(tc, "binlog_server: " + describe(options) +
+                          "; listener: certificate, require_secure_transport; client "
+                          "ssl-mode disabled");
+        const auto storage{make_storage(options)};
+        apply_all(tc, server.sql, {operation{.kind = op_kind::insert_rows, .count = 1}});
+        fetch(tc, *storage);
+        const auto events{stored_events_of(tc, *storage)};
+        pull_process pull{tc, *storage};
+        pull.wait_until_listening();
+        const auto outcome{run_dump({.port = listener_port(),
+                                     .file = events.front().file,
+                                     .position = 4U,
+                                     .ssl_mode = SSL_MODE_DISABLED})};
+        pbt::note(tc, std::string{"client: "} + (outcome.connected ? "connected" : "not connected") +
+                          ", " + std::to_string(outcome.events.size()) + " event(s)" +
+                          (outcome.error.empty() ? "" : ", " + outcome.error));
+        pull.require_running();
+        pull.stop();
+        pbt::require(!outcome.connected || !outcome.error.empty(),
+                     "a client without TLS got a binlog dump although the listener "
+                     "requires secure transport");
+        pbt::require(outcome.events.empty(),
+                     "a client without TLS received events although the listener "
+                     "requires secure transport");
+      },
+      {.test_cases = 5U, .slow = true});
 }
