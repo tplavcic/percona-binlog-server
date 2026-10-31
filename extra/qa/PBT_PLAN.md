@@ -673,6 +673,16 @@ Cross-check with another team member's findings showed that a dump from a positi
 
 `UnencryptedFirstLoginWorksMySQL` finds PBT-045 (medium): without TLS, `fetch` / `pull` cannot log in as a `caching_sha2_password` account the server has not cached yet (no RSA public key requested). Same as Hrvoje's ticket 23. `TlsSettingsAreHonouredMySQL` logs the account in once with the RSA key first, so that it tests the TLS settings alone.
 
+### After the rebase onto PBS-29 part 2, PBS-30 and PBS-31 part 1 (sandbox run)
+
+Upstream added `COM_BINLOG_DUMP_GTID` handling (PBS-29 part 2), heartbeats on idle blocking dumps (PBS-30) and TLS for the replication source listener (PBS-31 part 1). Test changes:
+
+- `indexed_event_block` now indexes by event or by transaction; `get_number_of_events()` is `get_number_of_matching_events()` (the single-buffer constructor indexes by event, as before).
+- `replication_source.require_secure_transport` is a new required key, with an optional `replication_source.ssl` section (`cert`, `key`, both non-empty) that is required when it is `true`. The fixed test configurations set it to `false`; `config_property_test` draws it, adds the `ssl` section, and checks the new rules (missing section with `true`, empty `cert` / `key`). An empty `auth_rsa_private_key` is now rejected only when secure transport is not required.
+- The `PBT-042` row also matches "list during pull failed": when Hegel reports the race as flaky, the report has no counterexample text to match.
+
+Sandbox (release, MySQL 8.0.46): all properties run; no new issue, no regression. Not covered yet: GTID-based replicas of the listener, heartbeats, and listener TLS.
+
 ## 6. Open questions
 
 See the hand-over message; the answers will be folded in here.
