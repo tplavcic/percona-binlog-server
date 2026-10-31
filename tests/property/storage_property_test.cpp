@@ -219,6 +219,7 @@ make_config(const temporary_directory &directory,
   "replication_source": {"port": 3307, "server_id": 142,
                          "server_uuid": "00000000-0000-0000-0000-00000000008e",
                          "read_timeout": 1, "write_timeout": 1,
+                         "require_secure_transport": false,
                          "authentication": {"user": "u", "password": "p",
                                             "plugin": "caching_sha2_password"}},)";
   if (!settings.keyring.empty()) {
@@ -1242,7 +1243,7 @@ BOOST_AUTO_TEST_CASE(IndexedEventBlockSplitsCompleteEvents) {
                  tail_event.begin() + static_cast<std::ptrdiff_t>(tail_length));
 
     const binsrv::indexed_event_block indexed{to_buffer(block)};
-    pbt::require_equal(indexed.get_number_of_events(), sizes.size(),
+    pbt::require_equal(indexed.get_number_of_matching_events(), sizes.size(),
                        "number of complete events");
     pbt::require_equal(indexed.get_parsed_size(), complete_size,
                        "size of the parsed part");
@@ -1309,7 +1310,7 @@ BOOST_AUTO_TEST_CASE(IndexedEventBlockTerminatesOnAnyInput) {
             if (indexed.get_parsed_size() > buffer.size()) {
               code = child_beyond_block;
             }
-            for (std::size_t i{0U}; i < indexed.get_number_of_events(); ++i) {
+            for (std::size_t i{0U}; i < indexed.get_number_of_matching_events(); ++i) {
               if (std::size(indexed.get_event(i)) < 19U) {
                 code = child_short_event;
               }

@@ -221,6 +221,7 @@ void write_config(generated_storage &storage) {
   "replication_source": {"port": 3307, "server_id": 142,
                          "server_uuid": "00000000-0000-0000-0000-00000000008e",
                          "read_timeout": 1, "write_timeout": 1,
+                         "require_secure_transport": false,
                          "authentication": {"user": "u", "password": "p",
                                             "plugin": "caching_sha2_password"}},
   "storage": {"backend": "file", "uri": "file://)"

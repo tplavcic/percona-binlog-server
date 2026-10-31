@@ -973,6 +973,8 @@ std::unique_ptr<pbs_storage> make_storage(const pbs_options &options) {
       {"server_id", 142},
       {"server_uuid", "00000000-0000-0000-0000-00000000008e"},
       {"auth_rsa_private_key", listener_rsa_key().string()},
+      // README: true needs the 'ssl' section (listener TLS, not tested yet)
+      {"require_secure_transport", false},
       {"read_timeout", 5},
       {"write_timeout", 5},
       {"authentication", json::object{{"user", "replica"},

@@ -196,6 +196,14 @@ json::object valid_config(hegel::TestCase &tc) {
   }
   replication_source["read_timeout"] = draw_u32(1U);
   replication_source["write_timeout"] = draw_u32(1U);
+  // README: require_secure_transport true needs the ssl section (cert and
+  // key not empty); the section is optional otherwise
+  const bool secure{tc.draw(gs::booleans())};
+  replication_source["require_secure_transport"] = secure;
+  if (secure || tc.draw(gs::booleans())) {
+    replication_source["ssl"] = json::object{{"cert", "/etc/pbs/listener_cert.pem"},
+                                             {"key", "/etc/pbs/listener_cert_key.pem"}};
+  }
   replication_source["authentication"] = authentication;
 
   json::object storage;
@@ -290,7 +298,8 @@ bool is_required(const std::vector<std::string> &path) {
       "connection.tls.version",  "keyring",
       "replication.rewrite",     "storage.fs_buffer_directory",
       "storage.checkpoint_size", "storage.checkpoint_interval",
-      "storage.encryption",      "replication_source.auth_rsa_private_key"};
+      "storage.encryption",      "replication_source.auth_rsa_private_key",
+      "replication_source.ssl"};
   const auto name{join(path)};
   if (name == "keyring.uri") {
     return true;
@@ -356,7 +365,8 @@ std::vector<violation> applicable_violations(const json::object &config) {
                                    : std::int64_t{4294967296LL});
       }
     }
-    if (name == "replication.verify_checksum") {
+    if (name == "replication.verify_checksum" ||
+        name == "replication_source.require_secure_transport") {
       add("boolean given as a string", path, "true");
       add("boolean given as a number", path, 1);
     }
@@ -364,7 +374,8 @@ std::vector<violation> applicable_violations(const json::object &config) {
          {"logger.file", "connection.user", "connection.password",
           "storage.uri", "replication_source.authentication.user",
           "replication_source.server_uuid",
-          "replication_source.auth_rsa_private_key"}) {
+          "replication_source.auth_rsa_private_key",
+          "replication_source.ssl.cert", "replication_source.ssl.key"}) {
       if (name == text) {
         add("string given as a number", path, 42);
       }
@@ -415,9 +426,21 @@ std::vector<violation> applicable_violations(const json::object &config) {
     add("server_uuid not in the canonical form",
         {"replication_source", "server_uuid"}, json::value(uuid));
   }
-  if (has({"replication_source", "auth_rsa_private_key"})) {
+  // an empty auth_rsa_private_key is rejected only without secure transport
+  // (replication_source_config::validate(); with TLS required the full
+  // authentication does not need the key)
+  if (has({"replication_source", "auth_rsa_private_key"}) &&
+      !config.at("replication_source").at("require_secure_transport").as_bool()) {
     add("empty auth_rsa_private_key",
         {"replication_source", "auth_rsa_private_key"}, "");
+  }
+  if (has({"replication_source", "ssl"})) {
+    add("empty ssl.cert", {"replication_source", "ssl", "cert"}, "");
+    add("empty ssl.key", {"replication_source", "ssl", "key"}, "");
+    if (config.at("replication_source").at("require_secure_transport").as_bool()) {
+      add("require_secure_transport without the ssl section",
+          {"replication_source", "ssl"}, nullptr, true);
+    }
   }
   add("empty authentication.user",
       {"replication_source", "authentication", "user"}, "");
@@ -522,6 +545,14 @@ BOOST_AUTO_TEST_CASE(ValidConfigurationLoads) {
             root.get<"replication_source">().get<"server_uuid">(),
             std::string{config.at("replication_source").at("server_uuid").as_string()},
             "replication_source.server_uuid");
+        pbt::require_equal(
+            root.get<"replication_source">().get<"require_secure_transport">(),
+            config.at("replication_source").at("require_secure_transport").as_bool(),
+            "replication_source.require_secure_transport");
+        pbt::require_equal(
+            root.get<"replication_source">().get<"ssl">().has_value(),
+            config.at("replication_source").as_object().contains("ssl"),
+            "replication_source.ssl present");
         pbt::require_equal(root.get<"storage">().has_encryption(),
                            config.at("storage").as_object().contains("encryption"),
                            "storage.encryption present");
