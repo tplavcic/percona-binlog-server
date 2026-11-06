@@ -4637,7 +4637,8 @@ BOOST_AUTO_TEST_CASE(KilledFirstFetchIsRecoveredMySQL) {
 }
 
 // An object the storage does not index (file backend): one of the
-// README's garbage objects is removed and fetch continues; any other object
+// README's garbage objects (for the next binlog: only while it holds no
+// events, see below) is removed and fetch continues; any other object
 // makes fetch fail and nothing is removed; without it, fetch works again.
 // 'list' (read-only) works either way.
 BOOST_AUTO_TEST_CASE(UnindexedObjectsFollowTheRulesMySQL) {
@@ -4672,8 +4673,6 @@ BOOST_AUTO_TEST_CASE(UnindexedObjectsFollowTheRulesMySQL) {
           kinds.insert(kinds.end(), kinds.size(), "older_binlog");
         }
         const auto kind{tc.draw("unindexed", gs::sampled_from(kinds))};
-        const bool garbage{kind == "next_binlog" || kind == "next_binlog_with_metadata" ||
-                           kind == "older_binlog"};
         std::vector<std::string> objects;
         if (kind == "next_binlog" || kind == "next_binlog_with_metadata") {
           objects.push_back(binlog_name(last + 1U));
@@ -4696,11 +4695,44 @@ BOOST_AUTO_TEST_CASE(UnindexedObjectsFollowTheRulesMySQL) {
         }
         const auto content{tc.draw("content", gs::sampled_from<std::string>(
                                                   {"", std::string{"\xFE" "bin"}, "garbage"}))};
+        // a metadata file of the next binlog: junk, or a valid one (the
+        // newest binlog's, as written by PBS) recording the 4-byte magic
+        // only (what an interrupted rotation leaves) or its real size
+        const auto metadata{tc.draw("metadata", gs::sampled_from<std::string>(
+                                                    {"junk", "empty binlog", "with events"}))};
+        const auto metadata_text{[&]() -> std::string {
+          if (metadata == "junk") {
+            return content;
+          }
+          auto object{json::parse(read_file(storage->vault() / (names.back() + ".json")))
+                          .as_object()};
+          if (metadata == "empty binlog") {
+            object["size"] = 4;
+          }
+          return json::serialize(object);
+        }};
+        // README "Storage consistency checks"; since upstream PBS-109 /
+        // PBS-110 (e2fdd50) the objects of an interrupted creation of the next
+        // binlog are garbage only while they hold no events: a data file of
+        // at most the 4-byte magic and a valid metadata file recording 4
+        // bytes (a binlog index that lost its last entry is not repaired by
+        // deleting a binlog with events). Older binlogs left by an
+        // interrupted purge are garbage whatever they hold.
+        const bool next_data_empty{content.size() <= 4U};
+        const bool next_metadata_empty{metadata == "empty binlog"};
+        const bool garbage{kind == "older_binlog" ||
+                           (kind == "next_binlog" && next_data_empty) ||
+                           (kind == "next_binlog_with_metadata" && next_data_empty &&
+                            next_metadata_empty) ||
+                           (kind == "next_metadata_only" && next_metadata_empty)};
         for (const auto &object : objects) {
-          std::ofstream{storage->vault() / object, std::ios::binary} << content;
+          const bool is_metadata{object.ends_with(".json")};
+          std::ofstream{storage->vault() / object, std::ios::binary}
+              << (is_metadata && kind != "older_binlog" ? metadata_text() : content);
         }
         pbt::note(tc, "unindexed object(s) (" + kind + "): " + joined(objects) +
-                          "with " + std::to_string(content.size()) + " byte(s)");
+                          "data " + std::to_string(content.size()) + " byte(s), metadata " +
+                          metadata + (garbage ? " - garbage" : " - not garbage"));
         const auto before{vault_objects(*storage)};
         const auto listed{run({"list", storage->config_path})};
         pbt::require(!listed.signaled && listed.exit_code == 0,
@@ -6742,6 +6774,12 @@ BOOST_AUTO_TEST_CASE(ListenerRequiresSecureTransportMySQL) {
         pbt::require(outcome.events.empty(),
                      "a client without TLS received events although the listener "
                      "requires secure transport");
+        // and it is told why, with an error packet (MySQL: 3159), not with a
+        // dropped connection (the client then reports "Lost connection")
+        pbt::require(outcome.error.find("Lost connection") == std::string::npos &&
+                         outcome.error.find("lost connection") == std::string::npos,
+                     "the listener refused a client without TLS without an error "
+                     "packet: " + outcome.error);
       },
       {.test_cases = 5U, .slow = true});
 }
