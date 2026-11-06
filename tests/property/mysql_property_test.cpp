@@ -905,6 +905,10 @@ struct pbs_storage {
 
   [[nodiscard]] fs::path vault() const { return directory.path() / "vault"; }
   [[nodiscard]] fs::path log() const { return directory.path() / "binsrv.log"; }
+  // instance.local_settings_path (where PBS keeps its instance_id file)
+  [[nodiscard]] fs::path local_settings() const {
+    return directory.path() / "local-settings";
+  }
   // the stored binlog file / object
   [[nodiscard]] std::string stored(const std::string &name) const;
   // its plaintext: decrypted independently of PBS (OpenSSL EVP, the KEK of
@@ -948,8 +952,16 @@ std::unique_ptr<pbs_storage> make_storage(const pbs_options &options) {
   fs::create_directories(result->vault());
   const auto server{settings()};
   json::object config;
+  // README <instance>: mandatory, an existing directory for the instance's
+  // own state (the instance_id file); one per storage, inside its directory
+  fs::create_directories(result->local_settings());
+  config["instance"] =
+      json::object{{"local_settings_path", result->local_settings().string()}};
   config["logger"] = json::object{{"level", "info"},
                                   {"file", result->log().string()}};
+  // README <telemetry>: on by default in 'pull', which then writes reports to
+  // /usr/local/percona/telemetry/pbs, outside $TMPDIR
+  config["telemetry"] = json::object{{"enabled", false}};
   config["connection"] = json::object{{"host", server.host},
                                       {"port", options.mysql_port
                                                    ? unsigned{*options.mysql_port}
@@ -3988,12 +4000,18 @@ BOOST_AUTO_TEST_CASE(DiskFullStopsPullMySQL) {
 namespace {
 
 // a copy of the storage's configuration for a second process: its own log,
-// replication server_id (MySQL ends the older dump of a replica with the
-// same server_id) and listener port
+// instance.local_settings_path (README: each instance on a host gets its
+// own), replication server_id (MySQL ends the older dump of a replica with
+// the same server_id) and listener port
 std::string second_config(const pbs_storage &storage) {
   auto config{json::parse(read_file(storage.config_path)).as_object()};
   config["logger"].as_object()["file"] =
       (storage.directory.path() / "binsrv-second.log").string();
+  const auto second_local_settings{storage.directory.path() /
+                                   "local-settings-second"};
+  fs::create_directories(second_local_settings);
+  config["instance"].as_object()["local_settings_path"] =
+      second_local_settings.string();
   config["replication"].as_object()["server_id"] = 4243;
   config["replication_source"].as_object()["port"] =
       static_cast<unsigned>(listener_port()) + 1U;

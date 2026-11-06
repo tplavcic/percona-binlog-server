@@ -208,8 +208,13 @@ std::string iso(std::time_t value) {
 
 void write_config(generated_storage &storage) {
   const auto config_path{storage.directory.path() / "config.json"};
+  // README <instance>: mandatory, an existing directory (instance_id file)
+  const auto local_settings{storage.directory.path() / "local-settings"};
+  fs::create_directories(local_settings);
   std::ofstream output{config_path};
   output << R"({
+  "instance": {"local_settings_path": ")"
+         << local_settings.generic_string() << R"("},
   "logger": {"level": "error", "file": ")"
          << (storage.directory.path() / "binsrv.log").generic_string() << R"("},
   "connection": {"host": "127.0.0.1", "port": 3306, "user": "u",
@@ -225,7 +230,8 @@ void write_config(generated_storage &storage) {
                          "authentication": {"user": "u", "password": "p",
                                             "plugin": "caching_sha2_password"}},
   "storage": {"backend": "file", "uri": "file://)"
-         << storage.vault().generic_string() << R"("}
+         << storage.vault().generic_string() << R"("},
+  "telemetry": {"enabled": false}
 }
 )";
   storage.config_path = config_path.string();

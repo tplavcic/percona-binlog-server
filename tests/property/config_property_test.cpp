@@ -27,7 +27,14 @@
 //    when it is loaded, with an exception;
 //  - a misspelled key is not silently ignored;
 //  - storage_config::get_masked_uri(), used when the configuration is
-//    logged, never contains the S3 secret access key.
+//    logged, never contains the S3 secret access key;
+//  - the instance identifier kept in instance.local_settings_path is stable
+//    across loads, and a missing or malformed instance_id file is
+//    regenerated.
+//
+// Every "is rejected" property first loads the configuration it starts from:
+// a rejection then comes from the change under test, not from something else
+// the generated configuration lacks (such as a newly mandatory section).
 
 #define BOOST_TEST_MODULE ConfigPropertyTests
 
@@ -64,6 +71,8 @@
 
 #include "easymysql/ssl_mode_type.hpp"
 
+#include "util/uuid_helpers.hpp"
+
 #include "common/pbt_helpers.hpp"
 
 namespace {
@@ -99,6 +108,53 @@ private:
   fs::path path_;
 };
 
+class temporary_directory {
+public:
+  temporary_directory() {
+    std::string pattern{
+        (fs::temp_directory_path() / "pbs-pbt-config-dir-XXXXXX").string()};
+    if (::mkdtemp(std::data(pattern)) == nullptr) {
+      throw std::runtime_error{"mkdtemp failed"};
+    }
+    path_ = pattern;
+  }
+  temporary_directory(const temporary_directory &) = delete;
+  temporary_directory &operator=(const temporary_directory &) = delete;
+  temporary_directory(temporary_directory &&) = delete;
+  temporary_directory &operator=(temporary_directory &&) = delete;
+  ~temporary_directory() {
+    std::error_code ignored;
+    fs::remove_all(path_, ignored);
+  }
+  [[nodiscard]] const fs::path &path() const noexcept { return path_; }
+
+private:
+  fs::path path_;
+};
+
+// One directory per test process (under $TMPDIR, removed at exit) holding an
+// existing instance.local_settings_path for the generated configurations and
+// a regular file for the "not a directory" rule. Loading a configuration
+// writes the instance_id file into local_settings_path.
+const temporary_directory &scratch() {
+  static const temporary_directory directory;
+  return directory;
+}
+
+fs::path local_settings_dir() {
+  const auto path{scratch().path() / "local-settings"};
+  fs::create_directories(path);
+  return path;
+}
+
+fs::path regular_file() {
+  const auto path{scratch().path() / "regular-file"};
+  if (!fs::exists(path)) {
+    std::ofstream{path} << "not a directory\n";
+  }
+  return path;
+}
+
 std::unique_ptr<binsrv::main_config> load(const json::object &config,
                                           hegel::TestCase &tc) {
   const auto text{json::serialize(config)};
@@ -109,6 +165,17 @@ std::unique_ptr<binsrv::main_config> load(const json::object &config,
     output << text;
   }
   return std::make_unique<binsrv::main_config>(file.path().string());
+}
+
+// The configuration a rejection property starts from must load: otherwise
+// it is rejected for another reason and the property passes without testing
+// its rule.
+void require_baseline_loads(const json::object &config, hegel::TestCase &tc) {
+  try {
+    std::ignore = load(config, tc);
+  } catch (const std::exception &e) {
+    pbt::fail(std::string{"valid configuration rejected: "} + e.what());
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -229,6 +296,10 @@ json::object valid_config(hegel::TestCase &tc) {
   }
 
   json::object root;
+  // README <instance>: mandatory, an existing directory
+  json::object instance;
+  instance["local_settings_path"] = local_settings_dir().string();
+  root["instance"] = instance;
   root["logger"] = logger;
   root["connection"] = connection;
   root["replication"] = replication;
@@ -245,6 +316,14 @@ json::object valid_config(hegel::TestCase &tc) {
     root["keyring"] = keyring;
   }
   root["storage"] = storage;
+  // README <telemetry>: optional; 'enabled' is its only documented key
+  if (tc.draw(gs::booleans())) {
+    json::object telemetry;
+    if (tc.draw(gs::booleans())) {
+      telemetry["enabled"] = tc.draw(gs::booleans());
+    }
+    root["telemetry"] = telemetry;
+  }
   return root;
 }
 
@@ -288,7 +367,7 @@ bool is_required(const std::vector<std::string> &path) {
   // README: optional are connection.ssl / .tls (and every key in them except
   // ssl.mode), host / port / dns_srv_name (one form required), keyring,
   // replication.rewrite, storage.fs_buffer_directory / checkpoint_size /
-  // checkpoint_interval / encryption
+  // checkpoint_interval / encryption, telemetry (and its keys)
   static const std::vector<std::string> optional{
       "connection.ssl",          "connection.ssl.ca",
       "connection.ssl.capath",   "connection.ssl.crl",
@@ -299,7 +378,8 @@ bool is_required(const std::vector<std::string> &path) {
       "replication.rewrite",     "storage.fs_buffer_directory",
       "storage.checkpoint_size", "storage.checkpoint_interval",
       "storage.encryption",      "replication_source.auth_rsa_private_key",
-      "replication_source.ssl"};
+      "replication_source.ssl",  "telemetry",
+      "telemetry.enabled"};
   const auto name{join(path)};
   if (name == "keyring.uri") {
     return true;
@@ -366,12 +446,14 @@ std::vector<violation> applicable_violations(const json::object &config) {
       }
     }
     if (name == "replication.verify_checksum" ||
-        name == "replication_source.require_secure_transport") {
+        name == "replication_source.require_secure_transport" ||
+        name == "telemetry.enabled") {
       add("boolean given as a string", path, "true");
       add("boolean given as a number", path, 1);
     }
     for (const auto *text :
-         {"logger.file", "connection.user", "connection.password",
+         {"instance.local_settings_path", "logger.file", "connection.user",
+          "connection.password",
           "storage.uri", "replication_source.authentication.user",
           "replication_source.server_uuid",
           "replication_source.auth_rsa_private_key",
@@ -397,6 +479,14 @@ std::vector<violation> applicable_violations(const json::object &config) {
       }
     }
   }
+  // README <instance.local_settings_path>: must already exist and be a
+  // directory (or a symbolic link to one)
+  add("empty local_settings_path", {"instance", "local_settings_path"}, "");
+  add("local_settings_path that does not exist",
+      {"instance", "local_settings_path"},
+      json::value((scratch().path() / "does-not-exist").string()));
+  add("local_settings_path that is a regular file",
+      {"instance", "local_settings_path"}, json::value(regular_file().string()));
   // host / port vs dns_srv_name
   if (has({"connection", "dns_srv_name"})) {
     add("dns_srv_name together with host", {"connection", "host"}, "127.0.0.1");
@@ -556,6 +646,23 @@ BOOST_AUTO_TEST_CASE(ValidConfigurationLoads) {
         pbt::require_equal(root.get<"storage">().has_encryption(),
                            config.at("storage").as_object().contains("encryption"),
                            "storage.encryption present");
+        pbt::require_equal(
+            root.get<"instance">().get<"local_settings_path">(),
+            std::string{config.at("instance").at("local_settings_path").as_string()},
+            "instance.local_settings_path");
+        // README: telemetry is enabled when the section or the key is omitted
+        bool expected_telemetry{true};
+        if (const auto *telemetry{config.if_contains("telemetry")}) {
+          if (const auto *enabled{telemetry->as_object().if_contains("enabled")}) {
+            expected_telemetry = enabled->as_bool();
+          }
+        }
+        const auto &telemetry_section{root.get<"telemetry">()};
+        pbt::require_equal(
+            !telemetry_section.has_value() || telemetry_section->enabled(),
+            expected_telemetry, "telemetry.enabled");
+        pbt::require(util::is_canonical_uuid(loaded->instance_id()),
+                     "the instance identifier is not a canonical UUID");
       },
       {.test_cases = 300U});
 }
@@ -566,6 +673,7 @@ BOOST_AUTO_TEST_CASE(InvalidConfigurationIsRejected) {
   pbt::check(
       [](hegel::TestCase &tc) {
         auto config{valid_config(tc)};
+        require_baseline_loads(config, tc);
         const auto candidates{applicable_violations(config)};
         std::vector<std::string> kinds;
         for (const auto &candidate : candidates) {
@@ -605,6 +713,7 @@ BOOST_AUTO_TEST_CASE(MisspelledKeyIsRejected) {
   pbt::check(
       [](hegel::TestCase &tc) {
         auto config{valid_config(tc)};
+        require_baseline_loads(config, tc);
         std::vector<std::vector<std::string>> paths;
         collect_paths(config, {}, paths);
         const auto path{paths[tc.draw(
@@ -692,6 +801,7 @@ BOOST_AUTO_TEST_CASE(RewriteBaseFileNameIsValidatedOnLoad) {
   pbt::check(
       [](hegel::TestCase &tc) {
         auto config{valid_config(tc)};
+        require_baseline_loads(config, tc);
         auto &replication{config["replication"].as_object()};
         replication["mode"] = "gtid";
         json::object rewrite;
@@ -716,6 +826,7 @@ BOOST_AUTO_TEST_CASE(UpperCaseServerUuidIsRejected) {
   pbt::check(
       [](hegel::TestCase &tc) {
         auto config{valid_config(tc)};
+        require_baseline_loads(config, tc);
         std::string uuid{config["replication_source"].as_object()["server_uuid"].as_string()};
         // upper-case at least one hex letter (a digit-only UUID gets one)
         auto letter{std::ranges::find_if(uuid, [](char c) { return c >= 'a' && c <= 'f'; })};
@@ -739,4 +850,81 @@ BOOST_AUTO_TEST_CASE(UpperCaseServerUuidIsRejected) {
             "server_uuid with upper-case hex digits must be rejected");
       },
       {.test_cases = 100U});
+}
+
+// README <instance.local_settings_path>: the first load generates a stable
+// instance identifier and stores it in an 'instance_id' file in this
+// directory, later loads reuse it, and "a missing or malformed instance_id
+// file is regenerated". The identifier is what telemetry reports as
+// db_instance_id, so it must not change between runs of one instance.
+BOOST_AUTO_TEST_CASE(InstanceIdIsStableAndRegenerated) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        const temporary_directory directory;
+        auto config{valid_config(tc)};
+        config["instance"].as_object()["local_settings_path"] =
+            directory.path().string();
+        const auto id_file{directory.path() / "instance_id"};
+        const auto read_id_file{[&id_file]() {
+          std::ifstream input{id_file};
+          std::string line;
+          std::getline(input, line);
+          return line;
+        }};
+
+        std::string first;
+        try {
+          first = load(config, tc)->instance_id();
+        } catch (const std::exception &e) {
+          pbt::fail(std::string{"valid configuration rejected: "} + e.what());
+        }
+        tc.note("first instance id = " + first);
+        pbt::require(util::is_canonical_uuid(first),
+                     "the instance identifier is not a canonical UUID");
+        pbt::require_equal(read_id_file(), first,
+                           "instance_id file content after the first load");
+
+        const auto loads{tc.draw(
+            "further_loads", gs::integers<int>({.min_value = 1, .max_value = 3}))};
+        for (int i{0}; i < loads; ++i) {
+          pbt::require_equal(load(config, tc)->instance_id(), first,
+                             "instance identifier of a later load");
+        }
+
+        // a missing or malformed file: a fresh canonical identifier, stored
+        const auto damage{tc.draw(
+            "damage", gs::sampled_from<std::string>(
+                          {"removed", "empty", "garbage", "truncated",
+                           "not a uuid"}))};
+        tc.note("instance_id file " + damage);
+        if (damage == "removed") {
+          fs::remove(id_file);
+        } else {
+          std::string content;
+          if (damage == "garbage") {
+            content = "this is not an identifier\n";
+          } else if (damage == "truncated") {
+            content = first.substr(0U, 20U);
+          } else if (damage == "not a uuid") {
+            content = "zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz\n";
+          }
+          std::ofstream{id_file, std::ios::trunc} << content;
+        }
+        std::string regenerated;
+        try {
+          regenerated = load(config, tc)->instance_id();
+        } catch (const std::exception &e) {
+          pbt::fail(std::string{"configuration with a damaged instance_id file "
+                                "rejected: "} +
+                    e.what());
+        }
+        tc.note("regenerated instance id = " + regenerated);
+        pbt::require(util::is_canonical_uuid(regenerated),
+                     "the regenerated instance identifier is not a canonical UUID");
+        pbt::require_equal(read_id_file(), regenerated,
+                           "instance_id file content after regeneration");
+        pbt::require_equal(load(config, tc)->instance_id(), regenerated,
+                           "instance identifier after regeneration");
+      },
+      {.test_cases = 50U});
 }
