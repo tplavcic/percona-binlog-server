@@ -207,8 +207,13 @@ make_config(const temporary_directory &directory,
             const storage_settings &settings) {
   const auto vault{directory.path() / "vault"};
   fs::create_directories(vault);
+  // README <instance>: mandatory, an existing directory (instance_id file)
+  const auto local_settings{directory.path() / "local-settings"};
+  fs::create_directories(local_settings);
   std::ostringstream json;
   json << R"({
+  "instance": {"local_settings_path": ")"
+       << local_settings.generic_string() << R"("},
   "logger": {"level": "error", "file": ""},
   "connection": {"host": "127.0.0.1", "port": 3306, "user": "u",
                  "password": "", "connect_timeout": 1, "read_timeout": 1,
@@ -260,7 +265,9 @@ make_config(const temporary_directory &directory,
          << settings.kek_id << R"(", "cipher": ")" << settings.data_cipher
          << R"("})";
   }
-  json << "}\n}\n";
+  // README <telemetry>: off, it would write outside $TMPDIR (only 'pull'
+  // writes reports, but keep every configuration of the tests the same)
+  json << "},\n  \"telemetry\": {\"enabled\": false}\n}\n";
   const auto config_path{directory.path() / "config.json"};
   {
     std::ofstream output{config_path};
