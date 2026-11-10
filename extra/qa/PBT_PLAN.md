@@ -214,6 +214,8 @@ walker (magic, sizes, log_pos, CRC32, GTID order).
 | D23 | GTID dumps from the listener (upstream PBS-29 part 2): `GtidDumpSendsMissingTransactionsMySQL` (COM_BINLOG_DUMP_GTID, non-blocking, with a client GTID set that is empty, a prefix of the stored transactions or any subset: exactly the stored transactions not in the set are sent, in order, byte for byte), `GtidReplicaOfListenerMatchesSourceMySQL` (a MySQL replica with SOURCE_AUTO_POSITION = 1, also stopped / started and with pull stopped or killed meanwhile, reaches the source's gtid_executed and table checksums) | ✅ |
 | D24 | heartbeats on idle blocking dumps (upstream PBS-30): `IdleDumpSendsHeartbeatsMySQL` (period 0 / 250 / 500 / 1000 ms: none with 0, else about idle time / period, never two within 80 % of the period, each a well-formed HEARTBEAT_LOG_EVENT_V2 with a valid CRC32 naming the end of the newest stored binlog - independent decoder; the stored events before are unaffected), `HeartbeatVersionFollowsDumpFlagMySQL` (v1 without USE_HEARTBEAT_EVENT_V2, v2 with it), `ReplicaReceivesHeartbeatsMySQL` (a replica with SOURCE_HEARTBEAT_PERIOD 0.5 / 1 s and replica_net_timeout 3 stays connected for 8 idle seconds: heartbeats counted in performance_schema, no new listener session) | ✅ (PBT-048) |
 | D25 | TLS of the listener (upstream PBS-31 part 1): `ListenerTlsIsHonouredMySQL` (`replication_source.ssl` with the test PKI's certificate or none, client ssl-mode disabled / preferred / required / verify_ca / verify_identity: MySQL server rules for connecting and encryption, a connected dump receives exactly the stored events, pull keeps running), `ListenerRequiresSecureTransportMySQL` (require_secure_transport refuses a client without TLS, with an error packet) | ✅ (PBT-046, PBT-047 fixed; PBT-049) |
+| D26 | `HeartbeatsContinueAfterRotationMySQL`: a caught-up blocking dump keeps getting heartbeats when the source rotates (FLUSH BINARY LOGS) and stays quiet or writes one transaction; heartbeats name the end of binlog N or binlog N+1 (Hrvoje's ticket 40) | ✅ (PBT-050) |
+| D27 | GTID dumps the storage cannot serve, differential against the MySQL source holding the same binlogs (both purged the same ones): `GtidDumpAfterPurgeMatchesMySQL` (servable sets, also with GTIDs of an unknown UUID: the same transactions as MySQL), `GtidDumpMissingPurgedIsRefusedMySQL` and `GtidDumpAheadOfSourceIsRefusedMySQL` (MySQL refuses with error 1236; the listener must too, without sending a transaction) (Hrvoje's ticket 20) | ✅ (PBT-051, PBT-052) |
 | D9 | `PurgeOnServerMySQL`: `PURGE BINARY LOGS TO` before / after the storage got the binlogs; fetch succeeds exactly when the server still has what the storage needs (position: its newest binlog; GTID: gtid_purged covered; empty storage), else exits 1 leaving the storage unchanged | ✅ |
 
 GTID auto-positioning: the server starts a GTID dump at the newest binlog
@@ -244,8 +246,8 @@ there is authoritative):
 
 | Severity | Issues |
 |---|---|
-| high | PBT-015, PBT-017, PBT-022, PBT-039, PBT-040, PBT-043, PBT-044 |
-| medium | PBT-001, PBT-002, PBT-004, PBT-012, PBT-013, PBT-016, PBT-019, PBT-029, PBT-030, PBT-031, PBT-032, PBT-033, PBT-035, PBT-036, PBT-037, PBT-041, PBT-042, PBT-045, PBT-048 |
+| high | PBT-015, PBT-017, PBT-022, PBT-039, PBT-040, PBT-043, PBT-044, PBT-051 |
+| medium | PBT-001, PBT-002, PBT-004, PBT-012, PBT-013, PBT-016, PBT-019, PBT-029, PBT-030, PBT-031, PBT-032, PBT-033, PBT-035, PBT-036, PBT-037, PBT-041, PBT-042, PBT-045, PBT-048, PBT-050, PBT-052 |
 | fixed | PBT-034 (upstream PBS-10), PBT-026 and PBT-038 (upstream PBS-59), PBT-025 (upstream PBS-29), PBT-024 (upstream PBS-29 part 3, 2d7dc80), PBT-046 and PBT-047 (upstream PBS-31 part 3, 6b0960f) |
 | low | PBT-003, PBT-005, PBT-006, PBT-007, PBT-008, PBT-009, PBT-010, PBT-011, PBT-014, PBT-018, PBT-020, PBT-021, PBT-023, PBT-027, PBT-028, PBT-049 |
 
@@ -705,6 +707,15 @@ Not checked (MySQL behaviour PBS does not implement yet, marked TODO in `sender_
 - New PBT-049 (low): with `require_secure_transport` the listener refuses a client without TLS by closing the connection, without error 3159 (ER_SECURE_TRANSPORT_REQUIRED); the client reports "Lost connection" and a replica retries for ever. Same as Hrvoje's ticket 48.
 - PBT-041: `FailoverToLagging` passed in QA and in the sandbox, `FailoverGtidMode` still fails in the sandbox (the refused fetch appends a 4-byte binlog), so the row stays open.
 - PBT-039 still fails although Hrvoje's ticket 18 (double write after a failed write) was fixed by PBS-83 (c48510f).
+
+### Heartbeats after a rotation and unservable GTID dumps (sandbox run, D26 / D27)
+
+Rebased onto dd136e5 (PBS-68 / PBS-112: no `noexcept` on functions that throw on malformed event data; may fix PBT-017 and PBT-044, to be confirmed by the next QA run).
+
+- PBT-050 (medium): `HeartbeatsContinueAfterRotationMySQL` - after `FLUSH BINARY LOGS` with a quiet source the caught-up dump gets no heartbeat (0 in 3000 ms with a 250 ms period), because the new binlog holds only the magic and the sender cannot generate a heartbeat before it has read its preamble. Same as Hrvoje's ticket 40.
+- PBT-051 (high): `GtidDumpMissingPurgedIsRefusedMySQL` - a client whose GTID set lacks purged transactions is served (MySQL: error 1236), so a replica silently misses them.
+- PBT-052 (medium): `GtidDumpAheadOfSourceIsRefusedMySQL` - a client with GTIDs of the source's UUID the source never executed is served (MySQL: error 1236).
+- `GtidDumpAfterPurgeMatchesMySQL` passes: after the same purge on both, servable GTID sets (also with GTIDs of an unknown UUID) get the same transactions from the listener and from MySQL. Note: `purge_binlogs <name>` removes `<name>` too, `PURGE BINARY LOGS TO <name>` keeps it.
 
 ## 6. Open questions
 
