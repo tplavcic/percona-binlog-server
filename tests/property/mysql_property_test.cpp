@@ -1730,12 +1730,25 @@ public:
                  ignored);
     }
     process_ = std::make_unique<background_run>(
-        std::vector<std::string>{"pull", storage_.config_path}, file_size_limit_);
+        std::vector<std::string>{"pull", storage_.config_path}, file_size_limit_,
+        output_path().string());
+  }
+
+  // pull's stdout and stderr (of the current run)
+  [[nodiscard]] fs::path output_path() const {
+    return storage_.directory.path() / "pull-output.log";
   }
 
   void require_running() {
     if (const auto exited{process_->poll()}; exited) {
       pbt::note(tc_, "binlog_server log:" + log_tail(storage_));
+      // what it printed: an error before its file logger exists, or a
+      // sanitizer report, goes only to stdout / stderr
+      auto output{read_file_if_exists(output_path())};
+      if (output.size() > 3000U) {
+        output = "..." + output.substr(output.size() - 3000U);
+      }
+      pbt::note(tc_, "binlog_server pull stdout / stderr: " + output);
       pbt::fail("binlog_server pull exited on its own (" + exited->describe() +
                 ")");
     }

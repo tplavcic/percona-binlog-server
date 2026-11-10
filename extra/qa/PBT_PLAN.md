@@ -246,10 +246,10 @@ there is authoritative):
 
 | Severity | Issues |
 |---|---|
-| high | PBT-015, PBT-017, PBT-022, PBT-039, PBT-040, PBT-043, PBT-044, PBT-051 |
+| high | PBT-015, PBT-022, PBT-039, PBT-040, PBT-043, PBT-051 |
 | medium | PBT-001, PBT-002, PBT-004, PBT-012, PBT-013, PBT-016, PBT-019, PBT-029, PBT-030, PBT-031, PBT-032, PBT-033, PBT-035, PBT-036, PBT-037, PBT-041, PBT-042, PBT-045, PBT-048, PBT-050, PBT-052 |
-| fixed | PBT-034 (upstream PBS-10), PBT-026 and PBT-038 (upstream PBS-59), PBT-025 (upstream PBS-29), PBT-024 (upstream PBS-29 part 3, 2d7dc80), PBT-046 and PBT-047 (upstream PBS-31 part 3, 6b0960f) |
-| low | PBT-003, PBT-005, PBT-006, PBT-007, PBT-008, PBT-009, PBT-010, PBT-011, PBT-014, PBT-018, PBT-020, PBT-021, PBT-023, PBT-027, PBT-028, PBT-049 |
+| fixed | PBT-034 (upstream PBS-10), PBT-026 and PBT-038 (upstream PBS-59), PBT-025 (upstream PBS-29), PBT-024 (upstream PBS-29 part 3, 2d7dc80), PBT-046 and PBT-047 (upstream PBS-31 part 3, 6b0960f), PBT-017 and PBT-044 (upstream PBS-68 / PBS-112, dd136e5) |
+| low | PBT-003, PBT-005, PBT-006, PBT-007, PBT-008, PBT-009, PBT-010, PBT-011, PBT-014, PBT-018, PBT-020, PBT-021, PBT-023, PBT-027, PBT-028, PBT-049, PBT-053 |
 
 ### GTID sets (prototype run)
 
@@ -716,6 +716,15 @@ Rebased onto dd136e5 (PBS-68 / PBS-112: no `noexcept` on functions that throw on
 - PBT-051 (high): `GtidDumpMissingPurgedIsRefusedMySQL` - a client whose GTID set lacks purged transactions is served (MySQL: error 1236), so a replica silently misses them.
 - PBT-052 (medium): `GtidDumpAheadOfSourceIsRefusedMySQL` - a client with GTIDs of the source's UUID the source never executed is served (MySQL: error 1236).
 - `GtidDumpAfterPurgeMatchesMySQL` passes: after the same purge on both, servable GTID sets (also with GTIDs of an unknown UUID) get the same transactions from the listener and from MySQL. Note: `purge_binlogs <name>` removes `<name>` too, `PURGE BINARY LOGS TO <name>` keeps it.
+
+### First Jenkins run (ps80 "PBS property based tests" #24, asan_gcc14-ubsan, PS 8.4.10-10)
+
+205 properties, 156 passed, 49 failed: 48 known, 1 new, 0 regressions, 6 possibly fixed.
+
+- [fixed] PBT-017 and PBT-044 (dd136e5, PBS-68 / PBS-112): both properties pass, `FormatDescriptionWithOddServerVersionNeverAborts` also with 300 cases in the sandbox.
+- Possibly fixed but kept open: PBT-032 (fails again in the sandbox, 2 of 3 runs of 100 cases), PBT-043 and PBT-035 (need a rare sequence), PBT-041 (`FailoverToLagging` passes, `FailoverGtidMode` still fails).
+- New PBT-053 (low): `ListDuringPullIsConsistentMySQL` - `pull` exited with code 1 and an empty log (flaky). Reproduced in the sandbox as `list` failing with "cannot rename instance id tmp file": two processes that load the configuration for the first time together race on the fixed name `instance_id.tmp` (PBS-41). `ConcurrentFirstLoadsAgreeOnInstanceId` (`config_property_test`) reproduces it with 2 threads. `pull_process` now keeps pull's stdout / stderr in `pull-output.log` and prints it when pull exits on its own (an error before the file logger exists, or a sanitizer report, was lost in `/dev/null`).
+- D26 / D27 fail as in the sandbox (PBT-050, PBT-051, PBT-052); `GtidDumpAfterPurgeMatchesMySQL` passes.
 
 ## 6. Open questions
 

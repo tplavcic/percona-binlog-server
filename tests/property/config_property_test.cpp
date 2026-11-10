@@ -46,11 +46,13 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <latch>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <tuple>
 #include <unistd.h>
 #include <utility>
@@ -927,4 +929,66 @@ BOOST_AUTO_TEST_CASE(InstanceIdIsStableAndRegenerated) {
                            "instance identifier after regeneration");
       },
       {.test_cases = 50U});
+}
+
+// Several processes of one instance (pull and a monitoring list, a cron
+// fetch) can start for the first time together, on a local_settings_path
+// without an instance_id file yet. Every load must succeed and all of them
+// must get the same identifier, the one stored in the file (telemetry
+// reports it as db_instance_id). Loads in threads that start together, on
+// fresh directories, several rounds per case.
+BOOST_AUTO_TEST_CASE(ConcurrentFirstLoadsAgreeOnInstanceId) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        auto config{valid_config(tc)};
+        const auto loaders{tc.draw("loaders", gs::integers<std::size_t>({.min_value = 2U,
+                                                                         .max_value = 6U}))};
+        tc.note(std::to_string(loaders) + " concurrent loads, 20 rounds");
+        for (std::size_t round{0U}; round < 20U; ++round) {
+          const temporary_directory directory;
+          config["instance"].as_object()["local_settings_path"] = directory.path().string();
+          const temporary_file file;
+          {
+            std::ofstream output{file.path()};
+            output << json::serialize(config);
+          }
+          std::latch start{static_cast<std::ptrdiff_t>(loaders)};
+          std::vector<std::string> ids(loaders);
+          std::vector<std::string> errors(loaders);
+          std::vector<std::thread> threads;
+          for (std::size_t i{0U}; i < loaders; ++i) {
+            threads.emplace_back([&, i]() {
+              start.arrive_and_wait();
+              try {
+                ids[i] = binsrv::main_config{file.path().string()}.instance_id();
+              } catch (const std::exception &e) {
+                errors[i] = e.what();
+              }
+            });
+          }
+          for (auto &thread : threads) {
+            thread.join();
+          }
+          std::string stored;
+          {
+            std::ifstream input{directory.path() / "instance_id"};
+            std::getline(input, stored);
+          }
+          for (std::size_t i{0U}; i < loaders; ++i) {
+            if (!errors[i].empty()) {
+              tc.note("round " + std::to_string(round) + ": load " + std::to_string(i) +
+                      " failed: " + errors[i]);
+            }
+            pbt::require(errors[i].empty(),
+                         "a first load next to other first loads failed: " + errors[i]);
+          }
+          for (std::size_t i{0U}; i < loaders; ++i) {
+            pbt::require_equal(ids[i], stored,
+                               "instance identifier of a concurrent first load and the "
+                               "stored one (round " + std::to_string(round) + ", load " +
+                                   std::to_string(i) + ")");
+          }
+        }
+      },
+      {.test_cases = 20U});
 }
