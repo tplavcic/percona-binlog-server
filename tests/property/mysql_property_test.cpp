@@ -5933,6 +5933,9 @@ struct dump_options {
   // a blocking dump ends this long after the last event that is not a
   // heartbeat
   std::chrono::milliseconds idle_window{3000};
+  // the listener's account; the MySQL server's own one for a dump from it
+  std::string user{"replica"};
+  std::string password{"replica-password"};
 };
 
 struct timed_event {
@@ -5999,8 +6002,9 @@ dump_outcome run_dump(const dump_options &options) {
       outcome.error_number = ::mysql_errno(handle);
     }
   }};
-  if (::mysql_real_connect(handle, "127.0.0.1", "replica", "replica-password",
-                           nullptr, proxy.port(), nullptr, 0) == nullptr) {
+  if (::mysql_real_connect(handle, "127.0.0.1", options.user.c_str(),
+                           options.password.c_str(), nullptr, proxy.port(), nullptr,
+                           0) == nullptr) {
     fail("connect");
     ::mysql_close(handle);
     finish();
@@ -6782,4 +6786,361 @@ BOOST_AUTO_TEST_CASE(ListenerRequiresSecureTransportMySQL) {
                      "packet: " + outcome.error);
       },
       {.test_cases = 5U, .slow = true});
+}
+
+// ---------------------------------------------------------------------------
+// D26 - D27: heartbeats after a rotation, GTID sets the storage cannot serve
+// ---------------------------------------------------------------------------
+
+// A blocking dump that is caught up at the end of the newest binlog N keeps
+// getting a heartbeat about every @source_heartbeat_period when the source
+// rotates (FLUSH BINARY LOGS) and then stays quiet, or writes one more
+// transaction and stays quiet. The new binlog N+1 can hold only the binlog
+// magic for that whole time (its FORMAT_DESCRIPTION / PREVIOUS_GTIDS_LOG
+// stay buffered until a transaction is complete and a checkpoint or the next
+// rotation writes them), which is when a quiet source most needs heartbeats
+// (Hrvoje's ticket 40, PBS-113). From the last event that is not a heartbeat
+// until the dump ends (3000 ms idle), at least (idle time) / (period) - 2
+// heartbeats (at least 1), each well-formed with a valid CRC32, naming N at
+// its end or N+1 (MySQL: the coordinates the replica has reached).
+BOOST_AUTO_TEST_CASE(HeartbeatsContinueAfterRotationMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        start_case(tc, server);
+        const auto options{draw_options(tc)};
+        pbt::note(tc, "binlog_server: " + describe(options));
+        const auto storage{make_storage(options)};
+        pbt::note(tc, "workload:");
+        auto workload{draw_workload(tc, server.info, 4U)};
+        workload.push_back(operation{.kind = op_kind::insert_rows, .count = 1});
+        apply_all(tc, server.sql, workload);
+        fetch(tc, *storage);
+        require_storage_matches_server(tc, server.sql, server.info, *storage);
+        const auto events{stored_events_of(tc, *storage)};
+        const auto &newest{events.back()};
+        const auto newest_file{newest.file};
+        const auto end_position{newest.offset + newest.bytes.size()};
+        const auto period_ms{tc.draw("heartbeat_period_ms",
+                                     gs::sampled_from<std::uint64_t>({250U, 500U, 1000U}))};
+        const auto after{tc.draw("after_rotation", gs::sampled_from<std::string>(
+                                                       {"quiet", "one transaction"}))};
+        const auto delay_ms{tc.draw("rotation_after_ms",
+                                    gs::sampled_from<std::uint64_t>({300U, 1000U}))};
+        pbt::note(tc, "blocking dump from " + newest_file + ":" + std::to_string(end_position) +
+                          ", heartbeat period " + std::to_string(period_ms) + " ms; after " +
+                          std::to_string(delay_ms) + " ms FLUSH BINARY LOGS, then " + after +
+                          "; the dump ends 3000 ms after its last event that is not a "
+                          "heartbeat");
+
+        pull_process pull{tc, *storage};
+        pull.wait_until_listening();
+        wait_until_pull_caught_up(tc, server.sql, pull);
+        dump_outcome outcome;
+        std::thread client{[&outcome, &newest_file, end_position, period_ms]() {
+          outcome = run_dump({.port = listener_port(),
+                              .file = newest_file,
+                              .position = end_position,
+                              .blocking = true,
+                              .heartbeat_period_ns = period_ms * 1000000U,
+                              .heartbeat_v2 = true,
+                              .idle_window = std::chrono::milliseconds{3000}});
+        }};
+        wait_ms(delay_ms);
+        server.sql.exec("FLUSH BINARY LOGS");
+        if (after == "one transaction") {
+          apply(server.sql, operation{.kind = op_kind::insert_rows, .count = 1});
+        }
+        client.join();
+        pull.require_running();
+        pull.stop();
+        pbt::require(outcome.error.empty(), "the dump failed: " + outcome.error);
+
+        std::int64_t last_event_ms{0};
+        std::string last_event{"(none)"};
+        for (const auto &event : outcome.events) {
+          if (!is_heartbeat(event.bytes)) {
+            last_event_ms = event.at_ms;
+            last_event = describe_event(event.bytes);
+          }
+        }
+        std::vector<const timed_event *> heartbeats;
+        std::vector<const timed_event *> idle_heartbeats;
+        for (const auto &event : outcome.events) {
+          if (is_heartbeat(event.bytes)) {
+            heartbeats.push_back(&event);
+            if (event.at_ms > last_event_ms) {
+              idle_heartbeats.push_back(&event);
+            }
+          }
+        }
+        const auto idle_ms{last_event_ms == 0 || outcome.events.empty()
+                               ? std::int64_t{3000}
+                               : std::max<std::int64_t>(
+                                     3000, (idle_heartbeats.empty()
+                                                ? last_event_ms
+                                                : idle_heartbeats.back()->at_ms) -
+                                               last_event_ms)};
+        pbt::note(tc, std::to_string(outcome.events.size() - heartbeats.size()) +
+                          " event(s), the last " + last_event + "; " +
+                          std::to_string(heartbeats.size()) + " heartbeat(s), " +
+                          std::to_string(idle_heartbeats.size()) + " after the last event");
+        const auto storage_after{list(tc, *storage)};
+        std::string next_file;
+        std::uint64_t next_size{0U};
+        std::uint64_t newest_size{0U};
+        for (const auto &item : storage_after.at("result").as_array()) {
+          const std::string name{item.at("name").as_string()};
+          const auto size{storage->plaintext(name).size()};
+          if (name == newest_file) {
+            newest_size = size;
+          } else if (sequence_of(name) == sequence_of(newest_file) + 1U) {
+            next_file = name;
+            next_size = size;
+          }
+        }
+        const auto minimum{std::max<std::int64_t>(
+            1, idle_ms / static_cast<std::int64_t>(period_ms) - 2)};
+        if (static_cast<std::int64_t>(idle_heartbeats.size()) < minimum) {
+          pbt::note(tc, "storage after the dump: " + listed_text(tc, *storage));
+          pbt::note(tc, "binlog_server log:" + log_tail(*storage));
+        }
+        pbt::require(static_cast<std::int64_t>(idle_heartbeats.size()) >= minimum,
+                     "heartbeats in " + std::to_string(idle_ms) +
+                         " ms idle after the rotation with a " + std::to_string(period_ms) +
+                         " ms period: " + std::to_string(idle_heartbeats.size()));
+        for (std::size_t i{0U}; i < heartbeats.size(); ++i) {
+          const auto content{decode_heartbeat(heartbeats[i]->bytes)};
+          pbt::require(content.problem.empty(),
+                       "heartbeat " + std::to_string(i) + ": " + content.problem);
+          if (content.file == newest_file) {
+            pbt::require(content.position == end_position || content.position == newest_size,
+                         "heartbeat " + std::to_string(i) + " names " + content.file + ":" +
+                             std::to_string(content.position) + ", the end of " +
+                             newest_file + " is " + std::to_string(newest_size));
+          } else {
+            pbt::require(!next_file.empty() && content.file == next_file &&
+                             content.position >= 4U && content.position <= next_size,
+                         "heartbeat " + std::to_string(i) + " names " + content.file + ":" +
+                             std::to_string(content.position) + ", not a position the dump "
+                             "reached (" + newest_file + " or " + next_file + ")");
+          }
+        }
+      },
+      {.test_cases = 20U, .slow = true});
+}
+
+namespace {
+
+// a dump that the server refused (MySQL: error 1236, "Got fatal error 1236
+// from source when reading data from binary log: ..."); a dropped
+// connection or another error is not a refusal
+bool refused(const dump_outcome &outcome) { return outcome.error_number == 1236U; }
+
+std::string describe_outcome(const dump_outcome &outcome, const gtids::gtid_set &received) {
+  if (!outcome.error.empty()) {
+    return "error " + std::to_string(outcome.error_number) + ": " + outcome.error;
+  }
+  return "served transactions '" + received.str() + "'";
+}
+
+// the GTIDs of the transactions a dump sent
+gtids::gtid_set received_gtids(const dump_outcome &outcome) {
+  gtids::gtid_set result;
+  for (const auto &event : outcome.events) {
+    if (const auto gtid{transaction_gtid(event.bytes)}; gtid) {
+      result += *gtid;
+    }
+  }
+  return result;
+}
+
+} // namespace
+
+namespace {
+
+// The source and the storage hold the same binlogs; both purged the same
+// ones (PURGE BINARY LOGS TO on the source, purge_binlogs on the storage).
+// The same GTID dump (COM_BINLOG_DUMP_GTID, non-blocking) goes to the MySQL
+// source and to the listener. 'sets': "servable" (the client sets MySQL
+// serves), "missing purged" or "ahead of the source" (ones it refuses).
+void gtid_dump_matches_source(hegel::TestCase &tc, const std::string &sets) {
+      server_session server;
+      start_case(tc, server);
+      const auto options{draw_options(tc, true)};
+      pbt::note(tc, "binlog_server: " + describe(options));
+      const auto storage{make_storage(options)};
+      const auto binlogs{tc.draw("binlogs", gs::integers<std::size_t>({.min_value = 2U,
+                                                                       .max_value = 4U}))};
+      for (std::size_t i{0U}; i < binlogs; ++i) {
+        pbt::note(tc, "workload in binlog " + std::to_string(i + 1U) + ":");
+        auto workload{draw_workload(tc, server.info, 3U)};
+        std::erase_if(workload, [](const operation &op) { return op.kind == op_kind::flush; });
+        workload.push_back(operation{.kind = op_kind::insert_rows, .count = 1});
+        if (i + 1U < binlogs) {
+          workload.push_back(operation{.kind = op_kind::flush});
+        }
+        apply_all(tc, server.sql, workload);
+      }
+      fetch(tc, *storage);
+      require_storage_matches_server(tc, server.sql, server.info, *storage);
+      const auto events{stored_events_of(tc, *storage)};
+      const auto transactions{transactions_of(events)};
+      const auto names{listed_names(tc, *storage)};
+      pbt::require(names.size() >= 2U, "the storage holds fewer than 2 binlogs");
+
+      // the first 'purge' binlogs: PURGE BINARY LOGS TO keeps the binlog it
+      // names, purge_binlogs removes it too (README)
+      const auto purge{tc.draw(
+          "purged_binlogs",
+          gs::integers<std::size_t>({.min_value = sets == "missing purged" ? 1U : 0U,
+                                     .max_value = names.size() - 1U}))};
+      if (purge != 0U) {
+        const auto &target{names[purge]};
+        const auto &last_purged{names[purge - 1U]};
+        pbt::note(tc, "PURGE BINARY LOGS TO '" + target + "' on the source, purge_binlogs " +
+                          last_purged + " on the storage");
+        server.sql.exec("PURGE BINARY LOGS TO '" + target + "'");
+        const auto purged{run({"purge_binlogs", storage->config_path, last_purged})};
+        pbt::require(purged.exit_code == 0 && !purged.signaled,
+                     "purge_binlogs failed (" + purged.describe() + "): " + purged.output);
+      }
+      const auto is_purged{[&](const stored_transaction &transaction) {
+        if (transaction.events.empty()) {
+          return false;
+        }
+        const auto &file{transaction.events.front()->file};
+        return std::find(names.begin(), names.begin() + static_cast<std::ptrdiff_t>(purge),
+                         file) != names.begin() + static_cast<std::ptrdiff_t>(purge);
+      }};
+      const gtids::gtid_set source_purged{
+          strip_spaces(server.sql.scalar("SELECT @@GLOBAL.gtid_purged"))};
+      const gtids::gtid_set source_executed{server_executed(server.sql)};
+      pbt::note(tc, "source gtid_purged '" + source_purged.str() + "', gtid_executed '" +
+                        source_executed.str() + "'");
+
+      // the purged binlogs may hold no transaction (a rotation by
+      // max_binlog_size right before FLUSH BINARY LOGS)
+      tc.assume(sets != "missing purged" || !source_purged.is_empty());
+      const auto kind{sets == "servable"
+                          ? tc.draw("client_set", gs::sampled_from<std::string>(
+                                                      {"servable", "ahead in another UUID"}))
+                          : sets};
+      gtids::gtid_set client;
+      bool dropped{false};
+      for (const auto &transaction : transactions) {
+        if (!transaction.gtid) {
+          continue;
+        }
+        const bool purged_one{is_purged(transaction)};
+        bool include{purged_one ? true : tc.draw("has_transaction", gs::booleans())};
+        if (purged_one && kind == "missing purged") {
+          include = tc.draw("has_purged_transaction", gs::booleans());
+          dropped = dropped || !include;
+        }
+        if (include) {
+          client += *transaction.gtid;
+        }
+      }
+      // (start_case resets gtid_purged: the purged transactions are the
+      // ones of the purged binlogs)
+      if (kind != "missing purged") {
+        client += source_purged;
+      } else {
+        if (!dropped) {
+          // drop one purged transaction
+          for (const auto &transaction : transactions) {
+            if (transaction.gtid && is_purged(transaction)) {
+              client = client - *transaction.gtid;
+              break;
+            }
+          }
+        }
+      }
+      if (kind == "ahead of the source") {
+        const auto count{tc.draw("extra_gtids", gs::integers<std::size_t>({.min_value = 1U,
+                                                                           .max_value = 3U}))};
+        const auto uuid{server.sql.scalar("SELECT @@GLOBAL.server_uuid")};
+        client += gtids::gtid_set{uuid + ":1000000-" + std::to_string(1000000U + count - 1U)};
+      } else if (kind == "ahead in another UUID") {
+        client += gtids::gtid_set{std::string{"5a5a5a5a-0000-0000-0000-000000000bad:1-3"}};
+      }
+      pbt::note(tc, "client GTID set (" + kind + "): '" + client.str() + "'");
+
+      const auto source_settings{settings()};
+      const auto from_source{run_dump({.port = static_cast<std::uint16_t>(source_settings.port),
+                                       .gtids = client,
+                                       .user = source_settings.user,
+                                       .password = source_settings.password})};
+      const auto source_gtids{received_gtids(from_source)};
+      pbt::note(tc, "MySQL source: " + describe_outcome(from_source, source_gtids));
+      // the test's own premise: MySQL refuses the unservable sets
+      pbt::require(from_source.error.empty() || refused(from_source),
+                   "the dump from the MySQL source failed: " + from_source.error);
+      pbt::require(refused(from_source) == (kind == "missing purged" ||
+                                            kind == "ahead of the source"),
+                   "test premise: MySQL refuses exactly the 'missing purged' and "
+                   "'ahead of the source' sets");
+
+      pull_process pull{tc, *storage};
+      pull.wait_until_listening();
+      const auto from_listener{run_dump({.port = listener_port(), .gtids = client})};
+      pull.require_running();
+      pull.stop();
+      const auto listener_gtids{received_gtids(from_listener)};
+      pbt::note(tc, "listener: " + describe_outcome(from_listener, listener_gtids));
+      if (refused(from_source)) {
+        pbt::require(!from_listener.connected || !from_listener.error.empty(),
+                     "the listener served a GTID set the MySQL source refuses (" + kind +
+                         ")");
+        pbt::require(refused(from_listener),
+                     "the listener refused the GTID set without error 1236: " +
+                         from_listener.error);
+        pbt::require(listener_gtids.is_empty(),
+                     "the listener sent transactions before refusing the GTID set");
+        return;
+      }
+      if (!from_listener.error.empty()) {
+        pbt::note(tc, "binlog_server log:" + log_tail(*storage));
+      }
+      pbt::require(from_listener.error.empty(),
+                   "the listener failed a GTID set MySQL serves: " + from_listener.error);
+      if (listener_gtids != source_gtids) {
+        pbt::note(tc, "storage: " + listed_text(tc, *storage));
+        pbt::note(tc, "binlog_server log:" + log_tail(*storage, 40U));
+      }
+      pbt::require(listener_gtids == source_gtids,
+                   "the listener sent transactions '" + listener_gtids.str() +
+                       "', the MySQL source '" + source_gtids.str() + "'");
+}
+
+} // namespace
+
+// A GTID dump from the listener sends the transactions a dump with the same
+// GTID set from the MySQL source sends, after both purged binlogs. The
+// client's set has every purged transaction and any subset of the others,
+// possibly also GTIDs of a UUID the source does not know (MySQL accepts
+// them).
+BOOST_AUTO_TEST_CASE(GtidDumpAfterPurgeMatchesMySQL) {
+  pbt::check([](hegel::TestCase &tc) { gtid_dump_matches_source(tc, "servable"); },
+             {.test_cases = 30U, .slow = true});
+}
+
+// A GTID dump whose set lacks a transaction of a purged binlog is refused
+// as by the MySQL source: error 1236 (ER_SOURCE_HAS_PURGED_REQUIRED_GTIDS),
+// no transaction. Hrvoje's ticket 20 (PBS-120), the open part;
+// sender_context::get_event() has the check as a TODO ("Case B").
+BOOST_AUTO_TEST_CASE(GtidDumpMissingPurgedIsRefusedMySQL) {
+  pbt::check([](hegel::TestCase &tc) { gtid_dump_matches_source(tc, "missing purged"); },
+             {.test_cases = 10U, .slow = true});
+}
+
+// A GTID dump whose set has GTIDs of the source's server_uuid that the
+// source never executed is refused as by the MySQL source: error 1236
+// (ER_REPLICA_HAS_MORE_GTIDS_THAN_SOURCE), no transaction. The storage is
+// caught up with the source. sender_context::get_event() has the check as
+// a TODO ("Case A").
+BOOST_AUTO_TEST_CASE(GtidDumpAheadOfSourceIsRefusedMySQL) {
+  pbt::check([](hegel::TestCase &tc) { gtid_dump_matches_source(tc, "ahead of the source"); },
+             {.test_cases = 10U, .slow = true});
 }
