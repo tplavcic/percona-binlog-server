@@ -42,6 +42,7 @@
 #include <utility>
 #include <vector>
 
+#include <fcntl.h>
 #include <sys/resource.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -116,13 +117,14 @@ make_argv(const std::vector<std::string> &arguments) {
   return result;
 }
 
-// in the child: stdout to 'stdout_fd' (or /dev/null), stderr to /dev/null,
-// then exec; never returns. 'file_size_limit': RLIMIT_FSIZE with SIGXFSZ
+// in the child: stdout to 'stdout_fd' (or /dev/null), stderr to
+// 'stderr_fd' (or /dev/null), then exec; never returns. 'file_size_limit': RLIMIT_FSIZE with SIGXFSZ
 // ignored, so a write beyond the limit fails (EFBIG) like a write to a full
 // disk (ENOSPC) instead of killing the process.
 [[noreturn]] inline void exec_child(std::vector<std::string> &argv_storage,
                                     int stdout_fd,
-                                    std::optional<std::uint64_t> file_size_limit = {}) {
+                                    std::optional<std::uint64_t> file_size_limit = {},
+                                    int stderr_fd = -1) {
   std::vector<char *> argv;
   argv.reserve(argv_storage.size() + 1U);
   for (auto &item : argv_storage) {
@@ -148,7 +150,11 @@ make_argv(const std::vector<std::string> &arguments) {
   } else {
     std::ignore = std::freopen("/dev/null", "w", stdout);
   }
-  std::ignore = std::freopen("/dev/null", "w", stderr);
+  if (stderr_fd >= 0) {
+    ::dup2(stderr_fd, STDERR_FILENO);
+  } else {
+    std::ignore = std::freopen("/dev/null", "w", stderr);
+  }
   ::execv(argv_storage.front().c_str(), argv.data());
   ::_exit(127);
 }
@@ -205,19 +211,32 @@ inline run_result run(const std::vector<std::string> &arguments,
   return result;
 }
 
-// binlog_server running in the background (stdout / stderr discarded);
-// killed with SIGKILL when destroyed if still running
+// binlog_server running in the background; stdout and stderr go to
+// 'output_file' (truncated) or are discarded. Killed with SIGKILL when
+// destroyed if still running.
 class background_run {
 public:
   explicit background_run(const std::vector<std::string> &arguments,
-                          std::optional<std::uint64_t> file_size_limit = {}) {
+                          std::optional<std::uint64_t> file_size_limit = {},
+                          const std::string &output_file = {}) {
     auto argv_storage{detail::make_argv(arguments)};
+    int output_fd{-1};
+    if (!output_file.empty()) {
+      // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg)
+      output_fd = ::open(output_file.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    }
     pid_ = ::fork();
     if (pid_ < 0) {
+      if (output_fd >= 0) {
+        ::close(output_fd);
+      }
       throw std::runtime_error{"fork failed"};
     }
     if (pid_ == 0) {
-      detail::exec_child(argv_storage, -1, file_size_limit);
+      detail::exec_child(argv_storage, output_fd, file_size_limit, output_fd);
+    }
+    if (output_fd >= 0) {
+      ::close(output_fd);
     }
   }
   background_run(const background_run &) = delete;
