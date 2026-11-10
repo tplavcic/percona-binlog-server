@@ -216,6 +216,8 @@ walker (magic, sizes, log_pos, CRC32, GTID order).
 | D25 | TLS of the listener (upstream PBS-31 part 1): `ListenerTlsIsHonouredMySQL` (`replication_source.ssl` with the test PKI's certificate or none, client ssl-mode disabled / preferred / required / verify_ca / verify_identity: MySQL server rules for connecting and encryption, a connected dump receives exactly the stored events, pull keeps running), `ListenerRequiresSecureTransportMySQL` (require_secure_transport refuses a client without TLS, with an error packet) | ✅ (PBT-046, PBT-047 fixed; PBT-049) |
 | D26 | `HeartbeatsContinueAfterRotationMySQL`: a caught-up blocking dump keeps getting heartbeats when the source rotates (FLUSH BINARY LOGS) and stays quiet or writes one transaction; heartbeats name the end of binlog N or binlog N+1 (Hrvoje's ticket 40) | ✅ (PBT-050) |
 | D27 | GTID dumps the storage cannot serve, differential against the MySQL source holding the same binlogs (both purged the same ones): `GtidDumpAfterPurgeMatchesMySQL` (servable sets, also with GTIDs of an unknown UUID: the same transactions as MySQL), `GtidDumpMissingPurgedIsRefusedMySQL` and `GtidDumpAheadOfSourceIsRefusedMySQL` (MySQL refuses with error 1236; the listener must too, without sending a transaction) (Hrvoje's ticket 20) | ✅ (PBT-051, PBT-052) |
+| D28 | Clients that connect before pull has stored anything (pull's connection to the source through a proxy that is down until the client waits): `ClientBeforeFirstPullIsServedMySQL` (no binlog name / the first binlog at 4) and `ClientBeforeFirstPullFromPositionIsServedMySQL` (the first binlog at an event boundary); a blocking dump waits and then gets the stored events from its start point byte for byte, a non-blocking one ends with EOF (Hrvoje's tickets 38 and 26) | ✅ (PBT-054, PBT-055) |
+| D29 | `PullStopsPromptlyWithIdleSourceMySQL`: SIGTERM to a caught-up pull with an idle source and `connection.read_timeout` 10 / 30 s, with or without a blocking dump client: exit 0 within 4 s, the storage matches the server (Hrvoje's ticket 43) | ✅ (PBT-056) |
 | D9 | `PurgeOnServerMySQL`: `PURGE BINARY LOGS TO` before / after the storage got the binlogs; fetch succeeds exactly when the server still has what the storage needs (position: its newest binlog; GTID: gtid_purged covered; empty storage), else exits 1 leaving the storage unchanged | ✅ |
 
 GTID auto-positioning: the server starts a GTID dump at the newest binlog
@@ -247,7 +249,7 @@ there is authoritative):
 | Severity | Issues |
 |---|---|
 | high | PBT-015, PBT-022, PBT-039, PBT-040, PBT-043, PBT-051 |
-| medium | PBT-001, PBT-002, PBT-004, PBT-012, PBT-013, PBT-016, PBT-019, PBT-029, PBT-030, PBT-031, PBT-032, PBT-033, PBT-035, PBT-036, PBT-037, PBT-041, PBT-042, PBT-045, PBT-048, PBT-050, PBT-052 |
+| medium | PBT-001, PBT-002, PBT-004, PBT-012, PBT-013, PBT-016, PBT-019, PBT-029, PBT-030, PBT-031, PBT-032, PBT-033, PBT-035, PBT-036, PBT-037, PBT-041, PBT-042, PBT-045, PBT-048, PBT-050, PBT-052, PBT-054, PBT-055, PBT-056 |
 | fixed | PBT-034 (upstream PBS-10), PBT-026 and PBT-038 (upstream PBS-59), PBT-025 (upstream PBS-29), PBT-024 (upstream PBS-29 part 3, 2d7dc80), PBT-046 and PBT-047 (upstream PBS-31 part 3, 6b0960f), PBT-017 and PBT-044 (upstream PBS-68 / PBS-112, dd136e5) |
 | low | PBT-003, PBT-005, PBT-006, PBT-007, PBT-008, PBT-009, PBT-010, PBT-011, PBT-014, PBT-018, PBT-020, PBT-021, PBT-023, PBT-027, PBT-028, PBT-049, PBT-053 |
 
@@ -725,6 +727,13 @@ Rebased onto dd136e5 (PBS-68 / PBS-112: no `noexcept` on functions that throw on
 - Possibly fixed but kept open: PBT-032 (fails again in the sandbox, 2 of 3 runs of 100 cases), PBT-043 and PBT-035 (need a rare sequence), PBT-041 (`FailoverToLagging` passes, `FailoverGtidMode` still fails).
 - New PBT-053 (low): `ListDuringPullIsConsistentMySQL` - `pull` exited with code 1 and an empty log (flaky). Reproduced in the sandbox as `list` failing with "cannot rename instance id tmp file": two processes that load the configuration for the first time together race on the fixed name `instance_id.tmp` (PBS-41). `ConcurrentFirstLoadsAgreeOnInstanceId` (`config_property_test`) reproduces it with 2 threads. `pull_process` now keeps pull's stdout / stderr in `pull-output.log` and prints it when pull exits on its own (an error before the file logger exists, or a sanitizer report, was lost in `/dev/null`).
 - D26 / D27 fail as in the sandbox (PBT-050, PBT-051, PBT-052); `GtidDumpAfterPurgeMatchesMySQL` passes.
+
+### Clients before the first pull, stopping with an idle source (sandbox run, D28 / D29)
+
+- PBT-054 (medium): `ClientBeforeFirstPullIsServedMySQL` - a dump of binlog.000001 at 4 that connects while the storage is empty is disconnected ("Lost connection"), blocking or not (Hrvoje's ticket 38, regression since c31c880). With no binlog name the same blocking dump waits and gets every stored event (checked with the drawing restricted to that case).
+- PBT-055 (medium): `ClientBeforeFirstPullFromPositionIsServedMySQL` - the same for binlog.000001 at 126 (Hrvoje's ticket 26, PBS-96).
+- PBT-056 (medium): `PullStopsPromptlyWithIdleSourceMySQL` - read_timeout 10 s: pull exits 8.2 s after SIGTERM, with or without a connected client (Hrvoje's ticket 43, PBS-116).
+- `pbs_options::read_timeout` sets `connection.read_timeout` (default 1 s as before).
 
 ## 6. Open questions
 

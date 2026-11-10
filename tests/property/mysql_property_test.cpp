@@ -772,6 +772,9 @@ struct pbs_options {
   // section) and require_secure_transport (D25)
   std::optional<std::pair<std::string, std::string>> listener_certificate;
   bool listener_requires_tls{false};
+  // connection.read_timeout (default 1 s, so that an idle pull reconnects
+  // every second) (D29)
+  std::optional<unsigned> read_timeout;
 };
 
 std::string describe(const pbs_options &options) {
@@ -969,7 +972,7 @@ std::unique_ptr<pbs_storage> make_storage(const pbs_options &options) {
                                       {"user", options.mysql_user.value_or(server.user)},
                                       {"password", options.mysql_password.value_or(server.password)},
                                       {"connect_timeout", 10},
-                                      {"read_timeout", 1},
+                                      {"read_timeout", options.read_timeout.value_or(1U)},
                                       {"write_timeout", 10}};
   if (options.ssl) {
     config["connection"].as_object()["ssl"] = *options.ssl;
@@ -6850,7 +6853,7 @@ BOOST_AUTO_TEST_CASE(HeartbeatsContinueAfterRotationMySQL) {
         pull.wait_until_listening();
         wait_until_pull_caught_up(tc, server.sql, pull);
         dump_outcome outcome;
-        std::thread client{[&outcome, &newest_file, end_position, period_ms]() {
+        std::jthread client{[&outcome, &newest_file, end_position, period_ms]() {
           outcome = run_dump({.port = listener_port(),
                               .file = newest_file,
                               .position = end_position,
@@ -7156,4 +7159,219 @@ BOOST_AUTO_TEST_CASE(GtidDumpMissingPurgedIsRefusedMySQL) {
 BOOST_AUTO_TEST_CASE(GtidDumpAheadOfSourceIsRefusedMySQL) {
   pbt::check([](hegel::TestCase &tc) { gtid_dump_matches_source(tc, "ahead of the source"); },
              {.test_cases = 10U, .slow = true});
+}
+
+// ---------------------------------------------------------------------------
+// D28 - D29: clients before the first pull, stopping pull with an idle source
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// A client of the listener that connects while the storage is still empty
+// (pull has just started and has not stored anything from the source yet)
+// is served like one that connects later (PBS-91): a blocking dump waits
+// and then receives the stored events from the requested point on, byte
+// for byte; a non-blocking dump ends normally (EOF), without an error. The
+// request names no binlog (position 4), the first binlog at position 4
+// (Hrvoje's ticket 38, PBS-91 regression since c31c880), or the first
+// binlog at an event boundary after its FORMAT_DESCRIPTION (ticket 26,
+// PBS-96). The source already holds the transactions; pull's connection to
+// it goes through a proxy that is down until the client waits.
+void client_before_first_pull(hegel::TestCase &tc, bool from_position) {
+      server_session server;
+      start_case(tc, server);
+      auto options{draw_options(tc)};
+      const auto proxy{make_mysql_proxy()};
+      options.mysql_port = proxy->port();
+      pbt::note(tc, "binlog_server: " + describe(options));
+      const auto storage{make_storage(options)};
+      pbt::note(tc, "workload:");
+      auto workload{draw_workload(tc, server.info, 4U)};
+      std::erase_if(workload, [](const operation &op) { return op.kind == op_kind::flush; });
+      workload.push_back(operation{.kind = op_kind::insert_rows, .count = 1});
+      apply_all(tc, server.sql, workload);
+      const auto first{server_binlogs(server.sql).front().name};
+      // event start positions in the first binlog after its
+      // FORMAT_DESCRIPTION (SHOW BINLOG EVENTS: Pos)
+      std::vector<std::uint64_t> positions;
+      for (const auto &event : server.sql.query("SHOW BINLOG EVENTS IN '" + first + "'")) {
+        if (event.size() > 1U && event[1]) {
+          const auto position{std::stoull(*event[1])};
+          if (position > 4U) {
+            positions.push_back(position);
+          }
+        }
+      }
+      const auto request{from_position
+                             ? std::string{"first binlog at an event"}
+                             : tc.draw("request", gs::sampled_from<std::string>(
+                                                      {"no binlog name", "first binlog at 4"}))};
+      const auto pick{tc.draw("event_pick", gs::integers<std::size_t>({.max_value = 999U}))};
+      const bool blocking{tc.draw("blocking", gs::booleans())};
+      std::string file;
+      std::uint64_t position{4U};
+      if (request != "no binlog name") {
+        file = first;
+      }
+      if (request == "first binlog at an event" && !positions.empty()) {
+        position = positions[pick * positions.size() / 1000U];
+      }
+      pbt::note(tc, std::string{blocking ? "blocking" : "non-blocking"} + " dump of '" +
+                        file + "' at " + std::to_string(position) +
+                        " while the storage is empty");
+
+      proxy->set_down(true);
+      pull_process pull{tc, *storage};
+      pull.wait_until_listening();
+      wait_ms(300U);
+      pbt::require(listed_names(tc, *storage).empty(),
+                   "test premise: the storage is empty while pull cannot reach the source");
+      dump_outcome outcome;
+      std::jthread client{[&outcome, &file, position, blocking]() {
+        outcome = run_dump({.port = listener_port(),
+                            .file = file,
+                            .position = position,
+                            .blocking = blocking,
+                            .idle_window = std::chrono::milliseconds{6000}});
+      }};
+      wait_ms(1000U);
+      pbt::note(tc, "the source becomes reachable for pull");
+      proxy->set_down(false);
+      // rotate, so that the first binlog is stored also without
+      // checkpointing
+      apply_all(tc, server.sql, {operation{.kind = op_kind::flush},
+                                 operation{.kind = op_kind::insert_rows, .count = 1}});
+      client.join();
+      pull.require_running();
+      pull.stop();
+      if (!outcome.error.empty()) {
+        pbt::note(tc, "binlog_server log:" + log_tail(*storage, 40U));
+      }
+      pbt::require(outcome.error.empty(),
+                   "a dump that connected while the storage was empty failed: " +
+                       outcome.error);
+      std::vector<const std::string *> received;
+      for (const auto &event : outcome.events) {
+        if (!is_generated(event.bytes)) {
+          received.push_back(&event.bytes);
+        }
+      }
+      if (!blocking) {
+        pbt::require_equal(received.size(), std::size_t{0U},
+                           "stored events a non-blocking dump of an empty storage received");
+        return;
+      }
+      const auto stored{stored_events_of(tc, *storage)};
+      std::size_t start{0U};
+      if (!file.empty()) {
+        while (start < stored.size() &&
+               !at_or_after({stored[start].file, stored[start].offset}, {file, position})) {
+          ++start;
+        }
+      }
+      std::size_t required{0U};
+      for (auto i{start}; i < stored.size(); ++i) {
+        if (stored[i].file == first) {
+          ++required;
+        }
+      }
+      pbt::note(tc, std::to_string(received.size()) + " stored event(s) received, " +
+                        std::to_string(required) + " stored in " + first +
+                        " from the start point");
+      pbt::require(received.size() <= stored.size() - start,
+                   "the dump received more events than are stored from its start point");
+      for (std::size_t i{0U}; i < received.size(); ++i) {
+        const auto &want{stored[start + i]};
+        if (!same_event(want.bytes, *received[i])) {
+          pbt::note(tc, "event " + std::to_string(i) + ": expected the stored " + want.file +
+                            ":" + std::to_string(want.offset) + " (" +
+                            describe_event(want.bytes) + "), received " +
+                            describe_event(*received[i]));
+          pbt::fail("the dump received an event that differs from the stored one");
+        }
+      }
+      pbt::require(received.size() >= required,
+                   "the dump did not receive the events of " + first +
+                       " from its start point once they were stored");
+}
+
+} // namespace
+
+// no binlog name / the first binlog at position 4 (ticket 38)
+BOOST_AUTO_TEST_CASE(ClientBeforeFirstPullIsServedMySQL) {
+  pbt::check([](hegel::TestCase &tc) { client_before_first_pull(tc, false); },
+             {.test_cases = 20U, .slow = true});
+}
+
+// the first binlog at an event boundary after its FORMAT_DESCRIPTION
+// (ticket 26)
+BOOST_AUTO_TEST_CASE(ClientBeforeFirstPullFromPositionIsServedMySQL) {
+  pbt::check([](hegel::TestCase &tc) { client_before_first_pull(tc, true); },
+             {.test_cases = 20U, .slow = true});
+}
+
+// pull stops promptly after SIGTERM also while the source is idle and its
+// connection.read_timeout is long: within 4 s, exit code 0, and the storage
+// then matches the server. A blocking dump client may be connected to the
+// listener. (Hrvoje's ticket 43, PBS-116: pull waits in the blocking read
+// from the source until read_timeout.)
+BOOST_AUTO_TEST_CASE(PullStopsPromptlyWithIdleSourceMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        start_case(tc, server);
+        auto options{draw_options(tc)};
+        options.read_timeout =
+            tc.draw("read_timeout", gs::sampled_from<unsigned>({10U, 30U}));
+        pbt::note(tc, "binlog_server: " + describe(options) + ", read_timeout " +
+                          std::to_string(*options.read_timeout) + " s");
+        const auto storage{make_storage(options)};
+        pbt::note(tc, "workload:");
+        auto workload{draw_workload(tc, server.info, 3U)};
+        workload.push_back(operation{.kind = op_kind::insert_rows, .count = 1});
+        apply_all(tc, server.sql, workload);
+        pull_process pull{tc, *storage};
+        pull.wait_until_listening();
+        wait_until_pull_caught_up(tc, server.sql, pull);
+        const bool with_client{tc.draw("blocking_client", gs::booleans())};
+        dump_outcome outcome;
+        std::jthread client;
+        if (with_client) {
+          client = std::jthread{[&outcome]() {
+            outcome = run_dump({.port = listener_port(),
+                                .blocking = true,
+                                .idle_window = std::chrono::milliseconds{120000}});
+          }};
+        }
+        const auto idle_ms{tc.draw("idle_ms", gs::sampled_from<std::uint64_t>({500U, 2000U}))};
+        pbt::note(tc, std::string{with_client ? "a blocking dump client connected; " : ""} +
+                          "source idle for " + std::to_string(idle_ms) + " ms, then SIGTERM");
+        wait_ms(idle_ms);
+        const auto signalled{steady_ms()};
+        pull.send_term();
+        const auto exited{pull.wait_for_exit(std::chrono::seconds{90})};
+        const auto stop_ms{steady_ms() - signalled};
+        std::int64_t client_ms{0};
+        if (with_client) {
+          client.join();
+          client_ms = steady_ms() - signalled;
+        }
+        pbt::note(tc, "pull stopped " + std::to_string(stop_ms) + " ms after SIGTERM" +
+                          (with_client ? ", the client's connection ended after " +
+                                             std::to_string(client_ms) + " ms"
+                                       : std::string{}));
+        pbt::require(exited.has_value(), "pull did not stop within 90 s of SIGTERM");
+        if (exited->signaled || exited->exit_code != 0) {
+          pbt::note(tc, "binlog_server log:" + log_tail(*storage));
+        }
+        pbt::require(!exited->signaled && exited->exit_code == 0,
+                     "pull stopped by SIGTERM with " + exited->describe());
+        pbt::require(stop_ms <= 4000,
+                     "pull took " + std::to_string(stop_ms) +
+                         " ms to stop after SIGTERM with an idle source (read_timeout " +
+                         std::to_string(*options.read_timeout) + " s)");
+        fetch(tc, *storage);
+        require_storage_matches_server(tc, server.sql, server.info, *storage);
+      },
+      {.test_cases = 10U, .slow = true});
 }
