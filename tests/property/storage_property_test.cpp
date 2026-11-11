@@ -1812,3 +1812,111 @@ BOOST_AUTO_TEST_CASE(LongCheckpointIntervalDoesNotFlushEarly) {
       },
       {.test_cases = 100U});
 }
+
+// ---------------------------------------------------------------------------
+// encryption: keystream reuse after crash recovery
+// ---------------------------------------------------------------------------
+
+// The data of an encrypted binlog is AES-CTR (or ARIA / CAMELLIA CTR)
+// encrypted at its byte offset with one key and IV per file. A writer that
+// stops after appending data but before saving the binlog's metadata (a
+// crash) leaves an unrecorded tail; the next start truncates it and appends
+// again at the same offset. When the new data differs from the lost tail,
+// the same keystream must not encrypt both: whoever has both ciphertexts
+// (an S3 object version, a snapshot or backup taken before the crash)
+// learns the XOR of the two plaintexts (Hrvoje's ticket 32).
+//
+// The crash is simulated: transactions A are written and recorded, then B
+// is written and recorded and the binlog's metadata is put back to its
+// state after A (data written, metadata not saved). After the reopen
+// (recovery truncates B), C is written - different from B. The keystream at
+// each overlapping offset is ciphertext XOR plaintext (the plaintext is
+// what was written); the two keystreams must differ.
+BOOST_AUTO_TEST_CASE(RecoveredEncryptedBinlogNeverReusesKeystream) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        const temporary_directory directory;
+        auto settings{draw_encryption(tc, true)};
+        const auto config{make_config(directory, settings)};
+        const binsrv::events::composite_binlog_name name{"binlog", 1U};
+        const auto data_path{vault_path(directory, name.str())};
+        const auto metadata_path{vault_path(directory, name.str() + ".json")};
+        const auto write_all{[&](const std::vector<bytes> &events) {
+          auto storage{make_storage(*config)};
+          std::ignore = storage->open_binlog(name);
+          std::uint64_t sequence{1U};
+          for (const auto &event : events) {
+            storage->write_event(cspan(event), true, binsrv::gtids::gtid{},
+                                 util::ctime_timestamp{7}, sequence++);
+          }
+          storage.reset();  // flushes and saves the metadata
+        }};
+        const auto draw_events{[&tc](const std::string &label) {
+          const auto count{tc.draw(label + "_count",
+                                   gs::integers<std::size_t>({.min_value = 1U, .max_value = 3U}))};
+          std::vector<bytes> events;
+          for (std::size_t i{0U}; i < count; ++i) {
+            events.push_back(tc.draw(label, gs::binary({.min_size = 4U, .max_size = 48U})));
+          }
+          return events;
+        }};
+        const auto joined{[](const std::vector<bytes> &events) {
+          bytes result;
+          for (const auto &event : events) {
+            result.insert(result.end(), event.begin(), event.end());
+          }
+          return result;
+        }};
+
+        write_all(draw_events("a"));
+        const auto size_a{fs::file_size(data_path)};
+        const auto metadata_a{read_text(metadata_path)};
+        const auto b_events{draw_events("b")};
+        write_all(b_events);
+        const auto ciphertext_b{read_file(data_path)};
+        const auto b{joined(b_events)};
+        pbt::require_equal(ciphertext_b.size(), size_a + b.size(),
+                           "binlog size after writing B");
+
+        // the crash: B's data is in the file, the metadata is still A's
+        write_text(metadata_path, metadata_a);
+        auto c_events{draw_events("c")};
+        auto c{joined(c_events)};
+        const auto overlap{std::min(b.size(), c.size())};
+        // C differs from B in at least its first 4 bytes, so that a fixed
+        // storage fails the check only by chance (2^-32)
+        for (std::size_t i{0U}; i < 4U; ++i) {
+          if (c_events.front()[i] == b[i]) {
+            c_events.front()[i] = static_cast<std::uint8_t>(b[i] ^ 0x5aU);
+          }
+        }
+        c = joined(c_events);
+        tc.note("A: " + std::to_string(size_a) + " bytes with the magic; B: " + hex(b) +
+                "; C: " + hex(c));
+        write_all(c_events);
+        const auto ciphertext_c{read_file(data_path)};
+        pbt::require_equal(ciphertext_c.size(), size_a + c.size(),
+                           "binlog size after recovery and writing C");
+
+        std::size_t differing{0U};
+        std::size_t reused{0U};
+        for (std::size_t i{0U}; i < overlap; ++i) {
+          if (b[i] == c[i]) {
+            continue;
+          }
+          ++differing;
+          const auto keystream_b{static_cast<std::uint8_t>(ciphertext_b[size_a + i] ^ b[i])};
+          const auto keystream_c{static_cast<std::uint8_t>(ciphertext_c[size_a + i] ^ c[i])};
+          if (keystream_b == keystream_c) {
+            ++reused;
+          }
+        }
+        tc.note(std::to_string(reused) + " of " + std::to_string(differing) +
+                " differing byte(s) encrypted with the same keystream byte");
+        pbt::require(differing == 0U || reused < differing,
+                     "after crash recovery new data was encrypted with the keystream of the "
+                     "lost data at the same offset (" + std::to_string(reused) + " of " +
+                     std::to_string(differing) + " differing bytes)");
+      },
+      {.test_cases = 100U});
+}
