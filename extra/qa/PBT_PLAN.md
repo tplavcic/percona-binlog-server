@@ -218,6 +218,8 @@ walker (magic, sizes, log_pos, CRC32, GTID order).
 | D27 | GTID dumps the storage cannot serve, differential against the MySQL source holding the same binlogs (both purged the same ones): `GtidDumpAfterPurgeMatchesMySQL` (servable sets, also with GTIDs of an unknown UUID: the same transactions as MySQL), `GtidDumpMissingPurgedIsRefusedMySQL` and `GtidDumpAheadOfSourceIsRefusedMySQL` (MySQL refuses with error 1236; the listener must too, without sending a transaction) (Hrvoje's ticket 20) | ✅ (PBT-051, PBT-052) |
 | D28 | Clients that connect before pull has stored anything (pull's connection to the source through a proxy that is down until the client waits): `ClientBeforeFirstPullIsServedMySQL` (no binlog name / the first binlog at 4) and `ClientBeforeFirstPullFromPositionIsServedMySQL` (the first binlog at an event boundary); a blocking dump waits and then gets the stored events from its start point byte for byte, a non-blocking one ends with EOF (Hrvoje's tickets 38 and 26) | ✅ (PBT-054, PBT-055) |
 | D29 | `PullStopsPromptlyWithIdleSourceMySQL`: SIGTERM to a caught-up pull with an idle source and `connection.read_timeout` 10 / 30 s, with or without a blocking dump client: exit 0 within 4 s, the storage matches the server (Hrvoje's ticket 43) | ✅ (PBT-056) |
+| D30 | `storage_property_test::RecoveredEncryptedBinlogNeverReusesKeystream`: encrypted storage, A recorded, B written without its metadata (simulated crash: the metadata put back), reopen (recovery truncates B), C written (differs from B in at least 4 bytes); the keystream (ciphertext XOR plaintext) at the overlapping offsets must differ (Hrvoje's ticket 32) | ✅ (PBT-057) |
+| D31 | `S3UploadVolumeIsLinearMySQL`: fetch into S3 through a proxy that counts the bytes and PUT requests sent; one binlog of 20 - 50 transactions of 4 - 16 KB, checkpoint_size none / 1 / 4K / 16K / 64K: uploaded <= 3 x stored + 16 KiB per possible flush (Hrvoje's ticket 17) | ✅ (PBT-058) |
 | D9 | `PurgeOnServerMySQL`: `PURGE BINARY LOGS TO` before / after the storage got the binlogs; fetch succeeds exactly when the server still has what the storage needs (position: its newest binlog; GTID: gtid_purged covered; empty storage), else exits 1 leaving the storage unchanged | ✅ |
 
 GTID auto-positioning: the server starts a GTID dump at the newest binlog
@@ -248,8 +250,8 @@ there is authoritative):
 
 | Severity | Issues |
 |---|---|
-| high | PBT-015, PBT-022, PBT-039, PBT-040, PBT-043, PBT-051 |
-| medium | PBT-001, PBT-002, PBT-004, PBT-012, PBT-013, PBT-016, PBT-019, PBT-029, PBT-030, PBT-031, PBT-032, PBT-033, PBT-035, PBT-036, PBT-037, PBT-041, PBT-042, PBT-045, PBT-048, PBT-050, PBT-052, PBT-054, PBT-055, PBT-056 |
+| high | PBT-015, PBT-022, PBT-039, PBT-040, PBT-043, PBT-051, PBT-058 |
+| medium | PBT-001, PBT-002, PBT-004, PBT-012, PBT-013, PBT-016, PBT-019, PBT-029, PBT-030, PBT-031, PBT-032, PBT-033, PBT-035, PBT-036, PBT-037, PBT-041, PBT-042, PBT-045, PBT-048, PBT-050, PBT-052, PBT-054, PBT-055, PBT-056, PBT-057 |
 | fixed | PBT-034 (upstream PBS-10), PBT-026 and PBT-038 (upstream PBS-59), PBT-025 (upstream PBS-29), PBT-024 (upstream PBS-29 part 3, 2d7dc80), PBT-046 and PBT-047 (upstream PBS-31 part 3, 6b0960f), PBT-017 and PBT-044 (upstream PBS-68 / PBS-112, dd136e5) |
 | low | PBT-003, PBT-005, PBT-006, PBT-007, PBT-008, PBT-009, PBT-010, PBT-011, PBT-014, PBT-018, PBT-020, PBT-021, PBT-023, PBT-027, PBT-028, PBT-049, PBT-053 |
 
@@ -743,6 +745,11 @@ Rebased onto dd136e5 (PBS-68 / PBS-112: no `noexcept` on functions that throw on
 - PBT-053: pull's captured stdout shows "cannot open path for fsync: No such file or directory" while it loads the configuration - the instance_id.tmp race also hits the fsync of the temporary file. `ConcurrentFirstLoadsAgreeOnInstanceId` fails with the same message.
 - PBT-032 fails again (it had passed by chance in #24).
 - PBT-040 showed another symptom: with two writers a stored binlog differs from the server's from offset 0.
+
+### Encryption keystream and S3 upload volume (sandbox run, D30 / D31)
+
+- PBT-057 (medium): `RecoveredEncryptedBinlogNeverReusesKeystream` - after a simulated crash (data written, metadata not), recovery truncates and the next data is encrypted with the same keystream at the same offset (4 of 4 differing bytes; Hrvoje's ticket 32).
+- PBT-058 (high): `S3UploadVolumeIsLinearMySQL` - checkpoint_size 1: 85797 stored bytes, 929461 uploaded in 44 PUTs (10.8x); 64K checkpoints on 600 KB: 4.8x (Hrvoje's ticket 17, PBS-82). `tcp_proxy` now counts the bytes and PUT requests it forwards to the upstream server.
 
 ## 6. Open questions
 

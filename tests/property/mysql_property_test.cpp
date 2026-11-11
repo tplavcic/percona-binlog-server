@@ -3061,6 +3061,11 @@ public:
     const std::scoped_lock lock{cut_mutex_};
     return cut_after_ >= 0;
   }
+  // bytes forwarded from clients to the upstream server, and the HTTP PUT
+  // requests among them ("PUT " anywhere in the stream: the AWS SDK sends
+  // absolute-form request lines; D31, what PBS uploads to S3)
+  [[nodiscard]] std::uint64_t bytes_to_upstream() const { return bytes_to_upstream_; }
+  [[nodiscard]] std::uint64_t put_requests() const { return put_requests_; }
   // no fault: up, not stalled, no cut pending; the connections opened
   // during a fault are closed
   void clear() {
@@ -3142,6 +3147,14 @@ private:
             }
           }
         }
+        if (i == 0U) {
+          const std::string_view chunk{buffer.data(), forward};
+          for (auto at{chunk.find("PUT ")}; at != std::string_view::npos;
+               at = chunk.find("PUT ", at + 1U)) {
+            ++put_requests_;
+          }
+
+        }
         const int target{fds[1U - i].fd};
         std::size_t written{0U};
         while (written < forward) {
@@ -3152,6 +3165,9 @@ private:
             break;
           }
           written += static_cast<std::size_t>(result);
+        }
+        if (i == 0U) {
+          bytes_to_upstream_ += written;
         }
         if (cut_now) {
           closed = true;
@@ -3172,6 +3188,8 @@ private:
   std::atomic<bool> down_{false};
   std::atomic<bool> stalled_{false};
   std::atomic<std::uint64_t> generation_{0U};
+  std::atomic<std::uint64_t> bytes_to_upstream_{0U};
+  std::atomic<std::uint64_t> put_requests_{0U};
   std::mutex cut_mutex_;
   std::int64_t cut_after_{-1};
   std::thread acceptor_;
@@ -7374,4 +7392,76 @@ BOOST_AUTO_TEST_CASE(PullStopsPromptlyWithIdleSourceMySQL) {
         require_storage_matches_server(tc, server.sql, server.info, *storage);
       },
       {.test_cases = 10U, .slow = true});
+}
+
+// ---------------------------------------------------------------------------
+// D31: what the S3 backend uploads with checkpointing
+// ---------------------------------------------------------------------------
+
+// fetch into an S3 storage uploads every byte of a binlog a bounded number
+// of times, whatever the checkpoint settings: the bytes sent to S3 (through
+// a proxy that counts them) stay within 3 x the stored binlog bytes plus
+// 16 KiB per possible flush (one per transaction, plus the binlog's
+// creation and close: HTTP headers, the metadata and index objects). One
+// binlog (max_binlog_size 1 GiB) of 20 - 50 transactions of 4 - 16 KB. With
+// a checkpoint after every transaction, uploading the whole binlog object
+// again at each checkpoint (Hrvoje's ticket 17, PBS-82) grows with the
+// square of the binlog size. The storage matches the server either way.
+BOOST_AUTO_TEST_CASE(S3UploadVolumeIsLinearMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        if (!s3_available()) {
+          pbt::infrastructure_error("S3 endpoint not configured (PBT_S3_ENDPOINT)");
+        }
+        server_session server;
+        start_case(tc, server);
+        server.sql.exec("SET GLOBAL max_binlog_size = 1073741824");
+        auto options{draw_options(tc)};
+        options.checkpoint_interval.reset();
+        const auto checkpoint{tc.draw("checkpoint", gs::sampled_from<std::string>(
+                                                        {"none", "1", "4K", "16K", "64K"}))};
+        if (checkpoint == "none") {
+          options.checkpoint_size.reset();
+        } else {
+          options.checkpoint_size = checkpoint;
+        }
+        const auto proxy{make_s3_proxy()};
+        options.s3 = true;
+        options.s3_port = proxy->port();
+        pbt::note(tc, "binlog_server: " + describe(options) + " (max_binlog_size 1 GiB)");
+        const auto storage{make_storage(options)};
+        const auto transactions{tc.draw("transactions", gs::integers<std::size_t>(
+                                                            {.min_value = 20U, .max_value = 50U}))};
+        const auto row_size{tc.draw("row_size", gs::sampled_from<std::size_t>({4000U, 8000U, 16000U}))};
+        pbt::note(tc, std::to_string(transactions) + " transactions of a " +
+                          std::to_string(row_size) + " byte row");
+        for (std::size_t i{0U}; i < transactions; ++i) {
+          apply(server.sql, operation{.kind = op_kind::large_row, .size = row_size});
+        }
+        const auto before_bytes{proxy->bytes_to_upstream()};
+        const auto before_puts{proxy->put_requests()};
+        fetch(tc, *storage);
+        const auto uploaded{proxy->bytes_to_upstream() - before_bytes};
+        const auto puts{proxy->put_requests() - before_puts};
+        require_storage_matches_server(tc, server.sql, server.info, *storage);
+        std::uint64_t stored{0U};
+        std::size_t binlogs{0U};
+        const auto listing{list(tc, *storage)};
+        for (const auto &item : listing.at("result").as_array()) {
+          stored += item.at("size").to_number<std::uint64_t>();
+          ++binlogs;
+        }
+        const auto bound{3U * stored + 16384U * (transactions + 2U * binlogs + 2U)};
+        pbt::note(tc, "stored " + std::to_string(stored) + " byte(s) in " +
+                          std::to_string(binlogs) + " binlog(s); uploaded " +
+                          std::to_string(uploaded) + " byte(s) in " + std::to_string(puts) +
+                          " PUT request(s) (" +
+                          std::to_string(stored == 0U ? 0U : uploaded / stored) +
+                          " x the binlog bytes); bound " + std::to_string(bound));
+        pbt::require(uploaded <= bound,
+                     "fetch uploaded " + std::to_string(uploaded) + " bytes to S3 for " +
+                         std::to_string(stored) + " stored binlog bytes (checkpoint_size " +
+                         checkpoint + ")");
+      },
+      {.test_cases = 15U, .slow = true});
 }
