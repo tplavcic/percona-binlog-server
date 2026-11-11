@@ -735,6 +735,15 @@ Rebased onto dd136e5 (PBS-68 / PBS-112: no `noexcept` on functions that throw on
 - PBT-056 (medium): `PullStopsPromptlyWithIdleSourceMySQL` - read_timeout 10 s: pull exits 8.2 s after SIGTERM, with or without a connected client (Hrvoje's ticket 43, PBS-116).
 - `pbs_options::read_timeout` sets `connection.read_timeout` (default 1 s as before).
 
+### Jenkins run #25 (asan_gcc14-ubsan, PS 8.4.10-10, 35e0917)
+
+209 properties, 155 passed, 54 failed, all known; 0 new, 0 regressions; possibly fixed PBT-043, PBT-035, PBT-041 (rare sequences, kept open).
+
+- D28 / D29 fail as in the sandbox (PBT-054, PBT-055, PBT-056; pull stopped 8205 ms after SIGTERM).
+- PBT-053: pull's captured stdout shows "cannot open path for fsync: No such file or directory" while it loads the configuration - the instance_id.tmp race also hits the fsync of the temporary file. `ConcurrentFirstLoadsAgreeOnInstanceId` fails with the same message.
+- PBT-032 fails again (it had passed by chance in #24).
+- PBT-040 showed another symptom: with two writers a stored binlog differs from the server's from offset 0.
+
 ## 6. Open questions
 
 See the hand-over message; the answers will be folded in here.
