@@ -222,6 +222,8 @@ walker (magic, sizes, log_pos, CRC32, GTID order).
 | D31 | `S3UploadVolumeIsLinearMySQL`: fetch into S3 through a proxy that counts the bytes and PUT requests sent; one binlog of 20 - 50 transactions of 4 - 16 KB, checkpoint_size none / 1 / 4K / 16K / 64K: uploaded <= 3 x stored + 16 KiB per possible flush (Hrvoje's ticket 17) | ✅ (PBT-058) |
 | D32 | `ReadOnlyCommandsLeaveStorageUnchangedMySQL`: after fetch (file or S3), 1 - 4 of `list` / `search_by_timestamp` / `search_by_gtid_set` with the writer's configuration or one with encryption added (another KEK) / another data cipher / other checkpoint settings / another log level: every object stays byte-identical; the commands may fail but not crash (Hrvoje's ticket 28) | ✅ (PBT-059) |
 | D33 | `LargeEventsAreStoredAndServedMySQL`: one row of 1 MB / 16.7 MB / 16,777,100 / 16.8 MB / 20 MB (max_binlog_size 1 GiB): fetch stores it byte for byte, a non-blocking dump from the listener receives every stored event byte for byte (Hrvoje's ticket 10) | ✅ (PBT-060) |
+| D34 | `ReconnectAfterRotationKeepsFirstBinlogServableMySQL`: GTID-mode pull on an empty storage, the first binlog with 0 or 1 transaction, pull idle 2.5 s, its connection to the source down (proxy) during `FLUSH BINARY LOGS` + 1 - 3 operations, back up; a non-blocking dump from the first binlog at 4 succeeds and receives the source's gtid_executed (forces the Jenkins #28 sequence) | ✅ (PBT-043) |
+| D35 | `ReplicaOfPositionStorageOfGtidSourceMySQL`: D7 (a position-based gtid_mode=ON replica of the listener catches up) with a position-mode storage of the gtid_mode=ON source (Hrvoje's ticket 30) | ✅ (PBT-061) |
 | D9 | `PurgeOnServerMySQL`: `PURGE BINARY LOGS TO` before / after the storage got the binlogs; fetch succeeds exactly when the server still has what the storage needs (position: its newest binlog; GTID: gtid_purged covered; empty storage), else exits 1 leaving the storage unchanged | ✅ |
 
 GTID auto-positioning: the server starts a GTID dump at the newest binlog
@@ -253,7 +255,7 @@ there is authoritative):
 | Severity | Issues |
 |---|---|
 | high | PBT-015, PBT-022, PBT-039, PBT-040, PBT-043, PBT-051, PBT-058, PBT-060 |
-| medium | PBT-001, PBT-002, PBT-004, PBT-012, PBT-013, PBT-016, PBT-019, PBT-029, PBT-030, PBT-031, PBT-032, PBT-033, PBT-035, PBT-036, PBT-037, PBT-041, PBT-042, PBT-045, PBT-048, PBT-050, PBT-052, PBT-054, PBT-055, PBT-056, PBT-057 |
+| medium | PBT-001, PBT-002, PBT-004, PBT-012, PBT-013, PBT-016, PBT-019, PBT-029, PBT-030, PBT-031, PBT-032, PBT-033, PBT-035, PBT-036, PBT-037, PBT-041, PBT-042, PBT-045, PBT-048, PBT-050, PBT-052, PBT-054, PBT-055, PBT-056, PBT-057, PBT-061 |
 | fixed | PBT-034 (upstream PBS-10), PBT-026 and PBT-038 (upstream PBS-59), PBT-025 (upstream PBS-29), PBT-024 (upstream PBS-29 part 3, 2d7dc80), PBT-046 and PBT-047 (upstream PBS-31 part 3, 6b0960f), PBT-017 and PBT-044 (upstream PBS-68 / PBS-112, dd136e5) |
 | low | PBT-003, PBT-005, PBT-006, PBT-007, PBT-008, PBT-009, PBT-010, PBT-011, PBT-014, PBT-018, PBT-020, PBT-021, PBT-023, PBT-027, PBT-028, PBT-049, PBT-053, PBT-059 |
 
@@ -764,6 +766,12 @@ Rebased onto dd136e5 (PBS-68 / PBS-112: no `noexcept` on functions that throw on
 
 - D32 / D33 fail as in the sandbox (PBT-059, PBT-060).
 - New: `ReplicaReceivesHeartbeatsMySQL` - the replica did not catch up in 30 s (GTID mode, no checkpointing, `FLUSH BINARY LOGS` + 1 insert). Not reproduced in the sandbox (MySQL 8.0.46, 6 replays). Triaged as PBT-043 reached without a kill: an idle pull's reconnect skips binlog.000001, which stays stored as the magic (PBT-020), and the listener fails at it (analysis of the Jenkins report, likely). The property now prints the listener log, the replica's coordinates and the storage when it fails, to confirm it next time.
+
+### First binlog skipped by a reconnect; position storage of a GTID source (sandbox run, D34 / D35)
+
+- PBT-043 confirmed without a kill: `ReconnectAfterRotationKeepsFirstBinlogServableMySQL` fails in its first case (binlog.000001 stored as 4 bytes, binlog.000002 449 bytes, a dump from binlog.000001:4 gets "Lost connection"). This is the sequence of the `ReplicaReceivesHeartbeatsMySQL` failure of Jenkins #28, now forced on MySQL 8.0.46 too.
+- PBT-061 (medium): `ReplicaOfPositionStorageOfGtidSourceMySQL` - the replica refuses to start: "the source has GTID_MODE = OFF and this server has GTID_MODE = ON" (Hrvoje's ticket 30, PBS-102).
+- `replica_of_listener_matches_source()` takes a `position_storage` flag.
 
 ## 6. Open questions
 
