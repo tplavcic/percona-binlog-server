@@ -58,6 +58,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -7464,4 +7465,216 @@ BOOST_AUTO_TEST_CASE(S3UploadVolumeIsLinearMySQL) {
                          checkpoint + ")");
       },
       {.test_cases = 15U, .slow = true});
+}
+
+// ---------------------------------------------------------------------------
+// D32: read-only commands leave the storage unchanged
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// every object of the storage with its content (filesystem: the vault
+// directory, recursively; S3: the objects under the storage's prefix)
+std::map<std::string, std::string> storage_snapshot(const pbs_storage &storage) {
+  std::map<std::string, std::string> result;
+  if (!storage.s3) {
+    for (const auto &entry : fs::recursive_directory_iterator{storage.vault()}) {
+      if (entry.is_regular_file()) {
+        result[fs::relative(entry.path(), storage.vault()).generic_string()] =
+            read_file(entry.path());
+      }
+    }
+    return result;
+  }
+  const auto listing{storage_objects_text(storage)};
+  std::size_t start{0U};
+  while (start < listing.size()) {
+    const auto end{listing.find(' ', start)};
+    const auto item{listing.substr(start, end == std::string::npos ? std::string::npos
+                                                                    : end - start)};
+    start = end == std::string::npos ? listing.size() : end + 1U;
+    const auto open{item.rfind('(')};
+    if (item.empty() || item.front() == '(' || open == std::string::npos) {
+      continue;
+    }
+    const auto name{item.substr(0U, open)};
+    result[name] = storage.stored(name);
+  }
+  return result;
+}
+
+std::string snapshot_difference(const std::map<std::string, std::string> &before,
+                                const std::map<std::string, std::string> &after) {
+  std::string result;
+  for (const auto &[name, content] : before) {
+    const auto it{after.find(name)};
+    if (it == after.end()) {
+      result += "'" + name + "' removed; ";
+    } else if (it->second != content) {
+      result += "'" + name + "' changed (" + std::to_string(content.size()) + " -> " +
+                std::to_string(it->second.size()) + " bytes); ";
+    }
+  }
+  for (const auto &[name, content] : after) {
+    if (!before.contains(name)) {
+      result += "'" + name + "' added (" + std::to_string(content.size()) + " bytes); ";
+    }
+  }
+  return result;
+}
+
+} // namespace
+
+// list, search_by_timestamp and search_by_gtid_set open the storage only to
+// read it (querying_only mode): whatever they answer, and also with a
+// configuration that differs from the writer's in ways a query does not
+// need (encryption added, or another data cipher, other checkpoint
+// settings, another log level), every object of the storage stays
+// byte-identical. Hrvoje's ticket 28: a query with encryption added to the
+// configuration rewrites metadata.json. The commands may fail (e.g. a
+// configuration without the KEK of an encrypted storage), but not crash.
+BOOST_AUTO_TEST_CASE(ReadOnlyCommandsLeaveStorageUnchangedMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        start_case(tc, server);
+        auto options{draw_options(tc)};
+        options.s3 = s3_available() && tc.draw("s3", gs::booleans());
+        pbt::note(tc, "binlog_server: " + describe(options) +
+                          (options.s3 ? ", S3 storage" : ""));
+        const auto storage{make_storage(options)};
+        pbt::note(tc, "workload:");
+        auto workload{draw_workload(tc, server.info, 6U)};
+        workload.push_back(operation{.kind = op_kind::insert_rows, .count = 1});
+        apply_all(tc, server.sql, workload);
+        fetch(tc, *storage);
+
+        // the query configuration
+        auto config{json::parse(read_file(storage->config_path)).as_object()};
+        // (no reference into 'config': inserting a key may move its members)
+        const auto storage_section{[&config]() -> json::object & {
+          return config["storage"].as_object();
+        }};
+        const auto change{tc.draw("config_change", gs::sampled_from<std::string>(
+                                                       {"same", "encryption", "checkpoints",
+                                                        "log level"}))};
+        std::unique_ptr<pbs_storage> other;  // owns the other keyring file
+        std::string described{change};
+        if (change == "encryption") {
+          auto other_options{options};
+          other_options.s3 = false;
+          other_options.encryption = pbs_options::encryption_options{
+              "AES-256-GCM", std::string(64U, 'c'),
+              tc.draw("query_data_cipher", gs::sampled_from<std::string>(
+                                               {"AES-128-CTR", "AES-256-CTR"}))};
+          other = make_storage(other_options);
+          const auto other_config{json::parse(read_file(other->config_path)).as_object()};
+          if (options.encryption && tc.draw("keep_kek", gs::booleans())) {
+            // the storage's KEK, another data cipher
+            storage_section()["encryption"].as_object()["cipher"] =
+                other_options.encryption->data_cipher;
+            described = "data cipher " + other_options.encryption->data_cipher;
+          } else {
+            config["keyring"] = other_config.at("keyring");
+            storage_section()["encryption"] =
+                other_config.at("storage").as_object().at("encryption");
+            described = options.encryption ? "another KEK (the storage's is missing)"
+                                           : "encryption added";
+          }
+        } else if (change == "checkpoints") {
+          storage_section()["checkpoint_size"] = "1";
+          storage_section()["checkpoint_interval"] = "1s";
+        } else if (change == "log level") {
+          config["logger"].as_object()["level"] = "trace";
+        }
+        const auto query_config{(storage->directory.path() / "query-config.json").string()};
+        std::ofstream{query_config} << json::serialize(config);
+
+        std::vector<std::vector<std::string>> commands;
+        const auto count{tc.draw("commands", gs::integers<std::size_t>({.min_value = 1U,
+                                                                        .max_value = 4U}))};
+        for (std::size_t i{0U}; i < count; ++i) {
+          const auto command{tc.draw("command", gs::sampled_from<std::string>(
+                                                    {"list", "search_by_timestamp",
+                                                     "search_by_gtid_set"}))};
+          if (command == "list") {
+            commands.push_back({"list", query_config});
+          } else if (command == "search_by_timestamp") {
+            const auto when{tc.draw("timestamp", gs::sampled_from<std::string>(
+                                                     {"2000-01-01T00:00:00",
+                                                      "2099-01-01T00:00:00"}))};
+            commands.push_back({"search_by_timestamp", query_config, when});
+          } else {
+            commands.push_back({"search_by_gtid_set", query_config,
+                                server_executed(server.sql).str()});
+          }
+        }
+        const auto before{storage_snapshot(*storage)};
+        pbt::note(tc, "query configuration: " + described);
+        for (const auto &command : commands) {
+          const auto result{run(command)};
+          pbt::note(tc, command.front() + ": " + result.describe() + ", " +
+                            result.output.substr(0U, 200U));
+          pbt::require(!result.signaled, command.front() + " crashed (" + result.describe() + ")");
+        }
+        const auto after{storage_snapshot(*storage)};
+        const auto difference{snapshot_difference(before, after)};
+        pbt::require(difference.empty(),
+                     "a read-only command changed the storage: " + difference);
+      },
+      {.test_cases = 30U, .slow = true});
+}
+
+// ---------------------------------------------------------------------------
+// D33: events of 16 MB and more
+// ---------------------------------------------------------------------------
+
+// A row of 1 - 20 MB on the source (the binlog event is about as large):
+// fetch stores the binlog byte for byte, and a dump from the listener
+// (non-blocking, from the first binlog) receives every stored event byte
+// for byte. The MySQL protocol limits a packet to 0xFFFFFF bytes: larger
+// events are split into several packets, with an empty packet after a
+// payload that is an exact multiple of 0xFFFFFF (Hrvoje's ticket 10,
+// PBS-76: the listener cannot send events of 16,777,211 bytes or more).
+BOOST_AUTO_TEST_CASE(LargeEventsAreStoredAndServedMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        start_case(tc, server);
+        server.sql.exec("SET GLOBAL max_binlog_size = 1073741824");
+        auto options{draw_options(tc)};
+        pbt::note(tc, "binlog_server: " + describe(options));
+        const auto storage{make_storage(options)};
+        const auto row_size{tc.draw("row_size", gs::sampled_from<std::size_t>(
+                                                    {1000000U, 16700000U, 16777100U,
+                                                     16800000U, 20000000U}))};
+        pbt::note(tc, "insert a " + std::to_string(row_size) + " byte row, then 1 small row");
+        apply_all(tc, server.sql, {operation{.kind = op_kind::large_row, .size = row_size},
+                                   operation{.kind = op_kind::insert_rows, .count = 1}});
+        fetch(tc, *storage);
+        require_storage_matches_server(tc, server.sql, server.info, *storage);
+        const auto events{stored_events_of(tc, *storage)};
+        std::size_t largest{0U};
+        for (const auto &event : events) {
+          largest = std::max(largest, event.bytes.size());
+        }
+        pbt::note(tc, "largest stored event: " + std::to_string(largest) + " bytes");
+        std::vector<const stored_event *> expected;
+        for (const auto &event : events) {
+          expected.push_back(&event);
+        }
+        pull_process pull{tc, *storage};
+        pull.wait_until_listening();
+        const auto outcome{run_dump({.port = listener_port(), .file = events.front().file})};
+        pull.require_running();
+        pull.stop();
+        if (!outcome.error.empty()) {
+          pbt::note(tc, "binlog_server log:" + log_tail(*storage));
+        }
+        pbt::require(outcome.error.empty(),
+                     "a dump with a " + std::to_string(largest) + " byte event failed: " +
+                         outcome.error);
+        require_same_events(tc, outcome, expected, "dump with a large event");
+      },
+      {.test_cases = 8U, .slow = true});
 }
