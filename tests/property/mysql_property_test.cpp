@@ -6654,6 +6654,11 @@ BOOST_AUTO_TEST_CASE(ReplicaReceivesHeartbeatsMySQL) {
             if (std::chrono::steady_clock::now() >= deadline) {
               const auto status{replica.sql().first_row_named("SHOW REPLICA STATUS")};
               pbt::note(tc, "Last_IO_Error: " + field(status, "Last_IO_Error"));
+              pbt::note(tc, "Source_Log_File / Read_Source_Log_Pos: " +
+                                field(status, "Source_Log_File") + ":" +
+                                field(status, "Read_Source_Log_Pos"));
+              pbt::note(tc, "storage: " + listed_text(tc, *storage));
+              pbt::note(tc, "binlog_server log:" + log_tail(*storage, 40U));
               pbt::fail("the replica did not catch up in 30 s");
             }
             wait_ms(100U);
