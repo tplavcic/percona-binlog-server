@@ -2679,15 +2679,18 @@ private:
 namespace {
 
 void replica_of_listener_matches_source(hegel::TestCase &tc,
-                                        workload_set set = workload_set::basic) {
+                                        workload_set set = workload_set::basic,
+                                        bool position_storage = false) {
         server_session server;
         replica_session replica;
         start_case(tc, server);
         // the listener reports GTID_MODE from the storage's mode (README):
         // the replica runs with gtid_mode=ON, and MySQL refuses an ON
         // replica of an OFF source, so the storage is in GTID mode
-        // (the replication itself is position-based)
-        const auto options{draw_options(tc, true)};
+        // (the replication itself is position-based) - except for
+        // 'position_storage' (D35): a position-mode storage of the same
+        // gtid_mode=ON source, whose stored binlogs carry GTID_LOG events
+        const auto options{draw_options(tc, !position_storage)};
         pbt::note(tc, "binlog_server: " + describe(options));
         const auto storage{make_storage(options)};
         pull_process pull{tc, *storage};
@@ -7682,4 +7685,92 @@ BOOST_AUTO_TEST_CASE(LargeEventsAreStoredAndServedMySQL) {
         require_same_events(tc, outcome, expected, "dump with a large event");
       },
       {.test_cases = 8U, .slow = true});
+}
+
+// ---------------------------------------------------------------------------
+// D34 - D35: the first binlog skipped by a reconnect; a position-mode
+// storage of a GTID source as a replication source
+// ---------------------------------------------------------------------------
+
+// pull (GTID mode) starts on an empty storage while the source's first
+// binlog holds no transaction (or one), stays idle for 2.5 s (its 1 s
+// read_timeout makes it disconnect and reconnect), then loses its
+// connection to the source (a proxy goes down) while the source runs
+// FLUSH BINARY LOGS and 1 - 3 operations; the connection comes back and
+// pull catches up. Its auto-positioned reconnect may start at the new
+// binlog. A non-blocking dump from the first binlog at position 4 must then
+// succeed and receive every transaction of the source (its gtid_executed).
+// This forces the sequence behind the ReplicaReceivesHeartbeatsMySQL failure
+// of Jenkins #28 (PBT-043 without a kill: the first binlog stays stored as
+// the magic only, PBT-020, and the listener cannot get past it).
+BOOST_AUTO_TEST_CASE(ReconnectAfterRotationKeepsFirstBinlogServableMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        start_case(tc, server);
+        auto options{draw_options(tc, true)};
+        const auto proxy{make_mysql_proxy()};
+        options.mysql_port = proxy->port();
+        pbt::note(tc, "binlog_server: " + describe(options));
+        const auto storage{make_storage(options)};
+        const auto before{tc.draw("transactions_before", gs::integers<int>({.min_value = 0,
+                                                                            .max_value = 1}))};
+        if (before != 0) {
+          apply_all(tc, server.sql, {operation{.kind = op_kind::insert_rows, .count = 1}});
+        }
+        const auto first{server_binlogs(server.sql).front().name};
+        pull_process pull{tc, *storage};
+        pull.wait_until_listening();
+        pbt::note(tc, std::to_string(before) + " transaction(s) in " + first +
+                          "; pull idle for 2500 ms, then its connection to the source is down "
+                          "while the source runs:");
+        wait_ms(2500U);
+        proxy->set_down(true);
+        wait_ms(300U);
+        auto workload{draw_workload(tc, server.info, 3U)};
+        std::erase_if(workload, [](const operation &op) { return op.kind == op_kind::flush; });
+        workload.insert(workload.begin(), operation{.kind = op_kind::flush});
+        workload.push_back(operation{.kind = op_kind::insert_rows, .count = 1});
+        apply_all(tc, server.sql, workload);
+        proxy->set_down(false);
+        pbt::note(tc, "the connection is back");
+        wait_until_pull_caught_up(tc, server.sql, pull);
+        wait_ms(2500U);  // an idle read timeout flushes what pull has (no checkpoint needed)
+        const auto expected{server_executed(server.sql)};
+        const auto outcome{run_dump({.port = listener_port(), .file = first})};
+        const auto received{received_gtids(outcome)};
+        pull.require_running();
+        const auto stored{listed_text(tc, *storage)};
+        pull.stop();
+        pbt::note(tc, "storage: " + stored);
+        pbt::note(tc, "dump of " + first + ":4: " +
+                          (outcome.error.empty() ? std::string{"ended normally"} : outcome.error) +
+                          ", transactions '" + received.str() + "'; source gtid_executed '" +
+                          expected.str() + "'");
+        if (!outcome.error.empty() || received != expected) {
+          pbt::note(tc, "binlog_server log:" + log_tail(*storage, 40U));
+        }
+        pbt::require(outcome.error.empty(),
+                     "a dump from the first binlog failed after pull reconnected past it: " +
+                         outcome.error);
+        pbt::require(received == expected,
+                     "a dump from the first binlog did not receive every transaction of the "
+                     "source after pull reconnected past it");
+      },
+      {.test_cases = 20U, .slow = true});
+}
+
+// The same position-based MySQL replica (gtid_mode=ON, SOURCE_LOG_FILE /
+// SOURCE_LOG_POS) of the listener as ReplicaOfListenerMatchesSourceMySQL,
+// but the storage is in position mode while the source has gtid_mode=ON:
+// the stored binlogs are the source's, GTID_LOG events included, so a GTID
+// replica can apply them. The listener reports GTID_MODE from the storage's
+// mode (OFF), and MySQL refuses an ON replica of an OFF source (MY-013117).
+// MySQL 9.7 has gtid_mode=ON by default. Hrvoje's ticket 30 (PBS-102).
+BOOST_AUTO_TEST_CASE(ReplicaOfPositionStorageOfGtidSourceMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        replica_of_listener_matches_source(tc, workload_set::basic, true);
+      },
+      {.test_cases = 10U, .slow = true});
 }
