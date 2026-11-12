@@ -758,6 +758,13 @@ Rebased onto dd136e5 (PBS-68 / PBS-112: no `noexcept` on functions that throw on
 - PBT-059 (low): `ReadOnlyCommandsLeaveStorageUnchangedMySQL` - `list` with encryption added to the configuration rewrites `metadata.json` (Hrvoje's ticket 28).
 - PBT-060 (high): `LargeEventsAreStoredAndServedMySQL` - a 16,800,048-byte event is stored correctly by fetch, but the listener drops the session when it reaches it (system:90, EMSGSIZE; Hrvoje's ticket 10, PBS-76).
 
+### Jenkins run #28 (asan_gcc14-ubsan, PS 8.4.10-10, 2e0a300)
+
+213 properties, 153 passed, 60 failed: 59 known, 1 new, 0 regressions; possibly fixed PBT-040, PBT-035 (timing / rare).
+
+- D32 / D33 fail as in the sandbox (PBT-059, PBT-060).
+- New: `ReplicaReceivesHeartbeatsMySQL` - the replica did not catch up in 30 s (GTID mode, no checkpointing, `FLUSH BINARY LOGS` + 1 insert). Not reproduced in the sandbox (MySQL 8.0.46, 6 replays). Triaged as PBT-043 reached without a kill: an idle pull's reconnect skips binlog.000001, which stays stored as the magic (PBT-020), and the listener fails at it (analysis of the Jenkins report, likely). The property now prints the listener log, the replica's coordinates and the storage when it fails, to confirm it next time.
+
 ## 6. Open questions
 
 See the hand-over message; the answers will be folded in here.
