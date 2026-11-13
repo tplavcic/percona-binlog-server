@@ -255,7 +255,7 @@ there is authoritative):
 | Severity | Issues |
 |---|---|
 | high | PBT-015, PBT-022, PBT-039, PBT-040, PBT-043, PBT-051, PBT-058, PBT-060 |
-| medium | PBT-001, PBT-002, PBT-004, PBT-012, PBT-013, PBT-016, PBT-019, PBT-029, PBT-030, PBT-031, PBT-032, PBT-033, PBT-035, PBT-036, PBT-037, PBT-041, PBT-042, PBT-045, PBT-048, PBT-050, PBT-052, PBT-054, PBT-055, PBT-056, PBT-057, PBT-061 |
+| medium | PBT-001, PBT-002, PBT-004, PBT-012, PBT-013, PBT-016, PBT-019, PBT-029, PBT-030, PBT-031, PBT-032, PBT-033, PBT-035, PBT-036, PBT-037, PBT-041, PBT-042, PBT-045, PBT-048, PBT-050, PBT-052, PBT-054, PBT-055, PBT-056, PBT-057, PBT-061, PBT-062 |
 | fixed | PBT-034 (upstream PBS-10), PBT-026 and PBT-038 (upstream PBS-59), PBT-025 (upstream PBS-29), PBT-024 (upstream PBS-29 part 3, 2d7dc80), PBT-046 and PBT-047 (upstream PBS-31 part 3, 6b0960f), PBT-017 and PBT-044 (upstream PBS-68 / PBS-112, dd136e5) |
 | low | PBT-003, PBT-005, PBT-006, PBT-007, PBT-008, PBT-009, PBT-010, PBT-011, PBT-014, PBT-018, PBT-020, PBT-021, PBT-023, PBT-027, PBT-028, PBT-049, PBT-053, PBT-059 |
 
@@ -772,6 +772,13 @@ Rebased onto dd136e5 (PBS-68 / PBS-112: no `noexcept` on functions that throw on
 - PBT-043 confirmed without a kill: `ReconnectAfterRotationKeepsFirstBinlogServableMySQL` fails in its first case (binlog.000001 stored as 4 bytes, binlog.000002 449 bytes, a dump from binlog.000001:4 gets "Lost connection"). This is the sequence of the `ReplicaReceivesHeartbeatsMySQL` failure of Jenkins #28, now forced on MySQL 8.0.46 too.
 - PBT-061 (medium): `ReplicaOfPositionStorageOfGtidSourceMySQL` - the replica refuses to start: "the source has GTID_MODE = OFF and this server has GTID_MODE = ON" (Hrvoje's ticket 30, PBS-102).
 - `replica_of_listener_matches_source()` takes a `position_storage` flag.
+
+### Jenkins run #29 (asan_gcc14-ubsan, PS 8.4.10-10, 716a224)
+
+215 properties, 154 passed, 61 failed: 60 known, 0 new, 1 regression; possibly fixed PBT-043 (LiveClients*, ReplicaReceivesHeartbeats), PBT-041 (both failover properties).
+
+- D34 / D35 fail as in the sandbox (PBT-043 confirmed without a kill, PBT-061).
+- The regression: `DiskFullLeavesStorageConsistentMySQL` - after a full disk (limit 0) while creating binlog.000003 next to binlog.000001 (GTID mode: auto-positioning skipped the binlogs without transactions), fetch fails for good with "storage contains an object that is not referenced in the binlog index". The recovery only knows the binlog that follows the last indexed one. Not a code regression: PBS-59's fix (PBT-038) does not cover this sequence. New PBT-062 (medium), listed before the PBT-038 row.
 
 ## 6. Open questions
 
