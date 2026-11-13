@@ -49,6 +49,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <csignal>
 #include <cstddef>
@@ -7771,6 +7772,135 @@ BOOST_AUTO_TEST_CASE(ReplicaOfPositionStorageOfGtidSourceMySQL) {
   pbt::check(
       [](hegel::TestCase &tc) {
         replica_of_listener_matches_source(tc, workload_set::basic, true);
+      },
+      {.test_cases = 10U, .slow = true});
+}
+
+// ---------------------------------------------------------------------------
+// D36 - D37: diagnostics in the log
+// ---------------------------------------------------------------------------
+
+// fetch that cannot connect to its source fails (exit code 1, within 60 s,
+// no crash) and its log says why, with the reason the MySQL client library
+// reports: a wrong password ("Access denied"), nothing listening on the
+// port ("Can't connect"), a server certificate the configured CA does not
+// verify (ssl mode verify_ca with another CA: an SSL error), or an account
+// that requires TLS while ssl mode is disabled ("Access denied" / "secure
+// connection"). Hrvoje's ticket 47 (PBS-121): the log only says "unable to
+// establish connection to mysql server".
+BOOST_AUTO_TEST_CASE(ConnectionFailureIsExplainedInLogMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        start_case(tc, server);
+        auto options{draw_options(tc)};
+        const auto failure{tc.draw("failure", gs::sampled_from<std::string>(
+                                                  {"wrong password", "nothing listening",
+                                                   "certificate not verified",
+                                                   "account requires TLS"}))};
+        std::vector<std::string> reasons;
+        if (failure == "wrong password") {
+          options.mysql_password = "wrong-password";
+          reasons = {"access denied"};
+        } else if (failure == "nothing listening") {
+          // a port that was free a moment ago
+          const int probe{::socket(AF_INET, SOCK_STREAM, 0)};
+          sockaddr_in address{};
+          address.sin_family = AF_INET;
+          address.sin_port = 0;
+          address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+          socklen_t length{sizeof address};
+          // NOLINTBEGIN(cppcoreguidelines-pro-type-reinterpret-cast)
+          ::bind(probe, reinterpret_cast<sockaddr *>(&address), sizeof address);
+          ::getsockname(probe, reinterpret_cast<sockaddr *>(&address), &length);
+          // NOLINTEND(cppcoreguidelines-pro-type-reinterpret-cast)
+          ::close(probe);
+          options.mysql_port = ntohs(address.sin_port);
+          reasons = {"can't connect", "cannot connect", "connection refused"};
+        } else if (failure == "certificate not verified") {
+          options.ssl = json::object{{"mode", "verify_ca"},
+                                     {"ca", (tls_dir() / "other-ca.pem").string()}};
+          reasons = {"ssl", "certificate", "tls"};
+        } else {
+          create_tls_account(server.sql, "SSL");
+          options.mysql_user = std::string{tls_account};
+          options.mysql_password = std::string{tls_password};
+          options.ssl = json::object{{"mode", "disabled"}};
+          reasons = {"access denied", "secure connection", "ssl"};
+        }
+        pbt::note(tc, "binlog_server: " + describe(options) + "; failure: " + failure);
+        const auto storage{make_storage(options)};
+        apply_all(tc, server.sql, {operation{.kind = op_kind::insert_rows, .count = 1}});
+        background_run fetch_run{{"fetch", storage->config_path}};
+        const auto [result, in_time]{fetch_run.wait_for(std::chrono::seconds{60})};
+        pbt::note(tc, "fetch: " + (in_time ? result.describe() : std::string{"killed after 60 s"}));
+        pbt::require(in_time, "fetch that cannot connect did not end within 60 s");
+        pbt::require(!result.signaled, "fetch that cannot connect crashed (" + result.describe() + ")");
+        pbt::require(result.exit_code != 0, "fetch that cannot connect reported success");
+        auto log{read_file_if_exists(storage->log())};
+        std::ranges::transform(log, log.begin(), [](unsigned char c) {
+          return static_cast<char>(std::tolower(c));
+        });
+        const bool explained{std::ranges::any_of(reasons, [&log](const std::string &reason) {
+          return log.find(reason) != std::string::npos;
+        })};
+        if (!explained) {
+          pbt::note(tc, "binlog_server log:" + log_tail(*storage, 15U));
+        }
+        pbt::require(explained, "the log does not say why fetch could not connect (" + failure +
+                                    "; expected one of: " + joined_list(reasons, '/') + ")");
+      },
+      {.test_cases = 12U, .slow = true});
+}
+
+// Clients of the listener that end their dumps normally - a non-blocking
+// dump that reached the end, or a blocking dump the client closes - are not
+// errors: pull's log has no line at error level for them (Hrvoje's ticket
+// 42, PBS-115: every client disconnect is logged as an error, which buries
+// real errors and trips log-based alerting).
+BOOST_AUTO_TEST_CASE(NormalClientDisconnectIsNotAnErrorMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        start_case(tc, server);
+        const auto options{draw_options(tc)};
+        pbt::note(tc, "binlog_server: " + describe(options));
+        const auto storage{make_storage(options)};
+        apply_all(tc, server.sql, {operation{.kind = op_kind::insert_rows, .count = 1}});
+        fetch(tc, *storage);
+        const auto first{stored_events_of(tc, *storage).front().file};
+        pull_process pull{tc, *storage};
+        pull.wait_until_listening();
+        const auto clients{tc.draw("clients", gs::integers<std::size_t>({.min_value = 1U,
+                                                                         .max_value = 3U}))};
+        for (std::size_t i{0U}; i < clients; ++i) {
+          const bool blocking{tc.draw("blocking", gs::booleans())};
+          const auto outcome{run_dump({.port = listener_port(),
+                                       .file = first,
+                                       .blocking = blocking,
+                                       .idle_window = std::chrono::milliseconds{1000}})};
+          pbt::note(tc, std::string{blocking ? "blocking dump closed by the client"
+                                             : "non-blocking dump to the end"} +
+                            (outcome.error.empty() ? "" : " (" + outcome.error + ")"));
+          pbt::require(outcome.error.empty(), "the dump failed: " + outcome.error);
+        }
+        wait_ms(500U);
+        pull.require_running();
+        const auto log{read_file_if_exists(storage->log())};
+        pull.stop();
+        std::string error_lines;
+        std::istringstream lines{log};
+        for (std::string line; std::getline(lines, line);) {
+          if (line.find("[  error]") != std::string::npos ||
+              line.find("[error]") != std::string::npos) {
+            error_lines += "\n    | " + line;
+          }
+        }
+        if (!error_lines.empty()) {
+          pbt::note(tc, "error lines:" + error_lines);
+        }
+        pbt::require(error_lines.empty(),
+                     "pull logged a normal client disconnect at error level");
       },
       {.test_cases = 10U, .slow = true});
 }

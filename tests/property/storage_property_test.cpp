@@ -1446,82 +1446,109 @@ BOOST_AUTO_TEST_CASE(InconsistentBinlogSizeIsRejected) {
 // without metadata, that binlog.index does not list. Restarting must still
 // work: the binlogs that were complete keep their data, and the source can
 // send the interrupted binlog again (open_binlog() of the next name).
+namespace {
+
+void crash_while_creating_binlog(hegel::TestCase &tc, bool skip_numbers) {
+  const temporary_directory directory;
+  storage_model expected;
+  expected.settings.gtid_mode = tc.draw("gtid_mode", gs::booleans());
+  const auto config{make_config(directory, expected.settings)};
+  const auto number_of_files{tc.draw(
+      "files", gs::integers<std::size_t>({.min_value = skip_numbers ? 1U : 0U,
+                                          .max_value = 3U}))};
+  populate(*config, expected, tc, number_of_files);
+  // the sequence number of the interrupted binlog: the next one, or
+  // (skip_numbers) a later one, as a GTID-mode source may send after
+  // binlogs without transactions
+  const auto gap{skip_numbers
+                     ? tc.draw("gap", gs::integers<std::size_t>({.min_value = 2U,
+                                                                 .max_value = 4U}))
+                     : std::size_t{1U}};
+
+  const auto index_path{vault_path(directory, "binlog.index")};
+  const bool had_index{fs::exists(index_path)};
+  const auto index_before{had_index ? read_text(index_path) : ""};
+  const binsrv::events::composite_binlog_name interrupted{
+      "binlog", static_cast<std::uint32_t>(number_of_files + gap)};
+  tc.note("interrupted creation of " + interrupted.str() + " after " +
+          std::to_string(number_of_files) + " complete binlog(s)");
+  {
+    auto storage{make_storage(*config)};
+    std::ignore = storage->open_binlog(interrupted);
+  }
+  // undo the steps the crash prevented
+  enum class crash_point : std::uint8_t {
+    after_create, after_magic, after_metadata };
+  const auto point{tc.draw(
+      "crash_point",
+      gs::sampled_from<crash_point>({crash_point::after_create,
+                                     crash_point::after_magic,
+                                     crash_point::after_metadata}))};
+  tc.note(std::string{"crash point: "} +
+          (point == crash_point::after_create
+               ? "after creating the file"
+               : (point == crash_point::after_magic
+                      ? "after writing the magic bytes"
+                      : "after saving the metadata")));
+  if (had_index) {
+    write_text(index_path, index_before);
+  } else {
+    fs::remove(index_path);
+  }
+  if (point != crash_point::after_metadata) {
+    fs::remove(vault_path(directory, interrupted.str() + ".json"));
+  }
+  if (point == crash_point::after_create) {
+    fs::resize_file(vault_path(directory, interrupted.str()), 0U);
+  }
+
+  std::unique_ptr<binsrv::storage> reopened;
+  try {
+    reopened = make_storage(*config);
+  } catch (const std::exception &e) {
+    pbt::fail(std::string{"storage cannot be reopened after a crash "
+                          "while creating a binlog: "} +
+              e.what());
+  }
+  const auto records{reopened->get_binlog_records()};
+  pbt::require(records.size() == expected.files.size() ||
+                   (records.size() == expected.files.size() + 1U &&
+                    records.back().name == interrupted &&
+                    records.back().size <=
+                        binsrv::events::magic_binlog_offset),
+               "the complete binlogs and at most the empty interrupted "
+               "one");
+  for (std::size_t i{0U}; i < expected.files.size(); ++i) {
+    pbt::require_equal(records[i].size,
+                       std::uint64_t{expected.files[i].flushed.size()},
+                       "complete binlog kept");
+  }
+  try {
+    std::ignore = reopened->open_binlog(interrupted);
+  } catch (const std::exception &e) {
+    pbt::fail(std::string{"the interrupted binlog cannot be opened "
+                          "again: "} +
+              e.what());
+  }
+}
+
+} // namespace
+
 BOOST_AUTO_TEST_CASE(CrashWhileCreatingBinlogIsRecovered) {
-  pbt::check(
-      [](hegel::TestCase &tc) {
-        const temporary_directory directory;
-        storage_model expected;
-        expected.settings.gtid_mode = tc.draw("gtid_mode", gs::booleans());
-        const auto config{make_config(directory, expected.settings)};
-        const auto number_of_files{
-            tc.draw("files", gs::integers<std::size_t>({.max_value = 3U}))};
-        populate(*config, expected, tc, number_of_files);
+  pbt::check([](hegel::TestCase &tc) { crash_while_creating_binlog(tc, false); },
+             {.test_cases = 200U});
+}
 
-        const auto index_path{vault_path(directory, "binlog.index")};
-        const bool had_index{fs::exists(index_path)};
-        const auto index_before{had_index ? read_text(index_path) : ""};
-        const binsrv::events::composite_binlog_name interrupted{
-            "binlog", static_cast<std::uint32_t>(number_of_files + 1U)};
-        {
-          auto storage{make_storage(*config)};
-          std::ignore = storage->open_binlog(interrupted);
-        }
-        // undo the steps the crash prevented
-        enum class crash_point : std::uint8_t {
-          after_create, after_magic, after_metadata };
-        const auto point{tc.draw(
-            "crash_point",
-            gs::sampled_from<crash_point>({crash_point::after_create,
-                                           crash_point::after_magic,
-                                           crash_point::after_metadata}))};
-        tc.note(std::string{"crash point: "} +
-                (point == crash_point::after_create
-                     ? "after creating the file"
-                     : (point == crash_point::after_magic
-                            ? "after writing the magic bytes"
-                            : "after saving the metadata")));
-        if (had_index) {
-          write_text(index_path, index_before);
-        } else {
-          fs::remove(index_path);
-        }
-        if (point != crash_point::after_metadata) {
-          fs::remove(vault_path(directory, interrupted.str() + ".json"));
-        }
-        if (point == crash_point::after_create) {
-          fs::resize_file(vault_path(directory, interrupted.str()), 0U);
-        }
-
-        std::unique_ptr<binsrv::storage> reopened;
-        try {
-          reopened = make_storage(*config);
-        } catch (const std::exception &e) {
-          pbt::fail(std::string{"storage cannot be reopened after a crash "
-                                "while creating a binlog: "} +
-                    e.what());
-        }
-        const auto records{reopened->get_binlog_records()};
-        pbt::require(records.size() == expected.files.size() ||
-                         (records.size() == expected.files.size() + 1U &&
-                          records.back().name == interrupted &&
-                          records.back().size <=
-                              binsrv::events::magic_binlog_offset),
-                     "the complete binlogs and at most the empty interrupted "
-                     "one");
-        for (std::size_t i{0U}; i < expected.files.size(); ++i) {
-          pbt::require_equal(records[i].size,
-                             std::uint64_t{expected.files[i].flushed.size()},
-                             "complete binlog kept");
-        }
-        try {
-          std::ignore = reopened->open_binlog(interrupted);
-        } catch (const std::exception &e) {
-          pbt::fail(std::string{"the interrupted binlog cannot be opened "
-                                "again: "} +
-                    e.what());
-        }
-      },
-      {.test_cases = 200U});
+// The same when the interrupted binlog does not follow the last stored one
+// directly: in GTID mode MySQL starts an auto-positioned dump at the newest
+// binlog whose PREVIOUS_GTIDS the storage covers, so after binlogs without
+// transactions (FLUSH BINARY LOGS on an idle source) PBS creates e.g.
+// binlog.000003 after binlog.000001. A crash or a full disk while creating
+// it must not leave a storage that cannot be opened (PBT-062: the recovery
+// only recognises the next sequence number, Jenkins #29).
+BOOST_AUTO_TEST_CASE(CrashWhileCreatingLaterBinlogIsRecovered) {
+  pbt::check([](hegel::TestCase &tc) { crash_while_creating_binlog(tc, true); },
+             {.test_cases = 100U});
 }
 
 // In querying_only mode (list / search operations running next to the
