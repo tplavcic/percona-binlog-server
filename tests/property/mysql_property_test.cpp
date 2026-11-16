@@ -75,6 +75,7 @@
 #include <arpa/inet.h>
 #include <poll.h>
 #include <netinet/in.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -1771,6 +1772,11 @@ public:
     }
     return std::nullopt;
   }
+
+  [[nodiscard]] pid_t pid() const noexcept { return process_->pid(); }
+
+  // pull has exited (without failing the case)
+  [[nodiscard]] bool has_exited() { return process_->poll().has_value(); }
 
   // SIGTERM without waiting for anything (e.g. on a full disk, where the
   // log that stop() waits for may stay empty)
@@ -7901,6 +7907,156 @@ BOOST_AUTO_TEST_CASE(NormalClientDisconnectIsNotAnErrorMySQL) {
         }
         pbt::require(error_lines.empty(),
                      "pull logged a normal client disconnect at error level");
+      },
+      {.test_cases = 10U, .slow = true});
+}
+
+// ---------------------------------------------------------------------------
+// D38: resource exhaustion of the replication source listener
+// ---------------------------------------------------------------------------
+namespace {
+
+// open file descriptors of a process (entries of /proc/<pid>/fd)
+std::size_t open_descriptors(pid_t pid) {
+  std::error_code error;
+  std::size_t count{0U};
+  for (fs::directory_iterator it{fs::path{"/proc"} / std::to_string(pid) / "fd", error};
+       !error && it != fs::directory_iterator{}; it.increment(error)) {
+    ++count;
+  }
+  return count;
+}
+
+void set_descriptor_limit(pid_t pid, rlim_t soft) {
+  rlimit old_limit{};
+  pbt::require(::prlimit(pid, RLIMIT_NOFILE, nullptr, &old_limit) == 0,
+               "prlimit(RLIMIT_NOFILE) of pull cannot be read");
+  const rlimit new_limit{.rlim_cur = std::min(soft, old_limit.rlim_max),
+                         .rlim_max = old_limit.rlim_max};
+  pbt::require(::prlimit(pid, RLIMIT_NOFILE, &new_limit, nullptr) == 0,
+               "prlimit(RLIMIT_NOFILE) of pull cannot be set");
+}
+
+// an idle TCP connection to the listener that never logs in (-1: none)
+int idle_connection(std::uint16_t port) {
+  const int fd{::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)};
+  if (fd < 0) {
+    return -1;
+  }
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_port = htons(port);
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+  if (::connect(fd, reinterpret_cast<sockaddr *>(&address), sizeof address) != 0) {
+    ::close(fd);
+    return -1;
+  }
+  return fd;
+}
+
+} // namespace
+
+// Running out of file descriptors is temporary: pull, with its soft
+// RLIMIT_NOFILE lowered to what it has open plus 8 - 64, gets that many plus
+// 1 - 64 idle connections to its listener that never log in (held 0 - 2 s,
+// all within the listener's read_timeout of 5 s); once the test closes them
+// (and, in some cases, restores the limit), a non-blocking dump from the
+// first binlog succeeds within 15 s and pull is still running. Hrvoje's
+// ticket 55: the accept loop (network_service::listener()) treats EMFILE
+// like any accept error other than operation_aborted / bad_descriptor,
+// throws, and handle_exception("listener") ends it; pull keeps collecting
+// but never accepts another connection, and a supervisor does not restart
+// it. Anyone who can reach the port can do this without credentials.
+BOOST_AUTO_TEST_CASE(ListenerRecoversFromDescriptorExhaustionMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        start_case(tc, server);
+        const auto options{draw_options(tc)};
+        pbt::note(tc, "binlog_server: " + describe(options));
+        const auto storage{make_storage(options)};
+        apply_all(tc, server.sql, {operation{.kind = op_kind::insert_rows, .count = 1}});
+        fetch(tc, *storage);
+        const auto first{stored_events_of(tc, *storage).front().file};
+        pull_process pull{tc, *storage};
+        pull.wait_until_listening();
+        // the dump that must succeed afterwards also works before
+        const auto before{run_dump({.port = listener_port(), .file = first})};
+        pbt::require(before.error.empty(),
+                     "a dump before the flood failed: " + before.error);
+        wait_ms(300U);
+
+        const auto baseline{open_descriptors(pull.pid())};
+        const auto headroom{tc.draw("headroom", gs::integers<std::size_t>(
+                                                    {.min_value = 8U, .max_value = 64U}))};
+        const auto extra{tc.draw("extra_connections", gs::integers<std::size_t>(
+                                                          {.min_value = 1U, .max_value = 64U}))};
+        const auto hold_ms{tc.draw("hold_ms", gs::integers<std::uint64_t>(
+                                                  {.min_value = 0U, .max_value = 2000U}))};
+        const bool restore_limit{tc.draw("restore_limit", gs::booleans())};
+        rlimit original{};
+        pbt::require(::prlimit(pull.pid(), RLIMIT_NOFILE, nullptr, &original) == 0,
+                     "prlimit(RLIMIT_NOFILE) of pull cannot be read");
+        set_descriptor_limit(pull.pid(), static_cast<rlim_t>(baseline + headroom));
+
+        std::vector<int> connections;
+        const auto close_all{[&connections]() {
+          for (const int fd : connections) {
+            ::close(fd);
+          }
+          connections.clear();
+        }};
+        for (std::size_t i{0U}; i < headroom + extra; ++i) {
+          const int fd{idle_connection(listener_port())};
+          if (fd < 0) {
+            break;
+          }
+          connections.push_back(fd);
+        }
+        wait_ms(hold_ms);
+        const auto during{open_descriptors(pull.pid())};
+        pbt::note(tc, "pull had " + std::to_string(baseline) + " descriptors open, limit " +
+                          std::to_string(baseline + headroom) + "; " +
+                          std::to_string(connections.size()) + " idle connections held " +
+                          std::to_string(hold_ms) + " ms (pull then had " +
+                          std::to_string(during) + " open); limit " +
+                          (restore_limit ? "restored" : "kept") + " afterwards");
+        close_all();
+        if (restore_limit) {
+          pbt::require(::prlimit(pull.pid(), RLIMIT_NOFILE, &original, nullptr) == 0,
+                       "prlimit(RLIMIT_NOFILE) of pull cannot be restored");
+        }
+
+        // the descriptors are free again: the listener serves clients
+        const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{15}};
+        std::string last_error;
+        bool served{false};
+        bool exited{false};
+        while (!served && std::chrono::steady_clock::now() < deadline) {
+          if (pull.has_exited()) {
+            exited = true;
+            break;
+          }
+          const auto after{run_dump({.port = listener_port(), .file = first})};
+          served = after.error.empty();
+          last_error = after.error;
+          if (!served) {
+            wait_ms(500U);
+          }
+        }
+        if (!served) {
+          pbt::note(tc, "binlog_server log:" + log_tail(*storage, 15U));
+          pbt::note(tc, "pull now has " + std::to_string(open_descriptors(pull.pid())) +
+                            " descriptors open");
+        }
+        pbt::require(!exited, "pull exited after it ran out of file descriptors");
+        pbt::require(served,
+                     "the listener did not accept connections again in 15 s after it ran "
+                     "out of file descriptors (pull still running; last dump: " +
+                         last_error + ")");
+        pull.require_running();
+        pull.stop();
       },
       {.test_cases = 10U, .slow = true});
 }
