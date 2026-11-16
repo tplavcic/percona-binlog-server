@@ -8249,3 +8249,200 @@ BOOST_AUTO_TEST_CASE(SourceChangeIsNotFollowedSilentlyMySQL) {
       },
       {.test_cases = 20U, .slow = true});
 }
+
+// ---------------------------------------------------------------------------
+// D42: a GTID dump that skips a transaction with a damaged length
+// ---------------------------------------------------------------------------
+namespace {
+
+// the transaction_length field of an untagged GTID_LOG event (MySQL 8.0+
+// Gtid_log_event body: after the 42-byte post header (flags, uuid, gno,
+// lt_type, last_committed, sequence_number) come immediate_commit_timestamp
+// (7 bytes; its top bit says original_commit_timestamp (7 bytes) follows)
+// and transaction_length as a packed integer (net_field_length): its offset
+// in the event, its width (1, 3, 4 or 9 bytes) and its value
+struct length_field {
+  std::size_t offset{};
+  std::size_t width{};
+  std::uint64_t value{};
+};
+
+std::optional<length_field> transaction_length_field(const std::string &event) {
+  std::size_t at{19U + 42U};
+  if (event.size() < at + 7U + 1U + 4U) {
+    return std::nullopt;
+  }
+  const bool has_original{(static_cast<unsigned char>(event[at + 6U]) & 0x80U) != 0U};
+  at += has_original ? 14U : 7U;
+  if (event.size() < at + 1U + 4U) {
+    return std::nullopt;
+  }
+  const auto first{static_cast<unsigned char>(event[at])};
+  const auto bytes_value{[&event](std::size_t from, std::size_t count) {
+    std::uint64_t value{0U};
+    for (std::size_t i{0U}; i < count; ++i) {
+      value |= static_cast<std::uint64_t>(static_cast<unsigned char>(event[from + i])) << (8U * i);
+    }
+    return value;
+  }};
+  if (first < 251U) {
+    return length_field{at, 1U, first};
+  }
+  const std::size_t extra{first == 252U ? 2U : first == 253U ? 3U : first == 254U ? 8U : 0U};
+  if (extra == 0U || event.size() < at + 1U + extra + 4U) {
+    return std::nullopt;
+  }
+  return length_field{at, 1U + extra, bytes_value(at + 1U, extra)};
+}
+
+void write_length(std::string &event, const length_field &field, std::uint64_t value) {
+  if (field.width == 1U) {
+    event[field.offset] = static_cast<char>(value);
+    return;
+  }
+  for (std::size_t i{0U}; i + 1U < field.width; ++i) {
+    event[field.offset + 1U + i] = static_cast<char>((value >> (8U * i)) & 0xFFU);
+  }
+}
+
+void put_le32(std::string &data, std::size_t offset, std::uint32_t value) {
+  for (std::size_t i{0U}; i < 4U; ++i) {
+    data[offset + i] = static_cast<char>((value >> (8U * i)) & 0xFFU);
+  }
+}
+
+} // namespace
+
+// A GTID-mode storage of a few transactions; in one stored untagged
+// GTID_LOG event, transaction_length is made 1 - 64 bytes too long (the
+// CRC32 footer recomputed, so only the length is wrong; in an encrypted
+// storage the change is XORed into the ciphertext). A COM_BINLOG_DUMP_GTID
+// whose set holds that transaction's GTID makes the sender skip it by its
+// length and land inside the next event. pull must keep running and keep
+// serving (a position dump of the first binlog afterwards succeeds), and
+// the damaged dump either ends with an error or sends only events that are
+// stored (no bytes from inside an event as an event of their own).
+// Hrvoje's ticket 39, the GTID-mode trigger (since PBS-29 part 2): the
+// exception escaped a noexcept function and terminated pull; the crash is
+// fixed upstream by dd136e5 (PBS-112).
+BOOST_AUTO_TEST_CASE(GtidDumpSkippingDamagedTransactionFailsCleanlyMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        start_case(tc, server);
+        const auto options{draw_options(tc, true)};
+        pbt::note(tc, "binlog_server: " + describe(options));
+        const auto storage{make_storage(options)};
+        auto workload{draw_workload(tc, server.info, 6U)};
+        workload.push_back(operation{.kind = op_kind::insert_rows, .count = 1});
+        workload.push_back(operation{.kind = op_kind::insert_rows, .count = 1});
+        apply_all(tc, server.sql, workload);
+        fetch(tc, *storage);
+
+        const auto events{stored_events_of(tc, *storage)};
+        std::vector<std::size_t> candidates;
+        for (std::size_t i{0U}; i < events.size(); ++i) {
+          if (event_type(events[i].bytes) == gtid_event &&
+              transaction_length_field(events[i].bytes)) {
+            candidates.push_back(i);
+          }
+        }
+        pbt::require(!candidates.empty(), "oracle: the storage has an untagged GTID event");
+        const auto index{candidates[tc.draw(
+            "transaction", gs::integers<std::size_t>({.max_value = candidates.size() - 1U}))]};
+        const auto &target{events[index]};
+        const auto field{*transaction_length_field(target.bytes)};
+        // oracle: the stored length is the transaction's size (up to the
+        // next transaction / ROTATE / STOP or the end of the binlog)
+        std::size_t actual{0U};
+        for (std::size_t i{index}; i < events.size() && events[i].file == target.file; ++i) {
+          const auto type{event_type(events[i].bytes)};
+          if (i != index && (type == gtid_event || type == gtid_tagged_event ||
+                             type == anonymous_gtid_event || type == rotate_event ||
+                             type == stop_event)) {
+            break;
+          }
+          actual += events[i].bytes.size();
+        }
+        pbt::require_equal(field.value, std::uint64_t{actual},
+                           "oracle: transaction_length of the GTID event at " + target.file +
+                               ":" + std::to_string(target.offset));
+        const auto limit{field.width == 1U ? std::uint64_t{250U}
+                         : field.width == 3U ? std::uint64_t{0xFFFFU}
+                                             : std::uint64_t{0xFFFFFFU}};
+        const auto overrun{tc.draw("overrun", gs::integers<std::uint64_t>(
+                                                  {.min_value = 1U, .max_value = 64U}))};
+        tc.assume(field.value + overrun <= limit);
+        auto damaged{target.bytes};
+        write_length(damaged, field, field.value + overrun);
+        const auto crc{static_cast<std::uint32_t>(::crc32(
+            0UL,
+            // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+            reinterpret_cast<const Bytef *>(damaged.data()),
+            static_cast<uInt>(damaged.size() - 4U)))};
+        put_le32(damaged, damaged.size() - 4U, crc);
+        const auto path{storage->vault() / target.file};
+        auto stored{read_file(path)};
+        for (std::size_t i{0U}; i < damaged.size(); ++i) {
+          stored[target.offset + i] = static_cast<char>(
+              stored[target.offset + i] ^ target.bytes[i] ^ damaged[i]);
+        }
+        {
+          std::ofstream output{path, std::ios::binary | std::ios::trunc};
+          output << stored;
+        }
+        const auto gtid_text{uuid_text(target.bytes, 20U) + ":" + [&target]() {
+          std::uint64_t gno{0U};
+          for (std::size_t i{0U}; i < 8U; ++i) {
+            gno |= static_cast<std::uint64_t>(static_cast<unsigned char>(target.bytes[36U + i]))
+                   << (8U * i);
+          }
+          return std::to_string(gno);
+        }()};
+        const gtids::gtid_set client{std::string_view{gtid_text}};
+        pbt::note(tc, "transaction_length of " + gtid_text + " (" + target.file + ":" +
+                          std::to_string(target.offset) + ") " + std::to_string(field.value) +
+                          " -> " + std::to_string(field.value + overrun) +
+                          "; GTID dump with the set '" + gtid_text + "'");
+
+        pull_process pull{tc, *storage};
+        pull.wait_until_listening();
+        const auto outcome{run_dump({.port = listener_port(), .gtids = client})};
+        pbt::note(tc, "GTID dump: " + std::to_string(outcome.events.size()) + " event(s)" +
+                          (outcome.error.empty() ? std::string{", ended normally"}
+                                                 : ", error: " + outcome.error));
+        wait_ms(300U);
+        if (pull.has_exited()) {
+          pbt::note(tc, "binlog_server log:" + log_tail(*storage, 15U));
+        }
+        pbt::require(!pull.has_exited(),
+                     "pull terminated after a GTID dump skipped a transaction whose stored "
+                     "transaction_length is too long");
+        const auto check{run_dump({.port = listener_port(), .file = events.front().file})};
+        pbt::require(check.error.empty(),
+                     "the listener did not serve a position dump after the damaged GTID dump: " +
+                         check.error);
+
+        std::vector<std::string> known;
+        for (const auto &event : events) {
+          known.push_back(event.bytes);
+        }
+        known[index] = damaged;
+        for (const auto &event : outcome.events) {
+          const auto type{event_type(event.bytes)};
+          if (type == rotate_event || type == format_description_event ||
+              type == previous_gtids_event || is_heartbeat(event.bytes)) {
+            continue;  // artificial events of the dump
+          }
+          if (std::ranges::find(known, event.bytes) == known.end()) {
+            pbt::note(tc, "unknown event of type " + std::to_string(type) + ", " +
+                              std::to_string(event.bytes.size()) + " bytes");
+          }
+          pbt::require(std::ranges::find(known, event.bytes) != known.end(),
+                       "the GTID dump that skipped the damaged transaction sent bytes that "
+                       "are not a stored event");
+        }
+        pull.stop();
+      },
+      {.test_cases = 15U, .slow = true});
+}
