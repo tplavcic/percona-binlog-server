@@ -228,6 +228,7 @@ walker (magic, sizes, log_pos, CRC32, GTID order).
 | D37 | `storage_property_test::CrashWhileCreatingLaterBinlogIsRecovered`: `CrashWhileCreatingBinlogIsRecovered` with the interrupted binlog 2 - 4 sequence numbers after the last complete one (PBT-062 without MySQL) | ✅ (PBT-062; first run pending) |
 | D38 | `ListenerRecoversFromDescriptorExhaustionMySQL`: pull's soft RLIMIT_NOFILE lowered (prlimit) to its open descriptors + 8 - 64; that many + 1 - 64 idle connections to the listener that never log in, held 0 - 2 s, closed; the limit kept or restored; a non-blocking dump from the first binlog succeeds within 15 s and pull is still running (Hrvoje's ticket 55, High) | ✅ (PBT-065; first run pending) |
 | D39 | `storage_property_test::StorageStartedWithoutEncryptionKeepsEncrypting`: an encrypted storage (any compatible KEK / data cipher) with 1 - 2 binlogs, reopened with the keyring but without `storage.encryption`: it refuses to start, or the next 1 - 2 binlogs are still encrypted and read back (Hrvoje's ticket 54, High). `EncryptionCanBeToggledButNeedsTheKek` -> `EncryptionCanBeEnabledButNeedsTheKek` (off -> on only; decision 2026-11-16: switching off silently is a bug) | ✅ (PBT-066; first run pending) |
+| D40 | Integrity of encrypted binlogs (Hrvoje's ticket 53, PBS-126): `storage_property_test::TamperedEncryptedBinlogIsDetected` (1 - 4 bytes after the magic XORed with a non-zero mask in the ciphertext file: a restarted storage must not return the changed data without an error); `EncryptedBinlogStrippedOfEncryptionIsNotServed` (a binlog after an encrypted one replaced with same-size plaintext and its `encryption` record removed: not served without an error); `mysql_property_test::ListenerDoesNotServeCorruptedEventsMySQL` (one body byte of a stored event changed: pull refuses the storage or a non-blocking dump does not receive the event) | ✅ (PBT-067, PBT-068; first run pending) |
 | D9 | `PurgeOnServerMySQL`: `PURGE BINARY LOGS TO` before / after the storage got the binlogs; fetch succeeds exactly when the server still has what the storage needs (position: its newest binlog; GTID: gtid_purged covered; empty storage), else exits 1 leaving the storage unchanged | ✅ |
 
 GTID auto-positioning: the server starts a GTID dump at the newest binlog
@@ -258,8 +259,8 @@ there is authoritative):
 
 | Severity | Issues |
 |---|---|
-| high | PBT-015, PBT-022, PBT-039, PBT-040, PBT-043, PBT-058, PBT-060, PBT-065, PBT-066 |
-| medium | PBT-001, PBT-002, PBT-004, PBT-012, PBT-013, PBT-016, PBT-019, PBT-029, PBT-030, PBT-031, PBT-032, PBT-033, PBT-035, PBT-036, PBT-037, PBT-041, PBT-042, PBT-045, PBT-048, PBT-050, PBT-052, PBT-054, PBT-055, PBT-056, PBT-057, PBT-061, PBT-062 |
+| high | PBT-015, PBT-022, PBT-039, PBT-040, PBT-043, PBT-058, PBT-060, PBT-065, PBT-066, PBT-067 |
+| medium | PBT-001, PBT-002, PBT-004, PBT-012, PBT-013, PBT-016, PBT-019, PBT-029, PBT-030, PBT-031, PBT-032, PBT-033, PBT-035, PBT-036, PBT-037, PBT-041, PBT-042, PBT-045, PBT-048, PBT-050, PBT-052, PBT-054, PBT-055, PBT-056, PBT-057, PBT-061, PBT-062, PBT-068 |
 | fixed | PBT-051 (upstream PBS-120, 1659166), PBT-034 (upstream PBS-10), PBT-026 and PBT-038 (upstream PBS-59), PBT-025 (upstream PBS-29), PBT-024 (upstream PBS-29 part 3, 2d7dc80), PBT-046 and PBT-047 (upstream PBS-31 part 3, 6b0960f), PBT-017 and PBT-044 (upstream PBS-68 / PBS-112, dd136e5) |
 | low | PBT-003, PBT-005, PBT-006, PBT-007, PBT-008, PBT-009, PBT-010, PBT-011, PBT-014, PBT-018, PBT-020, PBT-021, PBT-023, PBT-027, PBT-028, PBT-049, PBT-053, PBT-059, PBT-063, PBT-064 |
 
@@ -799,7 +800,7 @@ The sandbox lost its builds and MySQL instances (2026-11-13); these properties w
 
 ### Listener descriptor exhaustion (D38, first of Hrvoje's open High tickets)
 
-Hrvoje's open High tickets not yet covered by our properties: 53 (encrypted data not authenticated), 54 (storage started without an encryption section writes plaintext), 55 (EMFILE ends the accept loop), 39 (the second trigger, GTID mode). 25 is partly covered by D23 (PBT-041). D38 automates 55 end to end against the real `pull` (syntax-checked only). Ticket 54: decided (2026-11-16) to treat it as Hrvoje does - D39 (PBT-066); `EncryptionCanBeToggledButNeedsTheKek` now checks only switching encryption on and is renamed `EncryptionCanBeEnabledButNeedsTheKek`.
+Hrvoje's open High tickets not yet covered by our properties: 53 (encrypted data not authenticated), 54 (storage started without an encryption section writes plaintext), 55 (EMFILE ends the accept loop), 39 (the second trigger, GTID mode). 25 is partly covered by D23 (PBT-041). D38 automates 55 end to end against the real `pull` (syntax-checked only). Ticket 53: D40 (PBT-067 storage integrity, PBT-068 sender CRC32). Ticket 54: decided (2026-11-16) to treat it as Hrvoje does - D39 (PBT-066); `EncryptionCanBeToggledButNeedsTheKek` now checks only switching encryption on and is renamed `EncryptionCanBeEnabledButNeedsTheKek`.
 
 ## 6. Open questions
 

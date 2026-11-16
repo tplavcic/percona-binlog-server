@@ -79,6 +79,7 @@
 
 #include <boost/json/object.hpp>
 #include <boost/json/parse.hpp>
+#include <boost/json/serialize.hpp>
 #include <boost/json/value.hpp>
 
 #include <openssl/evp.h>
@@ -1799,6 +1800,158 @@ BOOST_AUTO_TEST_CASE(StorageStartedWithoutEncryptionKeepsEncrypting) {
           pbt::require_equal(hex(plaintext), hex(file.flushed),
                              "the binlog written after the restart reads back");
         }
+      },
+      {.test_cases = 100U});
+}
+
+// Integrity of encrypted binlogs (Hrvoje's ticket 53, PBS-126). Storage
+// encryption is AES/ARIA/CAMELLIA-CTR without a MAC, and the binlog
+// metadata is not authenticated either: someone who can write the storage
+// but has no key can change the data (XOR into the ciphertext XORs the
+// plaintext; the CRC32 footer can be patched to match because CRC32 is
+// affine) or replace a binlog with plaintext of their choosing, and PBS
+// serves it. A change to encrypted data must be detected when it is read.
+namespace {
+
+void write_file(const fs::path &path, const bytes &data) {
+  std::ofstream output{path, std::ios::binary | std::ios::trunc};
+  output.write(
+      // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+      reinterpret_cast<const char *>(data.data()),
+      static_cast<std::streamsize>(data.size()));
+}
+
+// the binlog's data after the magic as a restarted storage returns it;
+// nullopt (and 'error') when PBS reports an error (the storage cannot be
+// opened, fetch_event_block() throws or does not return success_full)
+std::optional<bytes> read_back(const binsrv::main_config &config,
+                               const binsrv::events::composite_binlog_name &name,
+                               std::uint64_t size, std::string &error) {
+  try {
+    const auto storage{make_storage(config)};
+    const util::byte_range range{binsrv::events::magic_binlog_offset,
+                                 size - binsrv::events::magic_binlog_offset};
+    util::dynamic_byte_buffer buffer;
+    const auto result{storage->fetch_event_block(name, range, buffer)};
+    if (result != binsrv::storage_fetch_result_type::success_full) {
+      error = "fetch_event_block() did not return success_full";
+      return std::nullopt;
+    }
+    return to_bytes(buffer);
+  } catch (const std::exception &exception) {
+    error = exception.what();
+    return std::nullopt;
+  }
+}
+
+// an encrypted storage (any compatible KEK / data cipher) with binlogs
+// binlog.000001 .. binlog.<files>, each holding one event
+storage_model encrypted_storage(hegel::TestCase &tc,
+                                const temporary_directory &directory,
+                                std::size_t min_files, std::size_t max_files) {
+  storage_model expected;
+  auto settings{draw_encryption(tc, true)};
+  settings.gtid_mode = tc.draw("gtid_mode", gs::booleans());
+  expected.settings = settings;
+  populate_more(*make_config(directory, settings), expected, tc,
+                tc.draw("files", gs::integers<std::size_t>(
+                                     {.min_value = min_files, .max_value = max_files})));
+  return expected;
+}
+
+} // namespace
+
+// 1 - 4 consecutive bytes after the magic of an encrypted binlog XORed with
+// a non-zero mask in the stored (encrypted) file - what an attacker without
+// the keyring can do knowing only where the events lie: a restarted
+// storage must not return the changed data without an error.
+BOOST_AUTO_TEST_CASE(TamperedEncryptedBinlogIsDetected) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        const temporary_directory directory;
+        const auto expected{encrypted_storage(tc, directory, 1U, 2U)};
+        const auto config{make_config(directory, expected.settings)};
+        const auto &file{expected.files[tc.draw(
+            "binlog", gs::integers<std::size_t>(
+                          {.max_value = expected.files.size() - 1U}))]};
+        const auto size{file.flushed.size()};
+        const auto offset{tc.draw(
+            "offset", gs::integers<std::size_t>(
+                          {.min_value = binsrv::events::magic_binlog_offset,
+                           .max_value = size - 1U}))};
+        const auto count{tc.draw(
+            "count", gs::integers<std::size_t>(
+                         {.min_value = 1U, .max_value = std::min<std::size_t>(4U, size - offset)}))};
+        const auto mask{static_cast<std::uint8_t>(
+            tc.draw("mask", gs::integers<int>({.min_value = 1, .max_value = 255})))};
+        const auto path{vault_path(directory, file.name.str())};
+        auto data{read_file(path)};
+        pbt::require_equal(data.size(), size, "stored size of " + file.name.str());
+        for (std::size_t i{0U}; i < count; ++i) {
+          data[offset + i] ^= mask;
+        }
+        write_file(path, data);
+        const std::string change{std::to_string(count) + " byte(s) XORed with " +
+                                 hex(bytes{mask}) + " at offset " + std::to_string(offset) +
+                                 " of " + file.name.str() + " (" +
+                                 std::to_string(size) + " bytes, data cipher " +
+                                 expected.settings.data_cipher + ")"};
+        pbt::note(tc, "changed: " + change);
+        std::string error;
+        const auto read{read_back(*config, file.name, size, error)};
+        if (!read) {
+          pbt::note(tc, "detected: " + error);
+          return;
+        }
+        const bytes original(file.flushed.begin() + 4, file.flushed.end());
+        pbt::require(*read == original,
+                     "a change to encrypted binlog data was read back without an "
+                     "error (" + change + ")");
+      },
+      {.test_cases = 100U});
+}
+
+// A binlog after an encrypted one replaced with plaintext of the attacker's
+// choosing (same size) and its 'encryption' record removed from its
+// metadata: no key, no keystream, no CRC32 arithmetic needed. In a storage
+// whose binlogs were encrypted before it, an unencrypted binlog is never
+// legitimate (switching encryption off is not supported silently, see
+// StorageStartedWithoutEncryptionKeepsEncrypting), so a restarted storage
+// must not serve it without an error. (A storage that had binlogs before
+// encryption was enabled legitimately has unencrypted ones at its start.)
+BOOST_AUTO_TEST_CASE(EncryptedBinlogStrippedOfEncryptionIsNotServed) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        const temporary_directory directory;
+        const auto expected{encrypted_storage(tc, directory, 2U, 3U)};
+        const auto config{make_config(directory, expected.settings)};
+        const auto &file{expected.files[tc.draw(
+            "binlog", gs::integers<std::size_t>(
+                          {.min_value = 1U, .max_value = expected.files.size() - 1U}))]};
+        const auto size{file.flushed.size()};
+        auto forged{magic_payload()};
+        const auto payload{tc.draw("forged_events",
+                                   gs::binary({.min_size = size - 4U, .max_size = size - 4U}))};
+        forged.insert(forged.end(), payload.begin(), payload.end());
+        write_file(vault_path(directory, file.name.str()), forged);
+        const auto metadata_path{vault_path(directory, file.name.str() + ".json")};
+        auto metadata{boost::json::parse(read_text(metadata_path)).as_object()};
+        pbt::require(metadata.erase("encryption") == 1U,
+                     "oracle: the metadata of " + file.name.str() +
+                         " has an encryption record");
+        write_text(metadata_path, boost::json::serialize(metadata));
+        pbt::note(tc, file.name.str() + " (after an encrypted binlog) replaced with " +
+                          std::to_string(size) +
+                          " bytes of plaintext, its encryption record removed");
+        std::string error;
+        const auto read{read_back(*config, file.name, size, error)};
+        if (!read) {
+          pbt::note(tc, "detected: " + error);
+          return;
+        }
+        pbt::require(*read != payload,
+                     "a binlog stripped of its encryption was served as plaintext "
+                     "without an error");
       },
       {.test_cases = 100U});
 }
