@@ -265,6 +265,8 @@ public:
     return std::nullopt;
   }
 
+  [[nodiscard]] pid_t pid() const noexcept { return pid_; }
+
   void send(int sig) const {
     if (!finished_) {
       ::kill(pid_, sig);

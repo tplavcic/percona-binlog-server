@@ -38,8 +38,9 @@
 //    (damaged) data;
 //  - encryption at rest: the model with every KEK / data cipher
 //    combination, independently decrypted on-disk files, the documented
-//    cipher restrictions, switching encryption on / off, the KEK being
-//    required;
+//    cipher restrictions, switching encryption on, the KEK being
+//    required, a storage started without its encryption section not
+//    writing plaintext;
 //  - the model on the S3 backend (SeaweedFS, PBT_S3_* environment);
 //  - a long checkpoint_interval does not flush early.
 //
@@ -1698,27 +1699,20 @@ BOOST_AUTO_TEST_CASE(IncompatibleKekAndDataCipherIsRejected) {
       {.test_cases = 50U});
 }
 
-// Encryption can be switched on or off for an existing storage: binlogs
-// keep the format they were created with, new binlogs follow the current
-// configuration, and all of them read back. A storage that has encrypted
-// binlogs cannot be opened without a keyring that holds their KEK (README:
-// the keyring section "must be present if the storage has at least one
-// encrypted binlog file").
-BOOST_AUTO_TEST_CASE(EncryptionCanBeToggledButNeedsTheKek) {
+// Encryption can be switched on for an existing storage: binlogs keep the
+// format they were created with, new binlogs are encrypted, and all of them
+// read back. A storage that has encrypted binlogs cannot be opened without a
+// keyring that holds their KEK (README: the keyring section "must be present
+// if the storage has at least one encrypted binlog file"). Switching it off
+// is not silent: see StorageStartedWithoutEncryptionKeepsEncrypting.
+BOOST_AUTO_TEST_CASE(EncryptionCanBeEnabledButNeedsTheKek) {
   pbt::check(
       [](hegel::TestCase &tc) {
         const temporary_directory directory;
         storage_model expected;
-        const auto encryption{draw_encryption(tc, true)};
-        const bool encrypted_first{tc.draw("encrypted_first", gs::booleans())};
-        storage_settings first{encrypted_first ? encryption : storage_settings{}};
-        storage_settings second{encrypted_first ? storage_settings{}
-                                                : encryption};
+        auto second{draw_encryption(tc, true)};
+        storage_settings first{};
         first.gtid_mode = second.gtid_mode = tc.draw("gtid_mode", gs::booleans());
-        if (encrypted_first) {
-          // the KEK must stay available after encryption is switched off
-          second.keyring = encryption.keyring;
-        }
         expected.settings = first;
         populate(*make_config(directory, first), expected, tc,
                  tc.draw("files_before", gs::integers<std::size_t>(
@@ -1738,6 +1732,7 @@ BOOST_AUTO_TEST_CASE(EncryptionCanBeToggledButNeedsTheKek) {
         // without the KEK the encrypted binlogs cannot be used
         storage_settings without{second};
         without.kek_id.clear();
+        without.data_cipher.clear();
         if (tc.draw("drop_whole_keyring", gs::booleans())) {
           without.keyring.clear();
         } else {
@@ -1748,6 +1743,62 @@ BOOST_AUTO_TEST_CASE(EncryptionCanBeToggledButNeedsTheKek) {
         pbt::require_throws<std::logic_error>(
             [&] { std::ignore = make_storage(*config_without); },
             "storage with encrypted binlogs must not open without their KEK");
+      },
+      {.test_cases = 100U});
+}
+
+// A storage whose binlogs are encrypted, started with the keyring (needed to
+// read them) but without a storage.encryption section - a configuration
+// template or config-management change that drops the section - must not
+// silently write the next binlogs in plaintext: it either refuses to start
+// or keeps encrypting them (with a KEK of the keyring), and they read back.
+// Turning encryption off has to be an explicit decision. Hrvoje's ticket 54:
+// validate_metadata() compares the configured encryption format with the
+// one in metadata.json only when both are set, and
+// generate_binlog_encryption_record() returns nothing without an active
+// KEK, so metadata.json keeps saying "generic" while new binlogs are
+// plaintext, and nothing is logged.
+BOOST_AUTO_TEST_CASE(StorageStartedWithoutEncryptionKeepsEncrypting) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        const temporary_directory directory;
+        storage_model expected;
+        auto encryption{draw_encryption(tc, true)};
+        encryption.gtid_mode = tc.draw("gtid_mode", gs::booleans());
+        expected.settings = encryption;
+        populate(*make_config(directory, encryption), expected, tc,
+                 tc.draw("files_before", gs::integers<std::size_t>(
+                                             {.min_value = 1U, .max_value = 2U})));
+
+        storage_settings without{encryption};
+        without.kek_id.clear();
+        without.data_cipher.clear();
+        const auto config_without{make_config(directory, without)};
+        try {
+          std::ignore = make_storage(*config_without);
+        } catch (const std::exception &error) {
+          pbt::note(tc, std::string{"refused to start: "} + error.what());
+          return;
+        }
+
+        const auto before{expected.files.size()};
+        expected.settings = without;
+        populate_more(*config_without, expected, tc,
+                      tc.draw("files_after", gs::integers<std::size_t>(
+                                                 {.min_value = 1U,
+                                                  .max_value = 2U})));
+        for (std::size_t i{before}; i < expected.files.size(); ++i) {
+          const auto &file{expected.files[i]};
+          bool encrypted{false};
+          const auto plaintext{
+              stored_plaintext(directory, encryption, file.name.str(), encrypted)};
+          pbt::require(encrypted,
+                       "started without an 'encryption' section but with the "
+                       "keyring, the storage of encrypted binlogs wrote " +
+                           file.name.str() + " in plaintext without an error");
+          pbt::require_equal(hex(plaintext), hex(file.flushed),
+                             "the binlog written after the restart reads back");
+        }
       },
       {.test_cases = 100U});
 }

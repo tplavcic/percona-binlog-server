@@ -226,6 +226,8 @@ walker (magic, sizes, log_pos, CRC32, GTID order).
 | D35 | `ReplicaOfPositionStorageOfGtidSourceMySQL`: D7 (a position-based gtid_mode=ON replica of the listener catches up) with a position-mode storage of the gtid_mode=ON source (Hrvoje's ticket 30) | ✅ (PBT-061) |
 | D36 | `ConnectionFailureIsExplainedInLogMySQL`: fetch with a wrong password / a port nothing listens on / ssl verify_ca with another CA / an account requiring TLS with ssl disabled fails within 60 s (exit code != 0, no crash) and its log names the reason (Hrvoje's ticket 47); `NormalClientDisconnectIsNotAnErrorMySQL`: 1 - 3 dumps ended normally leave no error-level line in pull's log (Hrvoje's ticket 42) | ✅ (PBT-063, PBT-064; first run pending) |
 | D37 | `storage_property_test::CrashWhileCreatingLaterBinlogIsRecovered`: `CrashWhileCreatingBinlogIsRecovered` with the interrupted binlog 2 - 4 sequence numbers after the last complete one (PBT-062 without MySQL) | ✅ (PBT-062; first run pending) |
+| D38 | `ListenerRecoversFromDescriptorExhaustionMySQL`: pull's soft RLIMIT_NOFILE lowered (prlimit) to its open descriptors + 8 - 64; that many + 1 - 64 idle connections to the listener that never log in, held 0 - 2 s, closed; the limit kept or restored; a non-blocking dump from the first binlog succeeds within 15 s and pull is still running (Hrvoje's ticket 55, High) | ✅ (PBT-065; first run pending) |
+| D39 | `storage_property_test::StorageStartedWithoutEncryptionKeepsEncrypting`: an encrypted storage (any compatible KEK / data cipher) with 1 - 2 binlogs, reopened with the keyring but without `storage.encryption`: it refuses to start, or the next 1 - 2 binlogs are still encrypted and read back (Hrvoje's ticket 54, High). `EncryptionCanBeToggledButNeedsTheKek` -> `EncryptionCanBeEnabledButNeedsTheKek` (off -> on only; decision 2026-11-16: switching off silently is a bug) | ✅ (PBT-066; first run pending) |
 | D9 | `PurgeOnServerMySQL`: `PURGE BINARY LOGS TO` before / after the storage got the binlogs; fetch succeeds exactly when the server still has what the storage needs (position: its newest binlog; GTID: gtid_purged covered; empty storage), else exits 1 leaving the storage unchanged | ✅ |
 
 GTID auto-positioning: the server starts a GTID dump at the newest binlog
@@ -256,9 +258,9 @@ there is authoritative):
 
 | Severity | Issues |
 |---|---|
-| high | PBT-015, PBT-022, PBT-039, PBT-040, PBT-043, PBT-051, PBT-058, PBT-060 |
+| high | PBT-015, PBT-022, PBT-039, PBT-040, PBT-043, PBT-058, PBT-060, PBT-065, PBT-066 |
 | medium | PBT-001, PBT-002, PBT-004, PBT-012, PBT-013, PBT-016, PBT-019, PBT-029, PBT-030, PBT-031, PBT-032, PBT-033, PBT-035, PBT-036, PBT-037, PBT-041, PBT-042, PBT-045, PBT-048, PBT-050, PBT-052, PBT-054, PBT-055, PBT-056, PBT-057, PBT-061, PBT-062 |
-| fixed | PBT-034 (upstream PBS-10), PBT-026 and PBT-038 (upstream PBS-59), PBT-025 (upstream PBS-29), PBT-024 (upstream PBS-29 part 3, 2d7dc80), PBT-046 and PBT-047 (upstream PBS-31 part 3, 6b0960f), PBT-017 and PBT-044 (upstream PBS-68 / PBS-112, dd136e5) |
+| fixed | PBT-051 (upstream PBS-120, 1659166), PBT-034 (upstream PBS-10), PBT-026 and PBT-038 (upstream PBS-59), PBT-025 (upstream PBS-29), PBT-024 (upstream PBS-29 part 3, 2d7dc80), PBT-046 and PBT-047 (upstream PBS-31 part 3, 6b0960f), PBT-017 and PBT-044 (upstream PBS-68 / PBS-112, dd136e5) |
 | low | PBT-003, PBT-005, PBT-006, PBT-007, PBT-008, PBT-009, PBT-010, PBT-011, PBT-014, PBT-018, PBT-020, PBT-021, PBT-023, PBT-027, PBT-028, PBT-049, PBT-053, PBT-059, PBT-063, PBT-064 |
 
 ### GTID sets (prototype run)
@@ -338,7 +340,7 @@ The storage suite grew to 15 properties (`units_property_test` adds 4):
     in the binlog metadata;
   - random-range reads;
   - the documented ECB/CBC + 192-bit rejection;
-  - switching encryption on and off for an existing storage;
+  - switching encryption on for an existing storage (switching it off by dropping the section: see D39);
   - refusing to open without the KEK;
 - the S3 backend (SeaweedFS): the same stateful model, with and without
   encryption. `run_property_tests.py --s3 auto` (the default) uses
@@ -785,6 +787,19 @@ Rebased onto dd136e5 (PBS-68 / PBS-112: no `noexcept` on functions that throw on
 ### Interrupted creation of a later binlog; diagnostics in the log (D36 / D37, written after the sandbox reset)
 
 The sandbox lost its builds and MySQL instances (2026-11-13); these properties were syntax-checked with GCC 14 (Boost 1.83 headers, hegel-cpp 0.13.1, reflect-cpp 0.22.0) but not run. The known_bugs rows (PBT-062 for the storage property, new PBT-063 / PBT-064) follow Hrvoje's tickets 47 / 42 and the code; the first Jenkins run confirms them.
+
+### Jenkins run #30 (asan_gcc14-ubsan, PS 8.4.10-10, 2032940, on upstream 2b18690)
+
+218 properties, 156 passed, 62 failed: 62 known, 0 new, 0 regressions; possibly fixed PBT-040, PBT-043, PBT-051, PBT-035, PBT-062, PBT-041.
+
+- D36 / D37 fail as expected: `CrashWhileCreatingLaterBinlogIsRecovered` confirms PBT-062 without MySQL; PBT-063 (smallest case: a wrong password, no "Access denied" in the log) and PBT-064 confirmed.
+- Upstream PBS-120 (1659166) fixes PBT-051 (row set to `fixed`). It also refuses a dump of a binlog the storage does not have with error 1236, also while the storage is empty: PBT-054 / PBT-055 now fail with "Could not find first log file name in binary log index file" instead of "Lost connection" (open question below); PBT-037 now fails only for a position inside an event.
+- Upstream PBS-85 (2b18690) fsyncs binlog data before its metadata (Hrvoje's ticket 19).
+- The other possibly fixed rows need rare sequences or timing and stay open.
+
+### Listener descriptor exhaustion (D38, first of Hrvoje's open High tickets)
+
+Hrvoje's open High tickets not yet covered by our properties: 53 (encrypted data not authenticated), 54 (storage started without an encryption section writes plaintext), 55 (EMFILE ends the accept loop), 39 (the second trigger, GTID mode). 25 is partly covered by D23 (PBT-041). D38 automates 55 end to end against the real `pull` (syntax-checked only). Ticket 54: decided (2026-11-16) to treat it as Hrvoje does - D39 (PBT-066); `EncryptionCanBeToggledButNeedsTheKek` now checks only switching encryption on and is renamed `EncryptionCanBeEnabledButNeedsTheKek`.
 
 ## 6. Open questions
 
