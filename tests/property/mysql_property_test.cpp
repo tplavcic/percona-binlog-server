@@ -7998,7 +7998,7 @@ BOOST_AUTO_TEST_CASE(ListenerRecoversFromDescriptorExhaustionMySQL) {
         rlimit original{};
         pbt::require(::prlimit(pull.pid(), RLIMIT_NOFILE, nullptr, &original) == 0,
                      "prlimit(RLIMIT_NOFILE) of pull cannot be read");
-        set_descriptor_limit(pull.pid(), static_cast<rlim_t>(baseline + headroom));
+        set_descriptor_limit(pull.pid(), baseline + headroom);
 
         std::vector<int> connections;
         const auto close_all{[&connections]() {
