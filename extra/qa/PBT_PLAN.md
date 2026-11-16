@@ -802,6 +802,15 @@ The sandbox lost its builds and MySQL instances (2026-11-13); these properties w
 
 Hrvoje's open High tickets not yet covered by our properties: 53 (encrypted data not authenticated), 54 (storage started without an encryption section writes plaintext), 55 (EMFILE ends the accept loop), 39 (the second trigger, GTID mode). 25 is partly covered by D23 (PBT-041). D38 automates 55 end to end against the real `pull` (syntax-checked only). Ticket 53: D40 (PBT-067 storage integrity, PBT-068 sender CRC32). Ticket 54: decided (2026-11-16) to treat it as Hrvoje does - D39 (PBT-066); `EncryptionCanBeToggledButNeedsTheKek` now checks only switching encryption on and is renamed `EncryptionCanBeEnabledButNeedsTheKek`.
 
+### Jenkins run #32 (asan_gcc14-ubsan, PS 8.4.10-10, 8108d2e; #31 did not compile)
+
+223 properties, 155 passed, 68 failed: 67 known, 1 new, 0 regressions; possibly fixed PBT-043, PBT-035, PBT-062, PBT-041.
+
+- #31 failed to build: `-Werror=useless-cast` in D38 (`static_cast<rlim_t>` of a `std::size_t`). Syntax checks now use the flags of `cmake/compiler_warnings.cmake`.
+- D38 / D39 / D40 fail as expected (PBT-065, PBT-066, PBT-067 x 2, PBT-068); `EncryptionCanBeEnabledButNeedsTheKek` passes.
+- The new issue: `FailoverGtidModeIsCorrectOrRefusedMySQL` - fetch from the promoted replica exits with code 0 but does not store its transaction (stored `<source>:1-4`, expected also `<new primary>:1`). No PBS change since #30; triaged as PBT-041 (silent data loss variant), second known_bugs row; the property now notes list before / after, the new primary's binlogs and the binlog_server log when it happens.
+- PBT-040 (`SecondWriterKeepsStorageConsistentMySQL`) fails again.
+
 ## 6. Open questions
 
 See the hand-over message; the answers will be folded in here.

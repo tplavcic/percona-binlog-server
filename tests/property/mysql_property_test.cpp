@@ -4333,6 +4333,17 @@ void require_storage_holds_once(hegel::TestCase &tc, const pbs_storage &storage,
                    (duplicate == sorted.end() ? std::string{} : *duplicate));
 }
 
+// SHOW BINARY LOGS of a server with each binlog's Previous_gtids, e.g.
+// "binlog.000001(<size>, prev '') binlog.000002(<size>, prev '...:1-4')"
+std::string new_primary_binlogs(sql_connection &sql) {
+  std::string text;
+  for (const auto &binlog : server_binlogs(sql)) {
+    text += binlog.name + "(" + std::to_string(binlog.size) + ", prev '" +
+            server_previous_gtids(sql, binlog.name).str() + "') ";
+  }
+  return text;
+}
+
 enum class failover_kind : std::uint8_t { up_to_date, lagging };
 
 // position_mode: a position-mode storage (no rewrite)
@@ -4417,6 +4428,13 @@ void failover(hegel::TestCase &tc, bool rewrite, failover_kind kind,
   if (result.exit_code == 0) {
     auto expected{stored_before};
     expected += server_executed(replica.sql());
+    if (const auto stored_after{stored_gtids(tc, *storage)}; stored_after != expected) {
+      // fetch reported success but did not store everything (Jenkins #32)
+      pbt::note(tc, "list before: " + before);
+      pbt::note(tc, "list after:  " + listed_text(tc, *storage));
+      pbt::note(tc, "new primary's binlogs: " + new_primary_binlogs(replica.sql()));
+      pbt::note(tc, "binlog_server log:" + log_tail(*storage, 40U));
+    }
     require_storage_holds_once(tc, *storage, expected);
   } else {
     pbt::note(tc, "(refused)");
