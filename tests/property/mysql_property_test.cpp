@@ -8060,3 +8060,85 @@ BOOST_AUTO_TEST_CASE(ListenerRecoversFromDescriptorExhaustionMySQL) {
       },
       {.test_cases = 10U, .slow = true});
 }
+
+// ---------------------------------------------------------------------------
+// D40: corrupted stored events (Hrvoje's ticket 53, the sender part)
+// ---------------------------------------------------------------------------
+
+// One byte of a stored event's body (not its 19-byte header or its CRC32
+// footer, not a FORMAT_DESCRIPTION) changed in the storage - bit rot, a
+// faulty disk or object store, or a blind change by someone without the
+// keyring (in an encrypted storage XOR into the ciphertext XORs the
+// plaintext). The binlog announces CRC32, so the event's checksum no longer
+// matches. pull either refuses the storage or its listener does not send
+// the corrupted event: a non-blocking dump of that binlog ends with an
+// error before it. Hrvoje's ticket 53 (PBS-126): the sender indexes events
+// by size only (indexed_event_block.cpp, "TODO: consider performing
+// checksum validation here") and streams the changed event; only a
+// replica that verifies checksums notices.
+BOOST_AUTO_TEST_CASE(ListenerDoesNotServeCorruptedEventsMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        start_case(tc, server);
+        const auto options{draw_options(tc)};
+        pbt::note(tc, "binlog_server: " + describe(options));
+        const auto storage{make_storage(options)};
+        auto workload{draw_workload(tc, server.info, 5U)};
+        workload.push_back(operation{.kind = op_kind::insert_rows, .count = 1});
+        apply_all(tc, server.sql, workload);
+        fetch(tc, *storage);
+        std::vector<stored_event> candidates;
+        for (auto &event : stored_events_of(tc, *storage)) {
+          if (event_type(event.bytes) != format_description_event &&
+              event.bytes.size() > 19U + 4U) {
+            candidates.push_back(std::move(event));
+          }
+        }
+        pbt::require(!candidates.empty(), "oracle: the storage has an event with a body");
+        auto target{candidates[tc.draw(
+            "event", gs::integers<std::size_t>({.max_value = candidates.size() - 1U}))]};
+        const auto at{tc.draw("body_offset",
+                              gs::integers<std::size_t>(
+                                  {.min_value = 19U, .max_value = target.bytes.size() - 5U}))};
+        const auto mask{static_cast<char>(
+            tc.draw("mask", gs::integers<int>({.min_value = 1, .max_value = 255})))};
+        const auto path{storage->vault() / target.file};
+        auto stored{read_file(path)};
+        stored[target.offset + at] = static_cast<char>(stored[target.offset + at] ^ mask);
+        {
+          std::ofstream output{path, std::ios::binary | std::ios::trunc};
+          output << stored;
+        }
+        target.bytes[at] = static_cast<char>(target.bytes[at] ^ mask);
+        pbt::note(tc, "corrupted: event of type " + std::to_string(event_type(target.bytes)) +
+                          " (" + std::to_string(target.bytes.size()) + " bytes) at " +
+                          target.file + ":" + std::to_string(target.offset) +
+                          ", body byte " + std::to_string(at));
+
+        pull_process pull{tc, *storage};
+        const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{20}};
+        while (!port_accepts_connections(listener_port())) {
+          if (pull.has_exited()) {
+            pbt::note(tc, "pull refused the storage; log:" + log_tail(*storage, 10U));
+            return;
+          }
+          pbt::require(std::chrono::steady_clock::now() < deadline,
+                       "the replication source listener did not accept connections in 20 s");
+          wait_ms(20U);
+        }
+        const auto outcome{run_dump({.port = listener_port(), .file = target.file})};
+        const bool served{std::ranges::any_of(outcome.events, [&target](const timed_event &event) {
+          return event.bytes == target.bytes;
+        })};
+        pbt::note(tc, "dump: " + std::to_string(outcome.events.size()) + " event(s)" +
+                          (outcome.error.empty() ? std::string{", ended normally"}
+                                                 : ", error: " + outcome.error));
+        pbt::require(!served, "the listener sent a stored event whose CRC32 does not match "
+                              "(corrupted in the storage) without an error");
+        if (!pull.has_exited()) {
+          pull.stop();
+        }
+      },
+      {.test_cases = 12U, .slow = true});
+}
