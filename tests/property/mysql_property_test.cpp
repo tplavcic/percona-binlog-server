@@ -8160,3 +8160,92 @@ BOOST_AUTO_TEST_CASE(ListenerDoesNotServeCorruptedEventsMySQL) {
       },
       {.test_cases = 12U, .slow = true});
 }
+
+// ---------------------------------------------------------------------------
+// D41: a source that is not the one the storage was written from
+// ---------------------------------------------------------------------------
+
+// After fetch has stored a source's binlogs, the source changes: it resets
+// its binary logs (RESET BINARY LOGS AND GTIDS / RESET MASTER: a new,
+// unrelated binlog.000001; in GTID mode the same server_uuid with GTIDs
+// counted from 1 again), or fetch is pointed at a different server with its
+// own binlog.000001 (a promoted server that never replicated from the old
+// source). Then 1 - 6 operations and 1 - 30 inserted rows on it, so its
+// binlog.000001 may be shorter or longer than the stored one. fetch must
+// not silently continue a storage that is not a copy of its source: it
+// either refuses (exit code != 0) and leaves the storage as it was, or
+// exits 0 with a storage that holds exactly the current source's binlogs.
+// Hrvoje's ticket 25: the storage records no server_uuid or binlog lineage,
+// so a reset source wedges it (every fetch exits 1 with an offset message)
+// and a different server whose binlog.000001 reaches the stored offset is
+// followed with exit code 0 - a silently wrong backup.
+BOOST_AUTO_TEST_CASE(SourceChangeIsNotFollowedSilentlyMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        start_case(tc, server);
+        const auto options{draw_options(tc)};
+        pbt::note(tc, "binlog_server: " + describe(options));
+        const auto storage{make_storage(options)};
+        pbt::note(tc, "workload before:");
+        auto workload{draw_workload(tc, server.info, 6U)};
+        workload.push_back(operation{.kind = op_kind::insert_rows, .count = 1});
+        apply_all(tc, server.sql, workload);
+        fetch(tc, *storage);
+
+        const auto change{tc.draw("change", gs::sampled_from<std::string>(
+                                                {"reset source", "different server"}))};
+        std::unique_ptr<replica_session> other;
+        sql_connection *current{&server.sql};
+        std::string config_path{storage->config_path};
+        if (change == "reset source") {
+          kill_dump_threads(server.sql);
+          server.sql.exec(server.info.reset_statement());
+        } else {
+          other = std::make_unique<replica_session>();
+          server_info other_info{inspect(other->sql())};
+          reset_server(other->sql(), other_info, 1073741824U);
+          current = &other->sql();
+          config_path = config_for_port(*storage, replica_port());
+        }
+        const server_info current_info{inspect(*current)};
+        pbt::note(tc, "the source changes: " + change + "; workload after:");
+        auto after_workload{draw_workload(tc, current_info, 6U)};
+        after_workload.push_back(operation{
+            .kind = op_kind::insert_rows,
+            .count = tc.draw("rows_after", gs::integers<int>({.min_value = 1, .max_value = 30}))});
+        apply_all(tc, *current, after_workload);
+
+        const auto before{listed_text(tc, *storage)};
+        const auto result{fetch_with(config_path)};
+        pbt::note(tc, "fetch after the change: " + result.describe());
+        pbt::require(!result.signaled, "fetch after the source changed crashed (" +
+                                           result.describe() + ")");
+        if (result.exit_code != 0) {
+          const auto after{listed_text(tc, *storage)};
+          if (after != before) {
+            pbt::note(tc, "list before: " + before);
+            pbt::note(tc, "list after:  " + after);
+            pbt::note(tc, "binlog_server log:" + log_tail(*storage));
+          }
+          pbt::require(after == before,
+                       "the fetch refused after the source changed left the storage as it was");
+          return;
+        }
+        try {
+          require_storage_matches_server(tc, *current, current_info, *storage);
+        } catch (const pbt::property_violation &violation) {
+          std::string reason{violation.what()};
+          if (constexpr std::string_view prefix{"PROPERTY VIOLATED: "}; reason.starts_with(prefix)) {
+            reason.erase(0U, prefix.size());
+          }
+          pbt::note(tc, "list before: " + before);
+          pbt::note(tc, "list after:  " + listed_text(tc, *storage));
+          pbt::note(tc, "binlog_server log:" + log_tail(*storage));
+          pbt::fail("fetch exited 0 after the source changed (" + change +
+                    "), but the storage is not a copy of the current source: " +
+                    reason);
+        }
+      },
+      {.test_cases = 20U, .slow = true});
+}
