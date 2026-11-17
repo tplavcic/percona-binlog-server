@@ -143,3 +143,29 @@ for it. When a change lands, move the tests into `PBT_PLAN.md` as
   so the file only compiles when the headers are in `/usr/include`.
   `build_property_tests.sh` works around it with
   `CMAKE_CXX_STANDARD_INCLUDE_DIRECTORIES`.
+
+## T10 - check that binlog data is synced before its metadata (Hrvoje's ticket 19)
+
+- **Tests that need it:** a durability property for the filesystem
+  backend (ticket 19, PBS-85, fixed upstream in 2b18690; not guarded by any
+  property yet). A real power loss cannot be simulated in the Jenkins
+  container (dm-flakey / dm-log-writes or LazyFS need a VM, device mapper
+  or FUSE); Hrvoje did not simulate one either: his `extra/qa/fsfault`
+  LD_PRELOAD shim showed that no fsync of a binlog data file happened
+  (before the fix) and injects EIO / ENOSPC into it (after the fix), and
+  he simulated the end state by cutting 1,000 bytes off the last binlog.
+- **Change, one of:**
+  - `strace -f -e trace=openat,write,pwrite64,fsync,fdatasync,rename`
+    around `fetch` / `pull` in a MySQL property: every write to a binlog
+    data file is followed by an fsync / fdatasync of that file before the
+    rename that installs the metadata recording its new size. Needs
+    `strace` in the Jenkins image and ptrace allowed in the container
+    (seccomp).
+  - our own small LD_PRELOAD shim (a CMake target, loaded after the ASan
+    runtime) that records the order of those calls on storage files, and
+    can also fail an fsync of binlog data (fetch must exit with an error
+    and the next run recover, as in Hrvoje's sweep).
+- **Why:** the order "data durable before the size that records it" is what
+  makes the startup recovery (truncating extra data) sufficient after a
+  crash of any kind; a regression would only show after a power loss.
+
