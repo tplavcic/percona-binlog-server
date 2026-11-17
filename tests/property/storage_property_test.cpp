@@ -70,6 +70,7 @@
 #include <system_error>
 #include <tuple>
 #include <csignal>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -2227,6 +2228,153 @@ BOOST_AUTO_TEST_CASE(PurgeWithFailedDeleteIsRecovered) {
         populate_more(*config, expected, tc, 1U);
         const auto again{make_storage(*config)};
         check_reported_state(*again, expected);
+      },
+      {.test_cases = 100U});
+}
+
+// ===========================================================================
+// file security of the filesystem backend (Hrvoje's tickets 56, 57)
+// ===========================================================================
+namespace {
+
+// the process umask for one scope
+class scoped_umask {
+public:
+  explicit scoped_umask(mode_t mask) : previous_{::umask(mask)} {}
+  scoped_umask(const scoped_umask &) = delete;
+  scoped_umask &operator=(const scoped_umask &) = delete;
+  scoped_umask(scoped_umask &&) = delete;
+  scoped_umask &operator=(scoped_umask &&) = delete;
+  ~scoped_umask() { ::umask(previous_); }
+
+private:
+  mode_t previous_;
+};
+
+std::string octal(fs::perms perms) {
+  std::ostringstream text;
+  text << std::oct << static_cast<unsigned>(perms);
+  return text.str();
+}
+
+// writes one binlog with one event through an open storage (as the
+// collector does); returns the error text when the storage refuses
+std::string write_next_binlog(binsrv::storage &storage, storage_model &expected,
+                              hegel::TestCase &tc) {
+  const auto name{expected.files.back().name.next()};
+  try {
+    std::ignore = storage.open_binlog(name);
+    const auto data{tc.draw("event", gs::binary({.min_size = 1U, .max_size = 32U}))};
+    const auto gtid{tc.draw("gtid", gtids())};
+    storage.write_event(cspan(data), true, gtid, util::ctime_timestamp{7}, 1U);
+    storage.close_binlog();
+  } catch (const std::exception &error) {
+    return error.what();
+  }
+  return {};
+}
+
+} // namespace
+
+// Storage files are not accessible to other users, whatever the umask:
+// with umask 000 / 002 / 022 / 027, after a storage is created and 1 - 3
+// binlogs are written (plain or encrypted), no object in the storage
+// directory (binlog data, binlog metadata, binlog.index, metadata.json) has
+// any permission for others or write permission for the group (MySQL
+// creates its binlogs 0640 whatever the umask). Hrvoje's ticket 56: files
+// are created 0666 & ~umask - world-readable under 022, world-writable
+// under 000.
+BOOST_AUTO_TEST_CASE(StorageFilesAreNotWorldAccessible) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        const auto mask{tc.draw("umask", gs::sampled_from<mode_t>({0000, 0002, 0022, 0027}))};
+        const scoped_umask umask_scope{mask};
+        const temporary_directory directory;
+        storage_model expected;
+        expected.settings = tc.draw("encrypted", gs::booleans()) ? draw_encryption(tc, true)
+                                                                 : storage_settings{};
+        expected.settings.gtid_mode = tc.draw("gtid_mode", gs::booleans());
+        const auto config{make_config(directory, expected.settings)};
+        populate_more(*config, expected, tc,
+                      tc.draw("files", gs::integers<std::size_t>(
+                                           {.min_value = 1U, .max_value = 3U})));
+        std::string exposed;
+        for (const auto &entry : fs::directory_iterator{directory.path() / "vault"}) {
+          const auto perms{entry.symlink_status().permissions()};
+          if ((perms & (fs::perms::others_all | fs::perms::group_write)) != fs::perms::none) {
+            exposed += entry.path().filename().string() + " " + octal(perms) + "; ";
+          }
+        }
+        pbt::note(tc, "umask " + octal(static_cast<fs::perms>(mask)));
+        pbt::require(exposed.empty(),
+                     "storage files accessible to other users (umask " +
+                         octal(static_cast<fs::perms>(mask)) + "): " + exposed);
+      },
+      {.test_cases = 50U});
+}
+
+// PBS never writes through a symlink in the storage directory. While a
+// storage is open (a running writer) with 1 - 2 binlogs, symlinks are
+// planted under the names it writes next - the next binlog, its
+// <binlog>.json.tmp, binlog.index.tmp - each pointing at a file outside the
+// storage; then the next binlog is written. Either the storage refuses
+// (an error), or it writes; in both cases every target file keeps its
+// content, and after a successful write binlog.index and the new binlog's
+// files are not symlinks. Hrvoje's ticket 57: std::ofstream and the
+// write-then-rename helper follow symlinks with predictable names, so an
+// account that can write the storage directory can make PBS overwrite any
+// file PBS can write.
+BOOST_AUTO_TEST_CASE(StorageNeverWritesThroughSymlinks) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        const temporary_directory directory;
+        storage_model expected;
+        expected.settings.gtid_mode = tc.draw("gtid_mode", gs::booleans());
+        const auto config{make_config(directory, expected.settings)};
+        populate_more(*config, expected, tc,
+                      tc.draw("files", gs::integers<std::size_t>(
+                                           {.min_value = 1U, .max_value = 2U})));
+        auto storage{make_storage(*config)};
+        const auto next{expected.files.back().name.next().str()};
+        const std::array<std::string, 3U> names{next, next + ".json.tmp", "binlog.index.tmp"};
+        constexpr std::array plant_labels{"plant_next_binlog", "plant_metadata_tmp",
+                                          "plant_index_tmp"};
+        std::vector<std::string> planted;
+        for (std::size_t i{0U}; i < names.size(); ++i) {
+          if (tc.draw(plant_labels[i], gs::booleans())) {
+            planted.push_back(names[i]);
+          }
+        }
+        if (planted.empty()) {
+          planted.push_back(
+              names[tc.draw("plant_one", gs::integers<std::size_t>({.max_value = 2U}))]);
+        }
+        const auto outside{directory.path() / "outside"};
+        fs::create_directories(outside);
+        const bytes original{'k', 'e', 'e', 'p'};
+        std::string planted_text;
+        for (const auto &name : planted) {
+          const auto target{outside / (name + ".target")};
+          write_file(target, original);
+          fs::create_symlink(target, vault_path(directory, name));
+          planted_text += name + " ";
+        }
+        pbt::note(tc, "symlinks planted while the storage is open: " + planted_text);
+        const auto error{write_next_binlog(*storage, expected, tc)};
+        storage.reset();
+        pbt::note(tc, error.empty() ? std::string{"the next binlog was written"}
+                                    : "the storage refused: " + error);
+        for (const auto &name : planted) {
+          pbt::require(read_file(outside / (name + ".target")) == original,
+                       "PBS wrote through a symlink planted in the storage directory (" + name +
+                           " -> a file outside the storage)");
+        }
+        if (error.empty()) {
+          for (const auto &name : {std::string{"binlog.index"}, next, next + ".json"}) {
+            pbt::require(!fs::is_symlink(vault_path(directory, name)),
+                         name + " is a symlink after the next binlog was written");
+          }
+        }
       },
       {.test_cases = 100U});
 }

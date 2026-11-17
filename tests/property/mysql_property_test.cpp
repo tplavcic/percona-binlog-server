@@ -8446,3 +8446,96 @@ BOOST_AUTO_TEST_CASE(GtidDumpSkippingDamagedTransactionFailsCleanlyMySQL) {
       },
       {.test_cases = 15U, .slow = true});
 }
+
+// ---------------------------------------------------------------------------
+// D46: log volume of the replication source listener
+// ---------------------------------------------------------------------------
+namespace {
+
+// lines of a log text; the most frequent message (timestamp and level cut,
+// digits replaced by '#', so that per-event lines group together)
+std::pair<std::size_t, std::string> log_lines_after(const std::string &log, std::size_t skip) {
+  std::istringstream input{log};
+  std::map<std::string, std::size_t> messages;
+  std::size_t count{0U};
+  std::size_t index{0U};
+  for (std::string line; std::getline(input, line); ++index) {
+    if (index < skip) {
+      continue;
+    }
+    ++count;
+    const auto level_end{line.find("] ", line.find("] ") + 2U)};
+    std::string message{level_end == std::string::npos ? line : line.substr(level_end + 2U)};
+    message = message.substr(0U, 60U);
+    for (auto &character : message) {
+      if (std::isdigit(static_cast<unsigned char>(character)) != 0) {
+        character = '#';
+      }
+    }
+    ++messages[message];
+  }
+  std::string top;
+  std::size_t top_count{0U};
+  for (const auto &[message, times] : messages) {
+    if (times > top_count) {
+      top = message;
+      top_count = times;
+    }
+  }
+  return {count, top + " (" + std::to_string(top_count) + "x)"};
+}
+
+std::size_t line_count(const std::string &text) {
+  return static_cast<std::size_t>(std::ranges::count(text, '\n'));
+}
+
+} // namespace
+
+// At the default info level, pull logs per connection and per binlog, not
+// per event: after a fetch of 20 - 80 transactions (about 5 events each),
+// 1 - 3 non-blocking dumps of the whole storage from the listener may add
+// at most 40 log lines per dump - however many events they stream. Hrvoje's
+// ticket 45 (PBS-118): pull logs a line for every event it sends to every
+// client ("net : generated binlog event packet for ...") and several per
+// block read for a client, so the log grows with the event rate times the
+// number of clients (67 MB per hour in his soak test).
+BOOST_AUTO_TEST_CASE(ListenerLogsPerDumpNotPerEventMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        start_case(tc, server);
+        const auto options{draw_options(tc)};
+        pbt::note(tc, "binlog_server: " + describe(options));
+        const auto storage{make_storage(options)};
+        const auto transactions{tc.draw("transactions", gs::integers<int>(
+                                                            {.min_value = 20, .max_value = 80}))};
+        std::vector<operation> workload(static_cast<std::size_t>(transactions),
+                                        operation{.kind = op_kind::insert_rows, .count = 1});
+        apply_all(tc, server.sql, workload);
+        fetch(tc, *storage);
+        const auto events{stored_events_of(tc, *storage)};
+        pull_process pull{tc, *storage};
+        pull.wait_until_listening();
+        wait_ms(500U);
+        const auto skip{line_count(read_file_if_exists(storage->log()))};
+        const auto dumps{tc.draw("dumps", gs::integers<std::size_t>(
+                                              {.min_value = 1U, .max_value = 3U}))};
+        for (std::size_t i{0U}; i < dumps; ++i) {
+          const auto outcome{run_dump({.port = listener_port(), .file = events.front().file})};
+          pbt::require(outcome.error.empty(), "a dump failed: " + outcome.error);
+        }
+        wait_ms(500U);
+        pull.require_running();
+        const auto [lines, top]{log_lines_after(read_file_if_exists(storage->log()), skip)};
+        pull.stop();
+        pbt::note(tc, std::to_string(lines) + " log lines for " + std::to_string(dumps) +
+                          " dump(s) of " + std::to_string(events.size()) +
+                          " stored events; most frequent: " + top);
+        pbt::require(lines <= 40U * dumps,
+                     "pull logged " + std::to_string(lines) + " lines at info level for " +
+                         std::to_string(dumps) + " dump(s) of " + std::to_string(events.size()) +
+                         " events (at most " + std::to_string(40U * dumps) +
+                         "); most frequent: " + top);
+      },
+      {.test_cases = 8U, .slow = true});
+}

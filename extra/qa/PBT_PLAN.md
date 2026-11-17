@@ -232,6 +232,9 @@ walker (magic, sizes, log_pos, CRC32, GTID order).
 | D41 | `SourceChangeIsNotFollowedSilentlyMySQL`: after a fetch, the source resets its binary logs or fetch is pointed at a different (never replicated) server; 1 - 6 operations and 1 - 30 rows on it; fetch either refuses and leaves the storage as it was, or exits 0 with the storage an exact copy of the current source (Hrvoje's ticket 25, High) | ✅ (PBT-069) |
 | D42 | `GtidDumpSkippingDamagedTransactionFailsCleanlyMySQL`: GTID-mode storage; one stored untagged GTID_LOG event's transaction_length made 1 - 64 bytes too long (CRC32 recomputed; XORed into the ciphertext when encrypted); a COM_BINLOG_DUMP_GTID whose set holds that GTID: pull keeps running and serving, and the dump ends with an error or sends only stored events (Hrvoje's ticket 39, the GTID-mode trigger; the crash is fixed upstream, so no known_bugs row - a failure is triaged when seen) | ✅ (passes, Jenkins #33) |
 | D43 | `storage_property_test::PurgeWithFailedDeleteIsRecovered`: 2 - 4 binlogs, purge up to binlog k while the delete of one purged binlog's data or metadata file fails (the object replaced by a non-empty directory for the purge only, then put back): the storage opens, holds the binlogs before or after the purge and accepts a new binlog (Hrvoje's ticket 33, fixed upstream in 9989a4a - a regression guard; InterruptedPurgeIsRecoveredMySQL covers a killed purge) | ✅ (first run pending) |
+| D44 | `storage_property_test::StorageFilesAreNotWorldAccessible`: umask 000 / 002 / 022 / 027, a storage (plain or encrypted) with 1 - 3 binlogs: no storage object has permissions for others or group write (Hrvoje's ticket 56, Medium) | ✅ (PBT-070; first run pending) |
+| D45 | `storage_property_test::StorageNeverWritesThroughSymlinks`: an open storage with 1 - 2 binlogs; symlinks to files outside the storage planted as the next binlog / its `.json.tmp` / `binlog.index.tmp`; the next binlog written: refused, or written without changing any target and without symlinks left as `binlog.index` or the new binlog's files (Hrvoje's ticket 57, Medium) | ✅ (PBT-071; first run pending) |
+| D46 | `ListenerLogsPerDumpNotPerEventMySQL`: 20 - 80 single-insert transactions fetched; 1 - 3 non-blocking dumps of the whole storage: at most 40 log lines per dump at the default info level (Hrvoje's ticket 45, Medium) | ✅ (PBT-072; first run pending) |
 | D9 | `PurgeOnServerMySQL`: `PURGE BINARY LOGS TO` before / after the storage got the binlogs; fetch succeeds exactly when the server still has what the storage needs (position: its newest binlog; GTID: gtid_purged covered; empty storage), else exits 1 leaving the storage unchanged | ✅ |
 
 GTID auto-positioning: the server starts a GTID dump at the newest binlog
@@ -263,7 +266,7 @@ there is authoritative):
 | Severity | Issues |
 |---|---|
 | high | PBT-015, PBT-022, PBT-039, PBT-040, PBT-043, PBT-058, PBT-060, PBT-065, PBT-066, PBT-067, PBT-069 |
-| medium | PBT-001, PBT-002, PBT-004, PBT-012, PBT-013, PBT-016, PBT-019, PBT-029, PBT-030, PBT-031, PBT-032, PBT-033, PBT-035, PBT-036, PBT-037, PBT-041, PBT-042, PBT-045, PBT-048, PBT-050, PBT-052, PBT-054, PBT-055, PBT-056, PBT-057, PBT-061, PBT-062, PBT-068 |
+| medium | PBT-001, PBT-002, PBT-004, PBT-012, PBT-013, PBT-016, PBT-019, PBT-029, PBT-030, PBT-031, PBT-032, PBT-033, PBT-035, PBT-036, PBT-037, PBT-041, PBT-042, PBT-045, PBT-048, PBT-050, PBT-052, PBT-054, PBT-055, PBT-056, PBT-057, PBT-061, PBT-062, PBT-068, PBT-070, PBT-071, PBT-072 |
 | fixed | PBT-051 (upstream PBS-120, 1659166), PBT-034 (upstream PBS-10), PBT-026 and PBT-038 (upstream PBS-59), PBT-025 (upstream PBS-29), PBT-024 (upstream PBS-29 part 3, 2d7dc80), PBT-046 and PBT-047 (upstream PBS-31 part 3, 6b0960f), PBT-017 and PBT-044 (upstream PBS-68 / PBS-112, dd136e5) |
 | low | PBT-003, PBT-005, PBT-006, PBT-007, PBT-008, PBT-009, PBT-010, PBT-011, PBT-014, PBT-018, PBT-020, PBT-021, PBT-023, PBT-027, PBT-028, PBT-049, PBT-053, PBT-059, PBT-063, PBT-064 |
 
@@ -831,6 +834,12 @@ Hrvoje's open High tickets not yet covered by our properties: 53 (encrypted data
 ### Coverage of Hrvoje's fixed High tickets (2026-11-17)
 
 Hrvoje's High tickets fixed upstream before our properties could find them are guarded by passing properties: 2 (checkpoint settings ignored) by `StorageMatchesModel` (checkpoint_size drawn, flushes expected); 21 (the listener ignored the requested binlog / position) by `ListenerServesServerEventsMySQL` (a dump from any stored event equals MySQL's); 27 (no artificial ROTATE into a binlog without events) by the `LiveClientsFollowPull*` clients, which require that ROTATE; 33 (a purge that cannot delete every file) by `InterruptedPurgeIsRecoveredMySQL` (killed purge) and D43 (failed delete). Not covered: 19 (data not fsynced before its metadata - needs a power loss) and 9 (closed as not a bug: purging while a writer runs is unsupported).
+
+### Hrvoje's Medium tickets 45, 56, 57 (D44 - D46); ticket 19 on the todo list
+
+- D44 / D45 / D46 automate tickets 56 (file modes), 57 (symlinks) and 45 (log volume); new PBT-070 / 071 / 072, expected to fail.
+- Ticket 19 (binlog data not synced before its metadata): `todo.md` T10 - a call-order check with strace or an LD_PRELOAD shim (Hrvoje used an fsync fault-injection shim and a simulated end state; nobody has simulated a power loss).
+- Hrvoje's other open Medium tickets not automated yet: 34 (use-after-free in the AWS SDK on the final S3 upload after errors; not seen in our S3 outage properties), 41 (a transaction of 4 GiB or more), 51 (0.4.x configuration after an upgrade).
 
 ## 6. Open questions
 
