@@ -2151,3 +2151,82 @@ BOOST_AUTO_TEST_CASE(RecoveredEncryptedBinlogNeverReusesKeystream) {
       },
       {.test_cases = 100U});
 }
+
+// A purge whose delete of one purged binlog's data or metadata file fails
+// (a filesystem error, a failed or timed-out S3 DELETE; here the object is
+// replaced by a non-empty directory of the same name for the purge only)
+// is the supported retention procedure going wrong once: purge_binlogs
+// reports a warning (or an error), the file is left behind, the writer is
+// started again. The storage must open, hold either the binlogs before or
+// the binlogs after the purge (never serve a purged binlog's leftovers),
+// and keep accepting new binlogs. Hrvoje's ticket 33 (fixed upstream in
+// 9989a4a, PBS-59: leftovers of a purge are removed at the next start);
+// InterruptedPurgeIsRecoveredMySQL covers a purge killed during its deletes.
+BOOST_AUTO_TEST_CASE(PurgeWithFailedDeleteIsRecovered) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        const temporary_directory directory;
+        storage_model before;
+        before.settings.gtid_mode = tc.draw("gtid_mode", gs::booleans());
+        const auto config{make_config(directory, before.settings)};
+        populate_more(*config, before, tc,
+                      tc.draw("files", gs::integers<std::size_t>(
+                                           {.min_value = 2U, .max_value = 4U})));
+        const auto target_index{tc.draw(
+            "target_index",
+            gs::integers<std::size_t>({.max_value = before.files.size() - 2U}))};
+        const auto &victim_file{before.files[tc.draw(
+            "victim_binlog", gs::integers<std::size_t>({.max_value = target_index}))]};
+        const bool metadata{tc.draw("victim_is_metadata", gs::booleans())};
+        const auto victim{vault_path(directory, victim_file.name.str() +
+                                                    (metadata ? ".json" : ""))};
+        const auto content{read_file(victim)};
+        fs::remove(victim);
+        fs::create_directory(victim);
+        write_file(victim / "blocker", bytes{1U});
+        storage_model after{before};
+        after.files.erase(after.files.begin(),
+                          after.files.begin() +
+                              static_cast<std::ptrdiff_t>(target_index + 1U));
+        const auto target{before.files[target_index].name};
+
+        std::string outcome;
+        bool threw{false};
+        try {
+          auto purging{make_storage(*config, binsrv::storage_construction_mode_type::purging)};
+          const auto [removed, warning]{purging->purge_binlogs(target)};
+          outcome = warning.empty() ? std::string{"no warning"} : "warning: " + warning;
+        } catch (const std::exception &error) {
+          threw = true;
+          outcome = std::string{"error: "} + error.what();
+        }
+        // the failure was transient: the file is back as the purge left it
+        fs::remove_all(victim);
+        write_file(victim, content);
+        pbt::note(tc, "purge up to " + target.str() + " with the delete of " +
+                          victim.filename().string() + " failing: " + outcome);
+
+        std::unique_ptr<binsrv::storage> reopened;
+        try {
+          reopened = make_storage(*config);
+        } catch (const std::exception &error) {
+          pbt::fail(std::string{"storage cannot be opened after a purge whose delete of "} +
+                    victim.filename().string() + " failed: " + error.what());
+        }
+        // a purge that returned committed the shorter index; one that threw
+        // may have done so or not
+        auto &expected{[&]() -> storage_model & {
+          if (!threw) {
+            return after;
+          }
+          return reopened->get_binlog_records().size() == after.files.size() ? after : before;
+        }()};
+        check_reported_state(*reopened, expected);
+        check_persisted_state(directory, *reopened, expected);
+        reopened.reset();
+        populate_more(*config, expected, tc, 1U);
+        const auto again{make_storage(*config)};
+        check_reported_state(*again, expected);
+      },
+      {.test_cases = 100U});
+}
