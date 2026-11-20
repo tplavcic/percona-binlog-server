@@ -223,7 +223,13 @@ make_config(const temporary_directory &directory,
                  "write_timeout": 1},
   "replication": {"server_id": 1, "idle_time": 1, "verify_checksum": true,
                   "mode": ")"
-       << (settings.gtid_mode ? "gtid" : "position") << R"("},
+       << (settings.gtid_mode ? "gtid" : "position") << '"'
+       // upstream 4717df9 (PBS-80, PBS-98): gtid mode requires the rewrite
+       // section; its base name must match the stored binlogs' ("binlog")
+       << (settings.gtid_mode
+               ? R"(, "rewrite": {"base_file_name": "binlog", "file_size": "1G"})"
+               : "")
+       << R"(},
   "replication_source": {"port": 3307, "server_id": 142,
                          "server_uuid": "00000000-0000-0000-0000-00000000008e",
                          "read_timeout": 1, "write_timeout": 1,
@@ -2375,6 +2381,71 @@ BOOST_AUTO_TEST_CASE(StorageNeverWritesThroughSymlinks) {
                          name + " is a symlink after the next binlog was written");
           }
         }
+      },
+      {.test_cases = 100U});
+}
+
+// A KEK id is bound to its key bytes. An encrypted storage (any compatible
+// KEK / data cipher) with 1 - 2 binlogs; the keyring is then replaced by
+// one whose record for the active KEK id has other key bytes (an edited
+// keyring, a wrong backup restored; same id, same cipher), and the next
+// binlog is written. Either the storage refuses (at start or when it
+// writes), or the new binlog can be read with the original keyring - never
+// is new data silently stored under a key the operator does not have.
+// Hrvoje's ticket 85 (PBS-161): the storage refers to a KEK by its id only
+// and a file key wrapped with a CTR / CBC / ECB KEK has no integrity, so a
+// keyring with the right id and other bytes is accepted and every run
+// reports success.
+BOOST_AUTO_TEST_CASE(ReplacedKekBytesAreRefused) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        const temporary_directory directory;
+        storage_model expected;
+        auto original{draw_encryption(tc, true)};
+        original.gtid_mode = tc.draw("gtid_mode", gs::booleans());
+        expected.settings = original;
+        populate_more(*make_config(directory, original), expected, tc,
+                      tc.draw("files", gs::integers<std::size_t>(
+                                           {.min_value = 1U, .max_value = 2U})));
+        auto replaced{original};
+        auto &kek{*std::ranges::find_if(replaced.keyring,
+                                        [](const keyring_key &key) { return key.id == "kek"; })};
+        const auto other{tc.draw("other_key_bytes", gs::binary({.min_size = kek.data.size(),
+                                                                .max_size = kek.data.size()}))};
+        tc.assume(other != kek.data);
+        kek.data = other;
+        const auto config{make_config(directory, replaced)};
+        pbt::note(tc, "KEK cipher " + kek.cipher + ", data cipher " + original.data_cipher +
+                          ": the keyring's bytes for 'kek' replaced");
+        std::string error;
+        std::unique_ptr<binsrv::storage> storage;
+        try {
+          storage = make_storage(*config);
+        } catch (const std::exception &exception) {
+          error = exception.what();
+        }
+        if (error.empty()) {
+          error = write_next_binlog(*storage, expected, tc);
+          storage.reset();
+        }
+        if (!error.empty()) {
+          pbt::note(tc, "refused: " + error);
+          return;
+        }
+        const auto next{expected.files.back().name.next().str()};
+        bool encrypted{false};
+        bytes readable;
+        std::string problem;
+        try {
+          readable = stored_plaintext(directory, original, next, encrypted);
+        } catch (const std::exception &exception) {
+          problem = exception.what();
+        }
+        pbt::require(problem.empty() && readable.size() >= 4U &&
+                         bytes(readable.begin(), readable.begin() + 4) == magic_payload(),
+                     "with the keyring's bytes for KEK 'kek' replaced, the storage wrote " + next +
+                         " without an error, and it cannot be read with the original keyring" +
+                         (problem.empty() ? std::string{} : " (" + problem + ")"));
       },
       {.test_cases = 100U});
 }
