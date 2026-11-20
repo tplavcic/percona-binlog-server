@@ -235,6 +235,9 @@ walker (magic, sizes, log_pos, CRC32, GTID order).
 | D44 | `storage_property_test::StorageFilesAreNotWorldAccessible`: umask 000 / 002 / 022 / 027, a storage (plain or encrypted) with 1 - 3 binlogs: no storage object has permissions for others or group write (Hrvoje's ticket 56, Medium) | ✅ (PBT-070; first run pending) |
 | D45 | `storage_property_test::StorageNeverWritesThroughSymlinks`: an open storage with 1 - 2 binlogs; symlinks to files outside the storage planted as the next binlog / its `.json.tmp` / `binlog.index.tmp`; the next binlog written: refused, or written without changing any target and without symlinks left as `binlog.index` or the new binlog's files (Hrvoje's ticket 57, Medium) | ✅ (PBT-071; first run pending) |
 | D46 | `ListenerLogsPerDumpNotPerEventMySQL`: 20 - 80 single-insert transactions fetched; 1 - 3 non-blocking dumps of the whole storage: at most 40 log lines per dump at the default info level (Hrvoje's ticket 45, Medium) | ✅ (PBT-072; first run pending) |
+| D47 | `ListenerSurvivesLongStatementsMySQL`: a logged-in client of the listener sends SET + a run of 1,000 - 300,000 spaces / tabs / line feeds / carriage returns, or SET @master_heartbeat_period= + digits: pull keeps running and serves a new dump (Hrvoje's ticket 72, High) | ✅ (PBT-073; first run pending) |
+| D48 | `EditedStoredGtidsDoNotSkipTransactionsMySQL`: rewrite-mode storage of 2 - 6 transactions; 1 - 3 future GTIDs added to the newest binlog's added_gtids; the source commits them (+ 0 - 2): fetch refuses or stores every transaction of the source in the binlog files (Hrvoje's ticket 81, High) | ✅ (PBT-074; first run pending) |
+| D49 | `storage_property_test::ReplacedKekBytesAreRefused`: encrypted storage with 1 - 2 binlogs; the keyring's bytes for the active KEK id replaced; the next binlog written: refused, or readable with the original keyring (Hrvoje's ticket 85, High) | ✅ (PBT-075; first run pending) |
 | D9 | `PurgeOnServerMySQL`: `PURGE BINARY LOGS TO` before / after the storage got the binlogs; fetch succeeds exactly when the server still has what the storage needs (position: its newest binlog; GTID: gtid_purged covered; empty storage), else exits 1 leaving the storage unchanged | ✅ |
 
 GTID auto-positioning: the server starts a GTID dump at the newest binlog
@@ -265,7 +268,7 @@ there is authoritative):
 
 | Severity | Issues |
 |---|---|
-| high | PBT-015, PBT-022, PBT-039, PBT-040, PBT-043, PBT-058, PBT-060, PBT-065, PBT-066, PBT-067, PBT-069 |
+| high | PBT-015, PBT-022, PBT-039, PBT-040, PBT-043, PBT-058, PBT-060, PBT-065, PBT-066, PBT-067, PBT-069, PBT-073, PBT-074, PBT-075 |
 | medium | PBT-001, PBT-002, PBT-004, PBT-012, PBT-013, PBT-016, PBT-019, PBT-029, PBT-030, PBT-031, PBT-032, PBT-033, PBT-035, PBT-036, PBT-037, PBT-041, PBT-042, PBT-045, PBT-048, PBT-050, PBT-052, PBT-054, PBT-055, PBT-056, PBT-057, PBT-061, PBT-062, PBT-068, PBT-070, PBT-071, PBT-072 |
 | fixed | PBT-051 (upstream PBS-120, 1659166), PBT-034 (upstream PBS-10), PBT-026 and PBT-038 (upstream PBS-59), PBT-025 (upstream PBS-29), PBT-024 (upstream PBS-29 part 3, 2d7dc80), PBT-046 and PBT-047 (upstream PBS-31 part 3, 6b0960f), PBT-017 and PBT-044 (upstream PBS-68 / PBS-112, dd136e5) |
 | low | PBT-003, PBT-005, PBT-006, PBT-007, PBT-008, PBT-009, PBT-010, PBT-011, PBT-014, PBT-018, PBT-020, PBT-021, PBT-023, PBT-027, PBT-028, PBT-049, PBT-053, PBT-059, PBT-063, PBT-064 |
@@ -840,6 +843,16 @@ Hrvoje's High tickets fixed upstream before our properties could find them are g
 - D44 / D45 / D46 automate tickets 56 (file modes), 57 (symlinks) and 45 (log volume); new PBT-070 / 071 / 072, expected to fail.
 - Ticket 19 (binlog data not synced before its metadata): `todo.md` T10 - a call-order check with strace or an LD_PRELOAD shim (Hrvoje used an fsync fault-injection shim and a simulated end state; nobody has simulated a power loss).
 - Hrvoje's other open Medium tickets not automated yet: 34 (use-after-free in the AWS SDK on the final S3 upload after errors; not seen in our S3 outage properties), 41 (a transaction of 4 GiB or more), 51 (0.4.x configuration after an upgrade).
+
+### Rebase on upstream dd6b598: GTID mode is rewrite mode (2026-11-20)
+
+Upstream 4717df9 (PBS-80, PBS-98) makes `<replication.rewrite>` mandatory in gtid mode and forbidden in position mode (every operation validates the configuration); dd6b598 (PBS-118) moves per-event log lines to debug (Hrvoje's ticket 45, our PBT-072). The suite is adapted:
+
+- storage / cli properties: GTID configurations get `rewrite` (base name `binlog`, file_size 1G; the storage's base name must match it - `validate_rewrite_base_file_name()`).
+- config properties: the generator always adds `rewrite` in gtid mode; a new violation "no rewrite section in gtid mode".
+- MySQL properties: `draw_options()` gives every GTID storage a rewrite section (base `rw`, file_size 1G / 16K / 64K) with checksum verification (without it is PBT-022). `require_storage_matches_server()` checks GTID storages transaction by transaction (`require_storage_holds_server_transactions()`: the server's transactions in order, exactly once, event by event except log_pos and CRC32, list previous / added GTIDs chained up to gtid_executed). Varied workloads leave out `SET GLOBAL binlog_checksum` in GTID mode (`for_options()`). Properties that compare with the server's binlog names / positions run in position mode only (D6 `ListenerServesServerEvents*`, D28 `ClientBeforeFirstPull*`, `ListDuringPullIsConsistentMySQL`); replicas and dumps of an empty storage start at `first_binlog_of_empty_storage()` (rw.000001 in GTID mode); `SearchByGtidSetMatchesServerMySQL` locates GTIDs in the stored binlogs; `PurgeOnServerMySQL` checks GTID storages append-only (tolerance `server_purged`).
+- known_bugs: PBT-033 (GtidResumeStoresRotateEvent) and PBT-041 (the three failover rows) set to fixed as obsolete - GTID mode without rewrite no longer exists; a failure of these properties now is a rewrite-mode issue (reported as a regression).
+- New for Hrvoje's significant tickets: D47 (72, a long SET crashes pull), D48 (81, rewrite mode trusts the stored GTID set), D49 (85, KEK bytes not bound to the id). Ticket 73 (failed final flush reported as success) is our PBT-039 (`DiskFullFetchSucceedsOnlyWhenCompleteMySQL`).
 
 ## 6. Open questions
 

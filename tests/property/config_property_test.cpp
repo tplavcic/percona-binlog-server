@@ -239,7 +239,9 @@ json::object valid_config(hegel::TestCase &tc) {
   replication["verify_checksum"] = tc.draw(gs::booleans());
   const bool gtid_mode{tc.draw(gs::booleans())};
   replication["mode"] = gtid_mode ? "gtid" : "position";
-  if (gtid_mode && tc.draw(gs::booleans())) {
+  // upstream 4717df9 (PBS-80, PBS-98): the rewrite section is required in
+  // gtid mode and not allowed in position mode
+  if (gtid_mode) {
     json::object rewrite;
     rewrite["base_file_name"] = tc.draw(names());
     rewrite["file_size"] = tc.draw(gs::sampled_from<std::string>(
@@ -547,6 +549,7 @@ std::vector<violation> applicable_violations(const json::object &config) {
   // rewrite
   if (has({"replication", "rewrite"})) {
     add("rewrite in position mode", {"replication", "mode"}, "position");
+    add("no rewrite section in gtid mode", {"replication", "rewrite"}, nullptr, true);
     for (const auto *size : {"0", "1", "1000", "1023"}) {
       add("rewrite.file_size below 1024 bytes",
           {"replication", "rewrite", "file_size"}, json::value(size));

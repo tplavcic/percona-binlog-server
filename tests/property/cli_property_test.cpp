@@ -222,7 +222,12 @@ void write_config(generated_storage &storage) {
                  "write_timeout": 1},
   "replication": {"server_id": 1, "idle_time": 1, "verify_checksum": true,
                   "mode": ")"
-         << (storage.gtid_mode ? "gtid" : "position") << R"("},
+         << (storage.gtid_mode ? "gtid" : "position") << '"'
+         // upstream 4717df9 (PBS-80, PBS-98): gtid mode requires rewrite
+         << (storage.gtid_mode
+                 ? R"(, "rewrite": {"base_file_name": "binlog", "file_size": "1G"})"
+                 : "")
+         << R"(},
   "replication_source": {"port": 3307, "server_id": 142,
                          "server_uuid": "00000000-0000-0000-0000-00000000008e",
                          "read_timeout": 1, "write_timeout": 1,

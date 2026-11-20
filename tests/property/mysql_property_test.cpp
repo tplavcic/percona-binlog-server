@@ -819,6 +819,15 @@ pbs_options draw_options(hegel::TestCase &tc, std::optional<bool> gtid_mode = {}
   options.gtid_mode =
       gtid_mode ? *gtid_mode : tc.draw("gtid_mode", gs::booleans());
   options.verify_checksum = tc.draw("verify_checksum", gs::booleans());
+  if (options.gtid_mode) {
+    // upstream 4717df9 (PBS-80, PBS-98): GTID mode requires the rewrite
+    // section (own binlog names rw.NNNNNN and size-based rotation). Rewrite
+    // mode needs CRC32 events and checksum verification: without it is
+    // PBT-022 (RewriteModeWithoutChecksumVerificationMySQL).
+    options.verify_checksum = true;
+    options.rewrite_file_size = tc.draw(
+        "rewrite_file_size", gs::sampled_from<std::string>({"1G", "16K", "64K"}));
+  }
   if (tc.draw("has_checkpoint_size", gs::booleans())) {
     options.checkpoint_size = tc.draw(
         "checkpoint_size", gs::sampled_from<std::string>({"1", "1K", "64K"}));
@@ -860,6 +869,17 @@ pbs_options draw_options(hegel::TestCase &tc, std::optional<bool> gtid_mode = {}
 // SeaweedFS filer's plain HTTP interface (PBT_S3_FILER, unsigned; the same
 // one extra/qa/seaweedfs.sh uses for its readiness check):
 // <filer>/buckets/<bucket>/<prefix>/<object>
+// rewrite mode needs CRC32 checksums: in GTID mode the varied workload
+// leaves out SET GLOBAL binlog_checksum
+workload_set for_options(workload_set set, const pbs_options &options) {
+  return options.gtid_mode && set == workload_set::varied ? workload_set::varied_crc32 : set;
+}
+
+// the name of the first binlog an empty storage gets from the server:
+// rewrite mode (GTID mode) names it rw.000001, position mode keeps the
+// server's names
+std::string first_binlog_of_empty_storage(const pbs_options &options, sql_connection &sql);
+
 struct s3_location {
   std::string uri;     // storage.uri (README: http://key:secret@host:port/bucket/path)
   std::string filer;   // <filer>/buckets/<bucket>/<prefix>
@@ -1315,6 +1335,10 @@ std::vector<server_binlog> server_binlogs(sql_connection &sql) {
   return result;
 }
 
+std::string first_binlog_of_empty_storage(const pbs_options &options, sql_connection &sql) {
+  return options.gtid_mode ? std::string{"rw.000001"} : server_binlogs(sql).front().name;
+}
+
 std::string strip_spaces(std::string text) {
   std::erase_if(text, [](char c) { return c == ' ' || c == '\n' || c == '\r'; });
   return text;
@@ -1504,15 +1528,153 @@ struct tolerances {
   // the storage was purged (purge_binlogs): the server's binlogs before the
   // first stored one are not expected in it
   bool storage_purged{false};
+  // the server purged binlogs the storage still has (GTID mode: the
+  // server's transactions are the end of the stored ones)
+  bool server_purged{false};
 };
 
+// a transaction as rewrite mode keeps it: its GTID (empty for a tagged or
+// anonymous one) and its events, each without the log_pos field of its
+// header (bytes 13 - 16, rewritten) and without its CRC32 footer
+struct normalized_transaction {
+  std::string gtid;
+  std::vector<std::string> events;
+};
+
+std::vector<normalized_transaction> normalized_transactions(const std::string &data,
+                                                            const std::string &what) {
+  std::vector<normalized_transaction> result;
+  if (data.size() <= 4U) {
+    return result;
+  }
+  const auto walked{walk(data, what)};
+  const std::size_t footer{walked.checksummed ? 4U : 0U};
+  std::size_t untagged{0U};
+  bool open{false};
+  for (std::size_t i{0U}; i < walked.types.size(); ++i) {
+    const auto type{walked.types[i]};
+    const auto offset{walked.offsets[i]};
+    const auto end{i + 1U < walked.offsets.size() ? walked.offsets[i + 1U] : data.size()};
+    if (type == gtid_event || type == gtid_tagged_event || type == anonymous_gtid_event) {
+      result.push_back({type == gtid_event ? walked.untagged_gtids[untagged++] : std::string{},
+                        {}});
+      open = true;
+    } else if (type == format_description_event || type == previous_gtids_event ||
+               type == rotate_event || type == stop_event) {
+      open = false;
+      continue;
+    }
+    if (!open || end - offset < 17U + footer) {
+      continue;
+    }
+    std::string event{data.substr(offset, 13U)};
+    event += data.substr(offset + 17U, end - offset - 17U - footer);
+    result.back().events.push_back(std::move(event));
+  }
+  return result;
+}
+
+std::string transaction_label(const normalized_transaction &transaction, std::size_t index) {
+  return "#" + std::to_string(index) + " (" +
+         (transaction.gtid.empty() ? std::string{"tagged / anonymous"} : transaction.gtid) + ", " +
+         std::to_string(transaction.events.size()) + " events)";
+}
+
+// GTID mode (always rewrite mode since upstream 4717df9): the stored
+// binlogs hold the server's transactions, in order, each exactly once,
+// event by event (except log_pos and the CRC32 footer, which rewrite mode
+// recomputes), in well-formed files (walk(): magic, sizes, log_pos, CRC32);
+// 'list' reports per-file previous / added GTIDs that chain up to the
+// server's gtid_executed, and the files' min / max timestamps.
+void require_storage_holds_server_transactions(hegel::TestCase &tc, sql_connection &sql,
+                                               const server_info &info,
+                                               const pbs_storage &storage,
+                                               tolerances tolerate) {
+  std::vector<normalized_transaction> on_server;
+  for (const auto &binlog : server_binlogs(sql)) {
+    auto transactions{normalized_transactions(server_file(info, binlog.name),
+                                              "server " + binlog.name)};
+    on_server.insert(on_server.end(), std::make_move_iterator(transactions.begin()),
+                     std::make_move_iterator(transactions.end()));
+  }
+  const auto response{list(tc, storage)};
+  pbt::require_equal(std::string{response.at("status").as_string()},
+                     std::string{"success"}, "list status");
+  std::vector<normalized_transaction> stored;
+  gtids::gtid_set stored_gtids;
+  bool first_file{true};
+  for (const auto &value : response.at("result").as_array()) {
+    const auto &item{value.as_object()};
+    const std::string name{item.at("name").as_string()};
+    const auto data{storage.plaintext(name)};
+    pbt::require_equal(std::uint64_t{data.size()}, item.at("size").to_number<std::uint64_t>(),
+                       "list: size of " + name);
+    auto transactions{normalized_transactions(data, "stored " + name)};
+    stored.insert(stored.end(), std::make_move_iterator(transactions.begin()),
+                  std::make_move_iterator(transactions.end()));
+    const gtids::gtid_set previous{std::string_view{item.at("previous_gtids").as_string()}};
+    // the first binlog's previous_gtids: what the server had purged when
+    // the storage was started (the collector sets it from gtid_purged)
+    if (!first_file) {
+      pbt::require_equal(previous, stored_gtids, "list: previous_gtids of " + name);
+    }
+    stored_gtids = previous;
+    stored_gtids += gtids::gtid_set{std::string_view{item.at("added_gtids").as_string()}};
+    first_file = false;
+  }
+  const auto &longer{tolerate.server_purged ? stored : on_server};
+  const auto &shorter{tolerate.server_purged ? on_server : stored};
+  const bool tail_only{tolerate.server_purged || tolerate.storage_purged};
+  const auto skip{tail_only && longer.size() >= shorter.size() ? longer.size() - shorter.size()
+                                                               : std::size_t{0U}};
+  if (!tail_only || longer.size() < shorter.size()) {
+    if (stored.size() != on_server.size()) {
+      pbt::note(tc, "storage objects: " + storage_objects_text(storage));
+    }
+    pbt::require_equal(stored.size(), on_server.size(),
+                       "number of stored transactions = the server's");
+  }
+  for (std::size_t i{0U}; i < shorter.size(); ++i) {
+    const auto &expected{tolerate.server_purged ? stored[skip + i] : on_server[skip + i]};
+    const auto &actual{tolerate.server_purged ? on_server[i] : stored[i]};
+    const auto &server_side{tolerate.server_purged ? actual : expected};
+    const auto &stored_side{tolerate.server_purged ? expected : actual};
+    if (server_side.gtid != stored_side.gtid || server_side.events != stored_side.events) {
+      std::string detail{"server " + transaction_label(server_side, i) + ", stored " +
+                         transaction_label(stored_side, i)};
+      for (std::size_t e{0U};
+           e < std::min(server_side.events.size(), stored_side.events.size()); ++e) {
+        if (server_side.events[e] != stored_side.events[e]) {
+          detail += "; event " + std::to_string(e) + ": " +
+                    first_difference(server_side.events[e], stored_side.events[e]);
+          break;
+        }
+      }
+      pbt::fail("stored transactions differ from the server's (in order, event by event): " +
+                detail);
+    }
+  }
+  if (!tolerate.storage_purged) {
+    pbt::require_equal(stored_gtids, server_executed(sql),
+                       "stored GTIDs (list) = the server's gtid_executed");
+  }
+}
+
 // the storage holds exactly the server's binlogs, byte for byte, and 'list'
-// reports them (GTID mode: per-file previous / added GTIDs). Stored binlogs
-// named in 'ignore_stored' (purged on the server) are left out.
+// reports them. GTID mode (rewrite mode): require_storage_holds_server_transactions.
+// Stored binlogs named in 'ignore_stored' (purged on the server) are left
+// out.
 void require_storage_matches_server(
     hegel::TestCase &tc, sql_connection &sql, const server_info &info,
     const pbs_storage &storage, tolerances tolerate = {},
     const std::vector<std::string> &ignore_stored = {}) {
+  if (storage.options.gtid_mode) {
+    if (!ignore_stored.empty()) {
+      tolerate.server_purged = true;
+    }
+    require_storage_holds_server_transactions(tc, sql, info, storage, tolerate);
+    return;
+  }
   auto binlogs{server_binlogs(sql)};
   const auto response{list(tc, storage)};
   pbt::require_equal(std::string{response.at("status").as_string()},
@@ -2015,7 +2177,7 @@ void fetch_matches_server(hegel::TestCase &tc, bool s3, bool gtid_off = false,
         pbt::note(tc, "binlog_server: " + describe(options));
         const auto storage{make_storage(options)};
         pbt::note(tc, "workload:");
-        apply_all(tc, server.sql, draw_workload(tc, server.info, 12U, set));
+        apply_all(tc, server.sql, draw_workload(tc, server.info, 12U, for_options(set, options)));
         fetch(tc, *storage);
         require_storage_matches_server(tc, server.sql, server.info, *storage);
         if (gtid_off) {
@@ -2096,7 +2258,7 @@ void repeated_fetch_resumes(hegel::TestCase &tc, bool s3, bool gtid_off = false,
             "rounds", gs::integers<std::size_t>({.min_value = 2U, .max_value = 4U}))};
         for (std::size_t round{0U}; round < rounds; ++round) {
           pbt::note(tc, "round " + std::to_string(round + 1U) + ":");
-          apply_all(tc, server.sql, draw_workload(tc, server.info, 5U, set));
+          apply_all(tc, server.sql, draw_workload(tc, server.info, 5U, for_options(set, options)));
           fetch(tc, *storage);
           require_storage_matches_server(tc, server.sql, server.info, *storage);
         }
@@ -2183,7 +2345,7 @@ void killed_pull_resumes(hegel::TestCase &tc, bool s3, bool gtid_off = false,
                             {"workload", "workload", "sleep", "kill", "stop"}))};
           if (action == "workload") {
             pbt::note(tc, "workload:");
-            apply_all(tc, server.sql, draw_workload(tc, server.info, 3U, set));
+            apply_all(tc, server.sql, draw_workload(tc, server.info, 3U, for_options(set, options)));
           } else if (action == "sleep") {
             const auto delay{tc.draw("sleep_ms", gs::sampled_from<std::uint64_t>(
                                                      {10U, 100U, 400U, 1500U}))};
@@ -2253,12 +2415,15 @@ BOOST_AUTO_TEST_CASE(SearchByGtidSetMatchesServerMySQL) {
         apply_all(tc, server.sql, draw_workload(tc, server.info, 10U));
         fetch(tc, *storage);
 
+        // the stored binlogs holding each GTID (rewrite mode: PBS's own
+        // binlog names and sizes)
         std::vector<std::pair<std::string, std::string>> located;  // gtid, binlog
-        for (const auto &binlog : server_binlogs(server.sql)) {
-          const auto walked{
-              walk(server_file(server.info, binlog.name), "server " + binlog.name)};
+        const auto stored_listing{list(tc, *storage)};
+        for (const auto &item : stored_listing.at("result").as_array()) {
+          const std::string name{item.at("name").as_string()};
+          const auto walked{walk(storage->plaintext(name), "stored " + name)};
           for (const auto &gtid : walked.untagged_gtids) {
-            located.emplace_back(gtid, binlog.name);
+            located.emplace_back(gtid, name);
           }
         }
         pbt::require(!located.empty(), "the workload wrote GTID_LOG events");
@@ -2424,12 +2589,16 @@ void listener_serves_server_events(hegel::TestCase &tc, bool s3,
                                    workload_set set = workload_set::basic) {
         server_session server;
         start_case(tc, server);
-        auto options{draw_options(tc)};
+        // position mode only: the comparison is with the server's own dump
+        // from the same binlog and position, which rewrite mode (GTID mode
+        // since upstream 4717df9) does not keep; GTID storages are served by
+        // the D23 properties (compared with the stored events)
+        auto options{draw_options(tc, false)};
         options.s3 = s3;
         pbt::note(tc, "binlog_server: " + describe(options));
         const auto storage{make_storage(options)};
         pbt::note(tc, "workload:");
-        auto workload{draw_workload(tc, server.info, 10U, set)};
+        auto workload{draw_workload(tc, server.info, 10U, for_options(set, options))};
         // the newest binlog ends with a transaction (PBT-020)
         workload.push_back(operation{.kind = op_kind::insert_rows, .count = 1});
         apply_all(tc, server.sql, workload);
@@ -2702,7 +2871,7 @@ void replica_of_listener_matches_source(hegel::TestCase &tc,
         const auto storage{make_storage(options)};
         pull_process pull{tc, *storage};
         pull.wait_until_listening();
-        const auto first{server_binlogs(server.sql).front().name};
+        const auto first{first_binlog_of_empty_storage(options, server.sql)};
         replica.sql().exec(
             "CHANGE REPLICATION SOURCE TO SOURCE_HOST = '127.0.0.1', "
             "SOURCE_PORT = " + std::to_string(listener_port()) +
@@ -2741,7 +2910,7 @@ void replica_of_listener_matches_source(hegel::TestCase &tc,
           }
         }
         pbt::note(tc, "workload while replicating:");
-        auto workload{draw_workload(tc, server.info, 8U, set)};
+        auto workload{draw_workload(tc, server.info, 8U, for_options(set, options))};
         workload.push_back(operation{.kind = op_kind::insert_rows, .count = 1});
         apply_all(tc, server.sql, workload);
 
@@ -2962,7 +3131,12 @@ BOOST_AUTO_TEST_CASE(PurgeOnServerMySQL) {
         }
         std::vector<std::string> only_in_storage;
         for (const auto &[name, content] : snapshot) {
-          if (!on_server(name)) {
+          if (options.gtid_mode) {
+            // rewrite mode: PBS's own binlogs, only ever appended to
+            const auto now{storage->stored(name)};
+            pbt::require(now.compare(0U, content.size(), content) == 0,
+                         "fetch changed what " + name + " held before");
+          } else if (!on_server(name)) {
             only_in_storage.push_back(name);
             pbt::require(storage->stored(name) == content,
                          "fetch changed " + name +
@@ -2971,7 +3145,7 @@ BOOST_AUTO_TEST_CASE(PurgeOnServerMySQL) {
         }
         if (succeeded) {
           require_storage_matches_server(tc, server.sql, server.info, *storage,
-                                         {}, only_in_storage);
+                                         {.server_purged = options.gtid_mode}, only_in_storage);
         } else {
           const auto after{list(tc, *storage)};
           const auto count{after.at("result").as_array().size()};
@@ -3550,7 +3724,7 @@ BOOST_AUTO_TEST_CASE(ReplicaOfPositionStorageGtidOffMySQL) {
         const auto storage{make_storage(options)};
         pull_process pull{tc, *storage};
         pull.wait_until_listening();
-        const auto first{server_binlogs(server.sql).front().name};
+        const auto first{first_binlog_of_empty_storage(options, server.sql)};
         replica.sql().exec(
             "CHANGE REPLICATION SOURCE TO SOURCE_HOST = '127.0.0.1', "
             "SOURCE_PORT = " + std::to_string(listener_port()) +
@@ -4143,7 +4317,9 @@ BOOST_AUTO_TEST_CASE(ListDuringPullIsConsistentMySQL) {
       [](hegel::TestCase &tc) {
         server_session server;
         start_case(tc, server);
-        const auto options{draw_options(tc)};
+        // position mode only: the listed names are compared with the server's
+        // binlogs, which rewrite mode (GTID mode) renames
+        const auto options{draw_options(tc, false)};
         pbt::note(tc, "binlog_server: " + describe(options));
         const auto storage{make_storage(options)};
         pull_process pull{tc, *storage};
@@ -5180,7 +5356,8 @@ void live_clients_follow_pull(hegel::TestCase &tc, bool s3) {
   start_case(tc, server);
   auto options{draw_options(tc)};
   options.s3 = s3;
-  // rewrite mode is not drawn by draw_options: the storage is a byte copy
+  // GTID mode is rewrite mode (upstream 4717df9): clients and the oracle
+  // use the stored binlogs' names and events
   pbt::note(tc, "binlog_server: " + describe(options));
   const auto storage{make_storage(options)};
 
@@ -5252,7 +5429,7 @@ void live_clients_follow_pull(hegel::TestCase &tc, bool s3) {
       source += ", SOURCE_HEARTBEAT_PERIOD = 1";
     }
     if (!empty_name) {
-      source += ", SOURCE_LOG_FILE = '" + server_binlogs(server.sql).front().name +
+      source += ", SOURCE_LOG_FILE = '" + first_binlog_of_empty_storage(options, server.sql) +
                 "', SOURCE_LOG_POS = 4";
     }
     replica->sql().exec(source);
@@ -6668,7 +6845,7 @@ BOOST_AUTO_TEST_CASE(ReplicaReceivesHeartbeatsMySQL) {
             "CHANGE REPLICATION SOURCE TO SOURCE_HOST = '127.0.0.1', "
             "SOURCE_PORT = " + std::to_string(listener_port()) +
             ", SOURCE_USER = 'replica', SOURCE_PASSWORD = 'replica-password', "
-            "SOURCE_LOG_FILE = '" + server_binlogs(server.sql).front().name +
+            "SOURCE_LOG_FILE = '" + first_binlog_of_empty_storage(options, server.sql) +
             "', SOURCE_LOG_POS = 4, GET_SOURCE_PUBLIC_KEY = 1, "
             "SOURCE_CONNECT_RETRY = 1, SOURCE_HEARTBEAT_PERIOD = " + period);
         replica.sql().exec("START REPLICA");
@@ -7232,7 +7409,9 @@ namespace {
 void client_before_first_pull(hegel::TestCase &tc, bool from_position) {
       server_session server;
       start_case(tc, server);
-      auto options{draw_options(tc)};
+      // position mode only: the dump names the server's first binlog and its
+      // event positions, which rewrite mode (GTID mode) does not keep
+      auto options{draw_options(tc, false)};
       const auto proxy{make_mysql_proxy()};
       options.mysql_port = proxy->port();
       pbt::note(tc, "binlog_server: " + describe(options));
@@ -7743,7 +7922,7 @@ BOOST_AUTO_TEST_CASE(ReconnectAfterRotationKeepsFirstBinlogServableMySQL) {
         if (before != 0) {
           apply_all(tc, server.sql, {operation{.kind = op_kind::insert_rows, .count = 1}});
         }
-        const auto first{server_binlogs(server.sql).front().name};
+        const auto first{first_binlog_of_empty_storage(options, server.sql)};
         pull_process pull{tc, *storage};
         pull.wait_until_listening();
         pbt::note(tc, std::to_string(before) + " transaction(s) in " + first +
@@ -8538,4 +8717,181 @@ BOOST_AUTO_TEST_CASE(ListenerLogsPerDumpNotPerEventMySQL) {
                          "); most frequent: " + top);
       },
       {.test_cases = 8U, .slow = true});
+}
+
+// ---------------------------------------------------------------------------
+// D47: a long statement from a logged-in client (Hrvoje's ticket 72)
+// ---------------------------------------------------------------------------
+namespace {
+
+// logs in to the listener as its replication user and sends one COM_QUERY;
+// returns the client's view ("answered: ..." / "error: ...")
+std::string send_statement_to_listener(const std::string &statement) {
+  MYSQL *handle{::mysql_init(nullptr)};
+  if (handle == nullptr) {
+    throw std::runtime_error{"mysql_init failed"};
+  }
+  const unsigned timeout{10U};
+  ::mysql_options(handle, MYSQL_OPT_CONNECT_TIMEOUT, &timeout);
+  ::mysql_options(handle, MYSQL_OPT_READ_TIMEOUT, &timeout);
+  const bool get_public_key{true};
+  ::mysql_options(handle, MYSQL_OPT_GET_SERVER_PUBLIC_KEY, &get_public_key);
+  ::mysql_options(handle, MYSQL_DEFAULT_AUTH, "caching_sha2_password");
+  std::string outcome;
+  if (::mysql_real_connect(handle, "127.0.0.1", "replica", "replica-password", nullptr,
+                           listener_port(), nullptr, 0) == nullptr) {
+    outcome = std::string{"login failed: "} + ::mysql_error(handle);
+  } else if (::mysql_real_query(handle, statement.data(), statement.size()) != 0) {
+    outcome = std::string{"error: "} + ::mysql_error(handle);
+  } else {
+    if (MYSQL_RES *result{::mysql_store_result(handle)}; result != nullptr) {
+      ::mysql_free_result(result);
+    }
+    outcome = "answered";
+  }
+  ::mysql_close(handle);
+  return outcome;
+}
+
+} // namespace
+
+// A logged-in client of the listener sends one statement the handshake
+// patterns look at - SET followed by a long run of spaces / tabs / line
+// feeds / carriage returns, or SET @master_heartbeat_period= followed by a
+// long run of digits - of 1,000 to 300,000 characters. pull keeps running
+// (the statement is answered or refused, the session may end) and serves
+// a new client. Hrvoje's ticket 72 (PBS-140): every statement goes through
+// std::regex_search with patterns containing \s+, \s* and [0-9]+, and
+// libstdc++'s regex executor recurses once per character: from about
+// 20,000 - 40,000 characters on the stack overflows and the whole pull
+// process dies with SIGSEGV.
+BOOST_AUTO_TEST_CASE(ListenerSurvivesLongStatementsMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        start_case(tc, server);
+        const auto options{draw_options(tc)};
+        pbt::note(tc, "binlog_server: " + describe(options));
+        const auto storage{make_storage(options)};
+        apply_all(tc, server.sql, {operation{.kind = op_kind::insert_rows, .count = 1}});
+        fetch(tc, *storage);
+        const auto first{stored_events_of(tc, *storage).front().file};
+        pull_process pull{tc, *storage};
+        pull.wait_until_listening();
+
+        const auto shape{tc.draw("shape", gs::sampled_from<std::string>(
+                                              {"SET + spaces", "SET + tabs before NAMES",
+                                               "SET + line feeds before @slave_uuid",
+                                               "SET + carriage returns",
+                                               "heartbeat period + digits"}))};
+        const auto length{tc.draw("length", gs::sampled_from<std::size_t>(
+                                                {1000U, 20000U, 40000U, 100000U, 300000U}))};
+        std::string statement;
+        if (shape == "SET + spaces") {
+          statement = "SET" + std::string(length, ' ') + "NAMES utf8mb4";
+        } else if (shape == "SET + tabs before NAMES") {
+          statement = "SET" + std::string(length, '\t') + "NAMES utf8mb4";
+        } else if (shape == "SET + line feeds before @slave_uuid") {
+          statement = "SET" + std::string(length, '\n') +
+                      "@slave_uuid = '00000000-0000-0000-0000-000000000002'";
+        } else if (shape == "SET + carriage returns") {
+          statement = "SET" + std::string(length, '\r');
+        } else {
+          statement = "SET @master_heartbeat_period=" + std::string(length, '1');
+        }
+        const auto client_view{send_statement_to_listener(statement)};
+        pbt::note(tc, shape + ", " + std::to_string(statement.size()) + " bytes: " + client_view);
+        wait_ms(500U);
+        if (pull.has_exited()) {
+          auto output{read_file_if_exists(pull.output_path())};
+          if (output.size() > 2000U) {
+            output = output.substr(0U, 2000U);
+          }
+          pbt::note(tc, "binlog_server log:" + log_tail(*storage, 10U));
+          pbt::note(tc, "pull stdout / stderr: " + output);
+          pbt::fail("pull terminated after a " + std::to_string(statement.size()) +
+                    "-byte statement (" + shape + ") from a logged-in client");
+        }
+        const auto after{run_dump({.port = listener_port(), .file = first})};
+        pbt::require(after.error.empty(),
+                     "the listener did not serve a dump after a long statement: " + after.error);
+        pull.stop();
+      },
+      {.test_cases = 15U, .slow = true});
+}
+
+// ---------------------------------------------------------------------------
+// D48: rewrite mode trusts the stored GTID set (Hrvoje's ticket 81)
+// ---------------------------------------------------------------------------
+
+// A GTID-mode (rewrite) storage of 2 - 6 transactions; the newest stored
+// binlog's metadata gets 1 - 3 GTIDs added to its added_gtids that the
+// source has not committed yet (someone who can write the storage, no key
+// needed); the source then commits them and 0 - 2 more. fetch either
+// refuses, or exits 0 with every transaction of the source stored in the
+// binlog files - never skipping the transactions whose GTIDs the metadata
+// claims. Hrvoje's ticket 81 (PBS-147): the resume set is taken from the
+// last binlog's previous_gtids + added_gtids only, and in rewrite mode
+// nothing compares an arriving GTID with the stored events, so those
+// transactions are never requested and every run reports success.
+BOOST_AUTO_TEST_CASE(EditedStoredGtidsDoNotSkipTransactionsMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        start_case(tc, server);
+        const auto options{draw_options(tc, true)};
+        pbt::note(tc, "binlog_server: " + describe(options));
+        const auto storage{make_storage(options)};
+        const auto before{tc.draw("transactions_before",
+                                  gs::integers<std::uint64_t>({.min_value = 2U, .max_value = 6U}))};
+        apply_all(tc, server.sql,
+                  std::vector<operation>(before,
+                                         operation{.kind = op_kind::insert_rows, .count = 1}));
+        fetch(tc, *storage);
+        const auto uuid{server.sql.scalar("SELECT @@GLOBAL.server_uuid")};
+        const auto claimed{tc.draw("claimed", gs::integers<std::uint64_t>(
+                                                  {.min_value = 1U, .max_value = 3U}))};
+        const auto names{listed_names(tc, *storage)};
+        pbt::require(!names.empty(), "oracle: the storage has a binlog");
+        const auto metadata_path{storage->vault() / (names.back() + ".json")};
+        auto metadata{json::parse(read_file(metadata_path)).as_object()};
+        pbt::require(metadata.contains("added_gtids") && metadata.at("added_gtids").is_string(),
+                     "oracle: added_gtids is a GTID set text in " + names.back() + ".json");
+        gtids::gtid_set added{std::string_view{metadata.at("added_gtids").as_string()}};
+        const auto fake{uuid + ":" + std::to_string(before + 1U) + "-" +
+                        std::to_string(before + claimed)};
+        added += gtids::gtid_set{std::string_view{fake}};
+        metadata["added_gtids"] = added.str();
+        std::ofstream{metadata_path, std::ios::trunc} << json::serialize(metadata);
+        const auto more{tc.draw("transactions_after_claimed",
+                                gs::integers<std::uint64_t>({.max_value = 2U}))};
+        pbt::note(tc, std::to_string(before) + " transactions fetched; " + names.back() +
+                          ".json claims " + fake + "; the source commits " +
+                          std::to_string(claimed + more) + " more");
+        apply_all(tc, server.sql,
+                  std::vector<operation>(claimed + more,
+                                         operation{.kind = op_kind::insert_rows, .count = 1}));
+        const auto result{fetch_with(storage->config_path)};
+        pbt::note(tc, "fetch: " + result.describe());
+        pbt::require(!result.signaled, "fetch crashed (" + result.describe() + ")");
+        if (result.exit_code != 0) {
+          return;  // refused: fine
+        }
+        gtids::gtid_set in_files;
+        const auto listing{list(tc, *storage)};
+        for (const auto &item : listing.at("result").as_array()) {
+          const std::string name{item.at("name").as_string()};
+          for (const auto &gtid : walk(storage->plaintext(name), "stored " + name).untagged_gtids) {
+            in_files += gtids::gtid_set{std::string_view{gtid}};
+          }
+        }
+        const auto missing{server_executed(server.sql) - in_files};
+        if (!missing.is_empty()) {
+          pbt::note(tc, "binlog_server log:" + log_tail(*storage, 15U));
+        }
+        pbt::require(missing.is_empty(),
+                     "fetch exited 0 but never stored the transactions " + missing.str() +
+                         " whose GTIDs were added to the stored metadata");
+      },
+      {.test_cases = 15U, .slow = true});
 }
