@@ -880,6 +880,16 @@ workload_set for_options(workload_set set, const pbs_options &options) {
 // server's names
 std::string first_binlog_of_empty_storage(const pbs_options &options, sql_connection &sql);
 
+// the first binlog a position-based replica of the listener names: the
+// server's first one (position mode), or - GTID (rewrite) mode - the first
+// stored one, which pull creates with its first transaction: one
+// transaction is committed and the test waits (up to 30 s) until the storage
+// lists it. A named binlog the storage does not have yet is refused with
+// error 1236 since PBS-120 (PBT-054, covered by D28).
+struct pbs_storage;
+std::string first_binlog_for_replica(hegel::TestCase &tc, const pbs_options &options,
+                                     sql_connection &sql, const pbs_storage &storage);
+
 struct s3_location {
   std::string uri;     // storage.uri (README: http://key:secret@host:port/bucket/path)
   std::string filer;   // <filer>/buckets/<bucket>/<prefix>
@@ -1569,6 +1579,22 @@ std::vector<normalized_transaction> normalized_transactions(const std::string &d
     }
     std::string event{data.substr(offset, 13U)};
     event += data.substr(offset + 17U, end - offset - 17U - footer);
+    // rewrite mode recomputes the logical clock of each transaction for the
+    // binlog file it writes it to (MySQL's last_committed / sequence_number
+    // are per file): left out of the comparison. GTID_LOG / ANONYMOUS_GTID:
+    // body bytes 26 - 41 (here 41 - 56, after the 13 header bytes kept and
+    // log_pos removed); a tagged GTID event serializes them among its
+    // fields, so only its type is compared (its GTID is in the set check)
+    if (type == gtid_event || type == anonymous_gtid_event) {
+      constexpr std::size_t clock_begin{13U + 2U + 26U};
+      constexpr std::size_t clock_end{clock_begin + 16U};
+      if (event.size() >= clock_end) {
+        std::fill(event.begin() + static_cast<std::ptrdiff_t>(clock_begin),
+                  event.begin() + static_cast<std::ptrdiff_t>(clock_end), '\0');
+      }
+    } else if (type == gtid_tagged_event) {
+      event.resize(13U);
+    }
     result.back().events.push_back(std::move(event));
   }
   return result;
@@ -2871,7 +2897,7 @@ void replica_of_listener_matches_source(hegel::TestCase &tc,
         const auto storage{make_storage(options)};
         pull_process pull{tc, *storage};
         pull.wait_until_listening();
-        const auto first{first_binlog_of_empty_storage(options, server.sql)};
+        const auto first{first_binlog_for_replica(tc, options, server.sql, *storage)};
         replica.sql().exec(
             "CHANGE REPLICATION SOURCE TO SOURCE_HOST = '127.0.0.1', "
             "SOURCE_PORT = " + std::to_string(listener_port()) +
@@ -3522,7 +3548,9 @@ BOOST_AUTO_TEST_CASE(S3OutageWhileServingKeepsPullRunningMySQL) {
       [](hegel::TestCase &tc) {
         server_session server;
         start_case(tc, server);
-        auto options{draw_options(tc)};
+        // position mode only: the oracle is the server's own dump of the
+        // same binlog, which rewrite mode (GTID mode) does not keep
+        auto options{draw_options(tc, false)};
         const auto proxy{make_s3_proxy()};
         options.s3 = true;
         options.s3_port = proxy->port();
@@ -3724,7 +3752,7 @@ BOOST_AUTO_TEST_CASE(ReplicaOfPositionStorageGtidOffMySQL) {
         const auto storage{make_storage(options)};
         pull_process pull{tc, *storage};
         pull.wait_until_listening();
-        const auto first{first_binlog_of_empty_storage(options, server.sql)};
+        const auto first{first_binlog_for_replica(tc, options, server.sql, *storage)};
         replica.sql().exec(
             "CHANGE REPLICATION SOURCE TO SOURCE_HOST = '127.0.0.1', "
             "SOURCE_PORT = " + std::to_string(listener_port()) +
@@ -4664,6 +4692,25 @@ BOOST_AUTO_TEST_CASE(FailoverToLaggingReplicaIsCorrectOrRefusedMySQL) {
 
 namespace {
 
+std::vector<std::string> listed_names(hegel::TestCase &tc, const pbs_storage &storage);
+
+std::string first_binlog_for_replica(hegel::TestCase &tc, const pbs_options &options,
+                                     sql_connection &sql, const pbs_storage &storage) {
+  if (!options.gtid_mode) {
+    return server_binlogs(sql).front().name;
+  }
+  sql.exec("INSERT INTO pbt.t1 (v, b) VALUES (0, 'first')");
+  const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{30}};
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (const auto names{listed_names(tc, storage)}; !names.empty()) {
+      return names.front();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{200});
+  }
+  pbt::note(tc, "(pull stored no binlog in 30 s; the replica names rw.000001)");
+  return "rw.000001";
+}
+
 std::vector<std::string> listed_names(hegel::TestCase &tc, const pbs_storage &storage) {
   std::vector<std::string> result;
   const auto response{list(tc, storage)};
@@ -4767,12 +4814,22 @@ BOOST_AUTO_TEST_CASE(InterruptedPurgeIsRecoveredMySQL) {
         start_case(tc, server);
         auto options{draw_options(tc)};
         options.s3 = (tc.draw("s3", gs::integers<int>({.min_value = 0, .max_value = 2})) == 0) && s3_available();
+        if (options.gtid_mode) {
+          options.rewrite_file_size = "4K";  // several binlogs from a small workload
+        }
         pbt::note(tc, "binlog_server: " + describe(options));
         const auto storage{make_storage(options)};
         pbt::note(tc, "workload:");
         apply_multi_binlog_workload(tc, server);
         fetch(tc, *storage);
-        const auto before{listed_names(tc, *storage)};
+        auto before{listed_names(tc, *storage)};
+        // rewrite mode (GTID mode) rotates by size only: commit more until
+        // the storage has two binlogs
+        for (int attempt{0}; attempt < 20 && before.size() < 2U; ++attempt) {
+          apply_all(tc, server.sql, {operation{.kind = op_kind::large_row, .size = 5000U}});
+          fetch(tc, *storage);
+          before = listed_names(tc, *storage);
+        }
         pbt::require(before.size() >= 2U, "the workload left several stored binlogs");
         const auto target_index{tc.draw(
             "target", gs::integers<std::size_t>({.max_value = before.size() - 2U}))};
@@ -5429,7 +5486,7 @@ void live_clients_follow_pull(hegel::TestCase &tc, bool s3) {
       source += ", SOURCE_HEARTBEAT_PERIOD = 1";
     }
     if (!empty_name) {
-      source += ", SOURCE_LOG_FILE = '" + first_binlog_of_empty_storage(options, server.sql) +
+      source += ", SOURCE_LOG_FILE = '" + first_binlog_for_replica(tc, options, server.sql, *storage) +
                 "', SOURCE_LOG_POS = 4";
     }
     replica->sql().exec(source);
@@ -6845,7 +6902,7 @@ BOOST_AUTO_TEST_CASE(ReplicaReceivesHeartbeatsMySQL) {
             "CHANGE REPLICATION SOURCE TO SOURCE_HOST = '127.0.0.1', "
             "SOURCE_PORT = " + std::to_string(listener_port()) +
             ", SOURCE_USER = 'replica', SOURCE_PASSWORD = 'replica-password', "
-            "SOURCE_LOG_FILE = '" + first_binlog_of_empty_storage(options, server.sql) +
+            "SOURCE_LOG_FILE = '" + first_binlog_for_replica(tc, options, server.sql, *storage) +
             "', SOURCE_LOG_POS = 4, GET_SOURCE_PUBLIC_KEY = 1, "
             "SOURCE_CONNECT_RETRY = 1, SOURCE_HEARTBEAT_PERIOD = " + period);
         replica.sql().exec("START REPLICA");
