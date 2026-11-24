@@ -238,6 +238,7 @@ walker (magic, sizes, log_pos, CRC32, GTID order).
 | D47 | `ListenerSurvivesLongStatementsMySQL`: a logged-in client of the listener sends SET + a run of 1,000 - 300,000 spaces / tabs / line feeds / carriage returns, or SET @master_heartbeat_period= + digits: pull keeps running and serves a new dump (Hrvoje's ticket 72, High) | ✅ (PBT-073) |
 | D48 | `EditedStoredGtidsDoNotSkipTransactionsMySQL`: rewrite-mode storage of 2 - 6 transactions; 1 - 3 future GTIDs added to the newest binlog's added_gtids; the source commits them (+ 0 - 2): fetch refuses or stores every transaction of the source in the binlog files (Hrvoje's ticket 81, High) | ✅ (PBT-074) |
 | D49 | `storage_property_test::ReplacedKekBytesAreRefused`: encrypted storage with 1 - 2 binlogs; the keyring's bytes for the active KEK id replaced; the next binlog written: refused, or readable with the original keyring (Hrvoje's ticket 85, High) | ✅ (PBT-075) |
+| D50 | `RewriteFileSizeIsHonouredAcrossFetchesMySQL`: rewrite file_size 1K / 4K; 2 - 8 fetch runs of 1 - 2 transactions of 600 - 5000 bytes each: no transaction but a binlog's first starts at or beyond file_size; the storage holds the server's transactions (found in Jenkins #39) | ✅ (PBT-076; first run pending) |
 | D9 | `PurgeOnServerMySQL`: `PURGE BINARY LOGS TO` before / after the storage got the binlogs; fetch succeeds exactly when the server still has what the storage needs (position: its newest binlog; GTID: gtid_purged covered; empty storage), else exits 1 leaving the storage unchanged | ✅ |
 
 GTID auto-positioning: the server starts a GTID dump at the newest binlog
@@ -269,7 +270,7 @@ there is authoritative):
 | Severity | Issues |
 |---|---|
 | high | PBT-015, PBT-022, PBT-039, PBT-040, PBT-043, PBT-058, PBT-060, PBT-065, PBT-066, PBT-067, PBT-069, PBT-073, PBT-074, PBT-075 |
-| medium | PBT-001, PBT-002, PBT-004, PBT-012, PBT-013, PBT-016, PBT-019, PBT-029, PBT-030, PBT-031, PBT-032, PBT-033, PBT-035, PBT-036, PBT-037, PBT-041, PBT-042, PBT-045, PBT-048, PBT-050, PBT-052, PBT-054, PBT-055, PBT-056, PBT-057, PBT-061, PBT-062, PBT-068, PBT-070, PBT-071, PBT-072 |
+| medium | PBT-001, PBT-002, PBT-004, PBT-012, PBT-013, PBT-016, PBT-019, PBT-029, PBT-030, PBT-031, PBT-032, PBT-033, PBT-035, PBT-036, PBT-037, PBT-041, PBT-042, PBT-045, PBT-048, PBT-050, PBT-052, PBT-054, PBT-055, PBT-056, PBT-057, PBT-061, PBT-062, PBT-068, PBT-070, PBT-071, PBT-072, PBT-076 |
 | fixed | PBT-051 (upstream PBS-120, 1659166), PBT-034 (upstream PBS-10), PBT-026 and PBT-038 (upstream PBS-59), PBT-025 (upstream PBS-29), PBT-024 (upstream PBS-29 part 3, 2d7dc80), PBT-046 and PBT-047 (upstream PBS-31 part 3, 6b0960f), PBT-017 and PBT-044 (upstream PBS-68 / PBS-112, dd136e5) |
 | low | PBT-003, PBT-005, PBT-006, PBT-007, PBT-008, PBT-009, PBT-010, PBT-011, PBT-014, PBT-018, PBT-020, PBT-021, PBT-023, PBT-027, PBT-028, PBT-049, PBT-053, PBT-059, PBT-063, PBT-064 |
 
@@ -865,6 +866,15 @@ Upstream 4717df9 (PBS-80, PBS-98) makes `<replication.rewrite>` mandatory in gti
   - `InterruptedPurgeIsRecoveredMySQL`: needs several stored binlogs - 4K rewrite files in GTID mode, and more rows until there are two.
 - D44, D45, D47, D48, D49 confirm PBT-070, 071, 073 (pull dies after a 40,029-byte SET statement), 074, 075. D46 passes: PBT-072 fixed by PBS-118 (dd6b598).
 - The failover properties pass in rewrite mode (PBT-041 obsolete as expected).
+
+### Jenkins run #39 (asan_gcc14-ubsan, PS 8.4.10-10, cd2b614 on upstream dd6b598)
+
+232 properties, 157 passed, 75 failed: 69 known, 6 new, 0 regressions; possibly fixed PBT-043 (LiveClients*, ReplicaReceivesHeartbeats, ReconnectAfterRotation), PBT-035, PBT-062, PBT-050.
+
+- The harness fixes of #36 hold: the transaction comparison, GtidResumeStoresRotateEvent (PBT-033 obsolete, passes), the replica tests.
+- New, a product bug: `InterruptedPurgeIsRecoveredMySQL` (GTID, rewrite 4K) still had one stored binlog after 20 fetch runs of one 5000-byte row each - rewrite mode does not rotate on the first transaction after a reconnect. New PBT-076 (medium) and D50 `RewriteFileSizeIsHonouredAcrossFetchesMySQL`.
+- New, PBT-069: `FailoverPositionModeIsRefusedMySQL` - fetch followed the promoted replica (exit 0) because the storage's newest binlog.000002 is magic only (PBT-020) and the replica has a binlog.000002 too. Second known_bugs row for PBT-069.
+- New, test premises (fixed): `UnindexedObjectsFollowTheRulesMySQL` (purge_binlogs of the only stored binlog - "target is the current tail binlog file"), the three D27 properties `GtidDump{AfterPurgeMatches,MissingPurgedIsRefused,AheadOfSourceIsRefused}MySQL` ("fewer than 2 binlogs"), `InterruptedPurgeIsRecoveredMySQL`. `apply_multi_binlog_workload()` now ends its segments with 5000-byte rows and these tests use rewrite file_size 1K in GTID mode (a stored binlog per row); D27 writes one 5000-byte row per source binlog and purges the source up to the first binlog whose previous GTIDs equal the stored binlog's.
 
 ## 6. Open questions
 

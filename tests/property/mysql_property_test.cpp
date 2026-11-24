@@ -4790,13 +4790,15 @@ std::uint64_t startup_ms() {
 }
 
 // a workload that leaves at least three binlogs
+// (5000-byte rows: in rewrite mode (GTID mode) with rewrite_file_size 1K
+// each of them ends a stored binlog, so the storage gets three as well)
 void apply_multi_binlog_workload(hegel::TestCase &tc, server_session &server) {
   auto workload{draw_workload(tc, server.info, 5U)};
   for (int i{0}; i < 2; ++i) {
-    workload.push_back(operation{.kind = op_kind::insert_rows, .count = 1});
+    workload.push_back(operation{.kind = op_kind::large_row, .size = 5000U});
     workload.push_back(operation{.kind = op_kind::flush});
   }
-  workload.push_back(operation{.kind = op_kind::insert_rows, .count = 1});
+  workload.push_back(operation{.kind = op_kind::large_row, .size = 5000U});
   apply_all(tc, server.sql, workload);
 }
 
@@ -4815,7 +4817,7 @@ BOOST_AUTO_TEST_CASE(InterruptedPurgeIsRecoveredMySQL) {
         auto options{draw_options(tc)};
         options.s3 = (tc.draw("s3", gs::integers<int>({.min_value = 0, .max_value = 2})) == 0) && s3_available();
         if (options.gtid_mode) {
-          options.rewrite_file_size = "4K";  // several binlogs from a small workload
+          options.rewrite_file_size = "1K";  // several binlogs from a small workload
         }
         pbt::note(tc, "binlog_server: " + describe(options));
         const auto storage{make_storage(options)};
@@ -4823,10 +4825,13 @@ BOOST_AUTO_TEST_CASE(InterruptedPurgeIsRecoveredMySQL) {
         apply_multi_binlog_workload(tc, server);
         fetch(tc, *storage);
         auto before{listed_names(tc, *storage)};
-        // rewrite mode (GTID mode) rotates by size only: commit more until
+        // rewrite mode (GTID mode) rotates by size only, at a transaction
+        // boundary within one session (PBT-076: not before the first
+        // transaction after a reconnect): commit more, two per fetch, until
         // the storage has two binlogs
-        for (int attempt{0}; attempt < 20 && before.size() < 2U; ++attempt) {
-          apply_all(tc, server.sql, {operation{.kind = op_kind::large_row, .size = 5000U}});
+        for (int attempt{0}; attempt < 5 && before.size() < 2U; ++attempt) {
+          apply_all(tc, server.sql, {operation{.kind = op_kind::large_row, .size = 5000U},
+                                     operation{.kind = op_kind::large_row, .size = 5000U}});
           fetch(tc, *storage);
           before = listed_names(tc, *storage);
         }
@@ -4943,6 +4948,9 @@ BOOST_AUTO_TEST_CASE(UnindexedObjectsFollowTheRulesMySQL) {
         server_session server;
         start_case(tc, server);
         auto options{draw_options(tc)};
+        if (options.gtid_mode) {
+          options.rewrite_file_size = "1K";  // a stored binlog per 5000-byte row
+        }
         pbt::note(tc, "binlog_server: " + describe(options));
         const auto storage{make_storage(options)};
         pbt::note(tc, "workload:");
@@ -7269,16 +7277,19 @@ namespace {
 void gtid_dump_matches_source(hegel::TestCase &tc, const std::string &sets) {
       server_session server;
       start_case(tc, server);
-      const auto options{draw_options(tc, true)};
+      auto options{draw_options(tc, true)};
+      // rewrite mode (GTID mode) rotates by size, not where the source does:
+      // with 1K files and each source binlog ending with a 5000-byte row, a
+      // stored binlog ends where a source binlog's transactions end, so both
+      // can purge the same transactions
+      options.rewrite_file_size = "1K";
       pbt::note(tc, "binlog_server: " + describe(options));
       const auto storage{make_storage(options)};
       const auto binlogs{tc.draw("binlogs", gs::integers<std::size_t>({.min_value = 2U,
                                                                        .max_value = 4U}))};
       for (std::size_t i{0U}; i < binlogs; ++i) {
         pbt::note(tc, "workload in binlog " + std::to_string(i + 1U) + ":");
-        auto workload{draw_workload(tc, server.info, 3U)};
-        std::erase_if(workload, [](const operation &op) { return op.kind == op_kind::flush; });
-        workload.push_back(operation{.kind = op_kind::insert_rows, .count = 1});
+        std::vector<operation> workload{operation{.kind = op_kind::large_row, .size = 5000U}};
         if (i + 1U < binlogs) {
           workload.push_back(operation{.kind = op_kind::flush});
         }
@@ -7298,8 +7309,27 @@ void gtid_dump_matches_source(hegel::TestCase &tc, const std::string &sets) {
           gs::integers<std::size_t>({.min_value = sets == "missing purged" ? 1U : 0U,
                                      .max_value = names.size() - 1U}))};
       if (purge != 0U) {
-        const auto &target{names[purge]};
         const auto &last_purged{names[purge - 1U]};
+        // the source binlog that starts where stored binlog names[purge]
+        // starts (the same previous GTIDs; the first one of several, e.g.
+        // after a size rotation that left an empty binlog)
+        gtids::gtid_set stored_previous;
+        const auto listing_for_purge{list(tc, *storage)};
+        for (const auto &item : listing_for_purge.at("result").as_array()) {
+          if (std::string{item.at("name").as_string()} == names[purge]) {
+            stored_previous = gtids::gtid_set{std::string_view{item.at("previous_gtids").as_string()}};
+          }
+        }
+        std::string target;
+        for (const auto &binlog : server_binlogs(server.sql)) {
+          if (server_previous_gtids(server.sql, binlog.name) == stored_previous) {
+            target = binlog.name;
+            break;
+          }
+        }
+        pbt::require(!target.empty(), "oracle: a source binlog starts where stored " +
+                                          names[purge] + " starts ('" + stored_previous.str() +
+                                          "')");
         pbt::note(tc, "PURGE BINARY LOGS TO '" + target + "' on the source, purge_binlogs " +
                           last_purged + " on the storage");
         server.sql.exec("PURGE BINARY LOGS TO '" + target + "'");
@@ -8949,6 +8979,75 @@ BOOST_AUTO_TEST_CASE(EditedStoredGtidsDoNotSkipTransactionsMySQL) {
         pbt::require(missing.is_empty(),
                      "fetch exited 0 but never stored the transactions " + missing.str() +
                          " whose GTIDs were added to the stored metadata");
+      },
+      {.test_cases = 15U, .slow = true});
+}
+
+// ---------------------------------------------------------------------------
+// D50: rewrite.file_size across fetches
+// ---------------------------------------------------------------------------
+
+// README: in rewrite mode the utility "will change to a new binary log file
+// when the size of the previous one reaches the specified value"
+// (<replication.rewrite.file_size>). A GTID (rewrite) storage with
+// file_size 1K / 4K is filled by 2 - 8 fetch runs, each getting 1 - 2
+// transactions of 600 - 5000 bytes (a cron-driven fetch): no transaction
+// starts in a stored binlog at or beyond file_size, except the first one of
+// that binlog. Found in Jenkins #39 (InterruptedPurgeIsRecoveredMySQL: 20
+// fetches of one 5000-byte row each, file_size 4K, one 100 KB binlog):
+// collector_context reopens the current binlog for the first event after a
+// reconnect without looking at its size, and checks the size only at the
+// next transaction boundary of the same session.
+BOOST_AUTO_TEST_CASE(RewriteFileSizeIsHonouredAcrossFetchesMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        start_case(tc, server);
+        auto options{draw_options(tc, true)};
+        options.rewrite_file_size =
+            tc.draw("file_size", gs::sampled_from<std::string>({"1K", "4K"}));
+        const std::uint64_t file_size{*options.rewrite_file_size == "1K" ? 1024U : 4096U};
+        pbt::note(tc, "binlog_server: " + describe(options));
+        const auto storage{make_storage(options)};
+        const auto runs{tc.draw("fetch_runs", gs::integers<std::size_t>(
+                                                  {.min_value = 2U, .max_value = 8U}))};
+        for (std::size_t run_index{0U}; run_index < runs; ++run_index) {
+          const auto per_run{tc.draw("transactions", gs::integers<std::size_t>(
+                                                         {.min_value = 1U, .max_value = 2U}))};
+          std::vector<operation> workload;
+          for (std::size_t t{0U}; t < per_run; ++t) {
+            workload.push_back(operation{
+                .kind = op_kind::large_row,
+                .size = tc.draw("row_size", gs::sampled_from<std::size_t>({600U, 2000U, 5000U}))});
+          }
+          apply_all(tc, server.sql, workload);
+          fetch(tc, *storage);
+        }
+        std::string sizes;
+        std::string late;
+        const auto listing{list(tc, *storage)};
+        for (const auto &item : listing.at("result").as_array()) {
+          const std::string name{item.at("name").as_string()};
+          const auto data{storage->plaintext(name)};
+          sizes += name + "(" + std::to_string(data.size()) + ") ";
+          const auto walked{walk(data, "stored " + name)};
+          bool first_transaction{true};
+          for (std::size_t i{0U}; i < walked.types.size(); ++i) {
+            const auto type{walked.types[i]};
+            if (type != gtid_event && type != gtid_tagged_event && type != anonymous_gtid_event) {
+              continue;
+            }
+            if (!first_transaction && walked.offsets[i] >= file_size && late.empty()) {
+              late = name + ":" + std::to_string(walked.offsets[i]);
+            }
+            first_transaction = false;
+          }
+        }
+        pbt::note(tc, "stored: " + sizes);
+        pbt::require(late.empty(), "a transaction starts at " + late + ", at or beyond rewrite.file_size " +
+                                       std::to_string(file_size) +
+                                       " (the binlog was not rotated across fetch runs)");
+        require_storage_matches_server(tc, server.sql, server.info, *storage);
       },
       {.test_cases = 15U, .slow = true});
 }
