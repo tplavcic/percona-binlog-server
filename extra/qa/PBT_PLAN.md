@@ -238,7 +238,7 @@ walker (magic, sizes, log_pos, CRC32, GTID order).
 | D47 | `ListenerSurvivesLongStatementsMySQL`: a logged-in client of the listener sends SET + a run of 1,000 - 300,000 spaces / tabs / line feeds / carriage returns, or SET @master_heartbeat_period= + digits: pull keeps running and serves a new dump (Hrvoje's ticket 72, High) | ✅ (PBT-073) |
 | D48 | `EditedStoredGtidsDoNotSkipTransactionsMySQL`: rewrite-mode storage of 2 - 6 transactions; 1 - 3 future GTIDs added to the newest binlog's added_gtids; the source commits them (+ 0 - 2): fetch refuses or stores every transaction of the source in the binlog files (Hrvoje's ticket 81, High) | ✅ (PBT-074) |
 | D49 | `storage_property_test::ReplacedKekBytesAreRefused`: encrypted storage with 1 - 2 binlogs; the keyring's bytes for the active KEK id replaced; the next binlog written: refused, or readable with the original keyring (Hrvoje's ticket 85, High) | ✅ (PBT-075) |
-| D50 | `RewriteFileSizeIsHonouredAcrossFetchesMySQL`: rewrite file_size 1K / 4K; 2 - 8 fetch runs of 1 - 2 transactions of 600 - 5000 bytes each: no transaction but a binlog's first starts at or beyond file_size; the storage holds the server's transactions (found in Jenkins #39) | ✅ (PBT-076; first run pending) |
+| D50 | `RewriteFileSizeIsHonouredAcrossFetchesMySQL`: rewrite file_size 1K / 4K; 2 - 8 fetch runs of 1 - 2 transactions of 600 - 5000 bytes each: no transaction but a binlog's first starts at or beyond file_size; the storage holds the server's transactions (found in Jenkins #39) | ✅ (PBT-076) |
 | D9 | `PurgeOnServerMySQL`: `PURGE BINARY LOGS TO` before / after the storage got the binlogs; fetch succeeds exactly when the server still has what the storage needs (position: its newest binlog; GTID: gtid_purged covered; empty storage), else exits 1 leaving the storage unchanged | ✅ |
 
 GTID auto-positioning: the server starts a GTID dump at the newest binlog
@@ -875,6 +875,15 @@ Upstream 4717df9 (PBS-80, PBS-98) makes `<replication.rewrite>` mandatory in gti
 - New, a product bug: `InterruptedPurgeIsRecoveredMySQL` (GTID, rewrite 4K) still had one stored binlog after 20 fetch runs of one 5000-byte row each - rewrite mode does not rotate on the first transaction after a reconnect. New PBT-076 (medium) and D50 `RewriteFileSizeIsHonouredAcrossFetchesMySQL`.
 - New, PBT-069: `FailoverPositionModeIsRefusedMySQL` - fetch followed the promoted replica (exit 0) because the storage's newest binlog.000002 is magic only (PBT-020) and the replica has a binlog.000002 too. Second known_bugs row for PBT-069.
 - New, test premises (fixed): `UnindexedObjectsFollowTheRulesMySQL` (purge_binlogs of the only stored binlog - "target is the current tail binlog file"), the three D27 properties `GtidDump{AfterPurgeMatches,MissingPurgedIsRefused,AheadOfSourceIsRefused}MySQL` ("fewer than 2 binlogs"), `InterruptedPurgeIsRecoveredMySQL`. `apply_multi_binlog_workload()` now ends its segments with 5000-byte rows and these tests use rewrite file_size 1K in GTID mode (a stored binlog per row); D27 writes one 5000-byte row per source binlog and purges the source up to the first binlog whose previous GTIDs equal the stored binlog's.
+
+### Jenkins run #40 (asan_gcc14-ubsan, PS 8.4.10-10, e64c5b8 on upstream 0e45db5)
+
+233 properties, 161 passed, 72 failed: 70 known, 1 new, 1 regression; possibly fixed PBT-039, PBT-043 (3 properties), PBT-069 (the failover row), PBT-035, PBT-062, PBT-050.
+
+- Upstream 0e45db5 (PBS-150, Hrvoje's ticket 83: an EOF mid-transaction left fragments in rewrite mode) also moves the final flush of fetch into the collector, before it reports success: `DiskFullFetchSucceedsOnlyWhenCompleteMySQL` passes, PBT-039 (= Hrvoje's 73) set to fixed.
+- D50 confirms PBT-076 (with file_size 1K a transaction starts at rw.000001:1040). D27 (`GtidDump*`) and `InterruptedPurgeIsRecoveredMySQL` pass their premises now; `GtidDumpAheadOfSourceIsRefusedMySQL` fails as PBT-052 in rewrite mode too.
+- New, test: `UnindexedObjectsFollowTheRulesMySQL` planted binlog.000004 next to rw.* binlogs (a foreign name, correctly refused). It now names the planted objects with the storage's own base name.
+- Regression reported for PBT-044 (`ListenerSurvivesInvalidDumpRequestsMySQL`) is not PBT-044: pull exited at its first start with "bind: Address already in use" on the listener port (something already listened there). `listener_port()` now picks, once per process, a pid-derived port that nothing listens on (and the next one, for D18), and the binaries are started with PR_SET_PDEATHSIG(SIGKILL) so that none outlives a killed test process.
 
 ## 6. Open questions
 

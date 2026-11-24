@@ -953,13 +953,49 @@ struct pbs_storage {
   [[nodiscard]] std::string plaintext(const std::string &name) const;
 };
 
+// whether nothing listens on 'port' (and on 'port' + 1) right now: a bind
+// to it with SO_REUSEADDR, as pull's acceptor does, succeeds
+bool listener_ports_free(std::uint16_t port) {
+  for (const std::uint16_t candidate : {port, static_cast<std::uint16_t>(port + 1U)}) {
+    const int fd{::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)};
+    if (fd < 0) {
+      return false;
+    }
+    const int on{1};
+    ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(candidate);
+    address.sin_addr.s_addr = htonl(INADDR_ANY);
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    const bool bound{::bind(fd, reinterpret_cast<sockaddr *>(&address), sizeof address) == 0};
+    ::close(fd);
+    if (!bound) {
+      return false;
+    }
+  }
+  return true;
+}
+
 std::uint16_t listener_port() {
   // replication_source listener of 'pull'; one per test process (D18's
   // second process uses the next port). Below Linux's ephemeral port range
   // (32768-60999 by default): a port in it can be in use by any outgoing
-  // connection on the host, and pull then fails with "bind: Address already
-  // in use"
-  return static_cast<std::uint16_t>(20000U + static_cast<unsigned>(::getpid()) % 12000U);
+  // connection on the host. Chosen once per process from the pid, skipping
+  // ports something already listens on (Jenkins #40: pull of
+  // ListenerSurvivesInvalidDumpRequestsMySQL failed with "bind: Address
+  // already in use" on its very first start)
+  static const std::uint16_t port{[]() {
+    const auto start{static_cast<unsigned>(::getpid()) % 12000U};
+    for (unsigned step{0U}; step < 400U; ++step) {
+      const auto candidate{static_cast<std::uint16_t>(20000U + (start + step * 37U) % 11998U)};
+      if (listener_ports_free(candidate)) {
+        return candidate;
+      }
+    }
+    return static_cast<std::uint16_t>(20000U + start);
+  }()};
+  return port;
 }
 
 // one RSA key per test process for the listener (openssl genrsa)
@@ -4976,20 +5012,25 @@ BOOST_AUTO_TEST_CASE(UnindexedObjectsFollowTheRulesMySQL) {
           // the interrupted-purge garbage: as likely as the rest together
           kinds.insert(kinds.end(), kinds.size(), "older_binlog");
         }
+        // the storage's own base name (rw in rewrite mode, GTID mode)
+        const auto base{names.back().substr(0U, names.back().rfind('.'))};
+        const auto stored_name{[&base](std::uint64_t sequence) {
+          return base + binlog_name(sequence).substr(std::string_view{"binlog"}.size());
+        }};
         const auto kind{tc.draw("unindexed", gs::sampled_from(kinds))};
         std::vector<std::string> objects;
         if (kind == "next_binlog" || kind == "next_binlog_with_metadata") {
-          objects.push_back(binlog_name(last + 1U));
+          objects.push_back(stored_name(last + 1U));
           if (kind == "next_binlog_with_metadata") {
-            objects.push_back(binlog_name(last + 1U) + ".json");
+            objects.push_back(stored_name(last + 1U) + ".json");
           }
         } else if (kind == "older_binlog") {
-          objects.push_back(binlog_name(first - 1U));
-          objects.push_back(binlog_name(first - 1U) + ".json");
+          objects.push_back(stored_name(first - 1U));
+          objects.push_back(stored_name(first - 1U) + ".json");
         } else if (kind == "gap_binlog") {
-          objects.push_back(binlog_name(last + 2U));
+          objects.push_back(stored_name(last + 2U));
         } else if (kind == "next_metadata_only") {
-          objects.push_back(binlog_name(last + 1U) + ".json");
+          objects.push_back(stored_name(last + 1U) + ".json");
         } else if (kind == "foreign_file") {
           objects.emplace_back("notes.txt");
         } else if (kind == "other_base_name") {

@@ -43,6 +43,7 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -139,6 +140,9 @@ make_argv(const std::vector<std::string> &arguments) {
   for (const int sig : {SIGTERM, SIGINT, SIGHUP, SIGPIPE, SIGCHLD}) {
     std::ignore = ::signal(sig, SIG_DFL);
   }
+  // the binary must not outlive the test process (a killed test would
+  // leave e.g. a pull listening on its port)
+  ::prctl(PR_SET_PDEATHSIG, SIGKILL);
   if (file_size_limit) {
     const rlimit limit{.rlim_cur = static_cast<rlim_t>(*file_size_limit),
                        .rlim_max = static_cast<rlim_t>(*file_size_limit)};
