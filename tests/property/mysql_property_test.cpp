@@ -9231,3 +9231,562 @@ BOOST_AUTO_TEST_CASE(GappedGtidsDoNotGrowStorageQuadraticallyMySQL) {
       },
       {.test_cases = 6U, .slow = true});
 }
+
+// ---------------------------------------------------------------------------
+// D54 / D55: a transaction cut short between the source and PBS (Hrvoje's
+// tickets 82 and 83)
+// ---------------------------------------------------------------------------
+
+// PBS takes the end of a transaction from one number, the
+// transaction_length of its GTID_LOG / ANONYMOUS_GTID_LOG event: once the
+// events received add up to it, the stream is "at a transaction boundary",
+// and what lies before a boundary is what a checkpoint, the end of a run
+// and the error paths store (GTID mode: also as stored GTIDs).
+//
+// A proxy between PBS and the source (connection.port points at it, TLS
+// off so that it can read the protocol) works on one transaction of the
+// binlog dump, the target (the one whose rows carry a marker), held back
+// until its last event:
+//  - D54, honest faults: only its first events are sent (up to GTID,
+//    BEGIN, TABLE_MAP or the first ROWS event), then the dump ends the way
+//    the source ends one (an EOF packet), the connection closes, or it
+//    closes in the middle of the next event;
+//  - D55, a man in the middle: its transaction_length is lowered so that
+//    it ends after one of those events (or 1 byte before its true end) and
+//    the CRC32 is fixed; then the rest is sent, or the dump ends / the
+//    connection closes, or the rest of the target is left out and the dump
+//    goes on.
+// The proxy fires once; later connections pass unchanged. The attacked
+// run is a 'fetch' or a running 'pull' (checkpoint_size 1, SIGTERM a few
+// seconds after the target). Afterwards the storage may hold only complete
+// transactions of the source, as the source wrote them (the comparison of
+// require_storage_holds_server_transactions, on the stored prefix), and an
+// honest 'fetch' (a second one if the first fails) completes it.
+//
+// Hrvoje's ticket 82: every lie that ends at an event boundary leaves a
+// stub in the storage (GTID mode: and records its GTID); position and GTID
+// mode then refuse every later run, rewrite mode goes on without the rows.
+// Ticket 83 (fixed by PBS-150): an EOF after GTID + BEGIN left fragments in
+// a rewrite-mode storage that pull could no longer serve.
+
+namespace {
+
+constexpr std::string_view cut_target_marker{"pbt-cut-target"};
+constexpr std::uint8_t cut_query_event{2U};
+constexpr std::uint8_t cut_xid_event{16U};
+constexpr std::uint8_t cut_table_map_event{19U};
+const std::vector<std::string> transaction_cuts{"after_gtid", "after_begin",
+                                                "after_table_map", "after_first_rows"};
+
+// what the proxy does to the target transaction
+struct cut_plan {
+  std::string lie;  // "": the true transaction_length; else a cut or "minus1"
+  std::string send; // "all", or a cut: only the events before it are sent
+  std::string then; // after them: go_on, eof, drop, half_drop, skip
+};
+
+std::string describe(const cut_plan &plan) {
+  std::string result{plan.lie.empty() ? std::string{"true transaction_length"}
+                                      : "transaction_length lowered to " + plan.lie};
+  result += plan.send == "all" ? std::string{", all its events sent"}
+                               : ", the events before " + plan.send + " sent";
+  return result + ", then " + plan.then;
+}
+
+cut_plan draw_cut_plan(hegel::TestCase &tc, bool lie) {
+  cut_plan plan;
+  if (!lie) {
+    plan.send = tc.draw("send", gs::sampled_from(transaction_cuts));
+    plan.then = tc.draw("then", gs::sampled_from<std::string>({"eof", "drop", "half_drop"}));
+    return plan;
+  }
+  auto lies{transaction_cuts};
+  lies.emplace_back("minus1");
+  plan.lie = tc.draw("lie", gs::sampled_from(lies));
+  if (plan.lie == "minus1" || tc.draw("rest_sent", gs::booleans())) {
+    plan.send = "all";
+    plan.then = "go_on";
+    return plan;
+  }
+  plan.send = plan.lie;
+  plan.then = tc.draw("then", gs::sampled_from<std::string>({"eof", "drop", "skip"}));
+  return plan;
+}
+
+// how many events of the transaction (GTID, BEGIN, TABLE_MAP, ROWS..., XID)
+// lie before 'cut'
+std::size_t cut_index(const std::vector<std::uint8_t> &codes, const std::string &cut) {
+  if (cut == "after_gtid") {
+    return 1U;
+  }
+  if (cut == "after_begin") {
+    return 2U;
+  }
+  const auto table_map{
+      static_cast<std::size_t>(std::ranges::find(codes, cut_table_map_event) - codes.begin())};
+  return cut == "after_table_map" ? table_map + 1U : table_map + 2U;
+}
+
+std::uint32_t packet_crc32(const std::string &payload) {
+  return static_cast<std::uint32_t>(::crc32(
+      0UL,
+      // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+      reinterpret_cast<const Bytef *>(payload.data() + 1),
+      static_cast<uInt>(payload.size() - 5U)));
+}
+
+bool packet_crc32_ok(const std::string &payload) {
+  return payload.size() > 24U && packet_crc32(payload) == le32(payload, payload.size() - 4U);
+}
+
+class transaction_cut_proxy {
+public:
+  explicit transaction_cut_proxy(cut_plan plan) : plan_{std::move(plan)} {
+    listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd_ < 0) {
+      throw std::runtime_error{"cut proxy: socket failed"};
+    }
+    const int reuse{1};
+    ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof reuse);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = 0;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    // NOLINTBEGIN(cppcoreguidelines-pro-type-reinterpret-cast)
+    if (::bind(listen_fd_, reinterpret_cast<sockaddr *>(&address), sizeof address) != 0 ||
+        ::listen(listen_fd_, 16) != 0) {
+      ::close(listen_fd_);
+      throw std::runtime_error{"cut proxy: bind / listen failed"};
+    }
+    socklen_t length{sizeof address};
+    ::getsockname(listen_fd_, reinterpret_cast<sockaddr *>(&address), &length);
+    // NOLINTEND(cppcoreguidelines-pro-type-reinterpret-cast)
+    port_ = ntohs(address.sin_port);
+    acceptor_ = std::thread{[this]() { accept_loop(); }};
+  }
+  transaction_cut_proxy(const transaction_cut_proxy &) = delete;
+  transaction_cut_proxy &operator=(const transaction_cut_proxy &) = delete;
+  transaction_cut_proxy(transaction_cut_proxy &&) = delete;
+  transaction_cut_proxy &operator=(transaction_cut_proxy &&) = delete;
+  ~transaction_cut_proxy() {
+    stop_ = true;
+    acceptor_.join();
+    std::vector<std::thread> connections;
+    {
+      const std::scoped_lock lock{mutex_};
+      connections.swap(connections_);
+    }
+    for (auto &connection : connections) {
+      connection.join();
+    }
+    ::close(listen_fd_);
+  }
+
+  [[nodiscard]] std::uint16_t port() const noexcept { return port_; }
+  // the target went through the proxy (once)
+  [[nodiscard]] bool fired() const { return fired_; }
+  // what was done to the target
+  [[nodiscard]] std::string report() {
+    const std::scoped_lock lock{mutex_};
+    return report_;
+  }
+  // why the plan could not be carried out (a target of another shape)
+  [[nodiscard]] std::string error() {
+    const std::scoped_lock lock{mutex_};
+    return error_;
+  }
+
+private:
+  struct connection_state {
+    int client{-1};
+    int upstream{-1};
+    bool dumping{false};
+    std::uint8_t sequence{0U};
+    bool continuation{false};
+    std::vector<std::string> held; // payloads of a transaction held back
+    std::int64_t remaining{0};
+  };
+
+  void accept_loop() {
+    while (!stop_) {
+      pollfd waiting{.fd = listen_fd_, .events = POLLIN, .revents = 0};
+      if (::poll(&waiting, 1, 50) <= 0) {
+        continue;
+      }
+      const int client{::accept(listen_fd_, nullptr, nullptr)};
+      if (client < 0) {
+        continue;
+      }
+      const std::scoped_lock lock{mutex_};
+      connections_.emplace_back([this, client]() { serve(client); });
+    }
+  }
+
+  static bool write_all(int fd, const std::string &data) {
+    std::size_t written{0U};
+    while (written < data.size()) {
+      const auto result{::write(fd, data.data() + written, data.size() - written)};
+      if (result <= 0) {
+        return false;
+      }
+      written += static_cast<std::size_t>(result);
+    }
+    return true;
+  }
+
+  // a packet to PBS, numbered in the dump's own sequence (the proxy may
+  // leave packets out); 'part': only the first bytes of the payload
+  static bool send(connection_state &state, const std::string &payload,
+                   std::size_t part = std::string::npos) {
+    state.sequence = static_cast<std::uint8_t>(state.sequence + 1U);
+    std::string packet(4U, '\0');
+    packet[0] = static_cast<char>(payload.size() & 0xFFU);
+    packet[1] = static_cast<char>((payload.size() >> 8U) & 0xFFU);
+    packet[2] = static_cast<char>((payload.size() >> 16U) & 0xFFU);
+    packet[3] = static_cast<char>(state.sequence);
+    packet += payload.substr(0U, part);
+    return write_all(state.client, packet);
+  }
+
+  static bool send_all(connection_state &state, const std::vector<std::string> &payloads) {
+    return std::ranges::all_of(payloads,
+                               [&state](const std::string &payload) { return send(state, payload); });
+  }
+
+  void serve(int client) {
+    const int upstream{::socket(AF_INET, SOCK_STREAM, 0)};
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(static_cast<std::uint16_t>(settings().port));
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    if (upstream < 0 || ::connect(upstream, reinterpret_cast<sockaddr *>(&address),
+                                  sizeof address) != 0) {
+      ::close(client);
+      if (upstream >= 0) {
+        ::close(upstream);
+      }
+      return;
+    }
+    connection_state state{.client = client, .upstream = upstream};
+    std::array<std::string, 2> incoming;
+    std::array<char, 65536> buffer{};
+    std::array<pollfd, 2> fds{pollfd{.fd = client, .events = POLLIN, .revents = 0},
+                              pollfd{.fd = upstream, .events = POLLIN, .revents = 0}};
+    bool open{true};
+    while (!stop_ && open) {
+      if (::poll(fds.data(), fds.size(), 50) <= 0) {
+        continue;
+      }
+      for (std::size_t i{0U}; i < fds.size() && open; ++i) {
+        if ((fds[i].revents & (POLLIN | POLLHUP | POLLERR)) == 0) {
+          continue;
+        }
+        const auto count{::read(fds[i].fd, buffer.data(), buffer.size())};
+        if (count <= 0) {
+          open = false;
+          break;
+        }
+        auto &bytes{incoming[i]};
+        bytes.append(buffer.data(), static_cast<std::size_t>(count));
+        while (open && bytes.size() >= 4U) {
+          const std::size_t length{std::size_t{static_cast<std::uint8_t>(bytes[0])} |
+                                   (std::size_t{static_cast<std::uint8_t>(bytes[1])} << 8U) |
+                                   (std::size_t{static_cast<std::uint8_t>(bytes[2])} << 16U)};
+          if (bytes.size() < 4U + length) {
+            break;
+          }
+          const auto packet{bytes.substr(0U, 4U + length)};
+          bytes.erase(0U, 4U + length);
+          open = i == 0U ? to_server(state, packet) : to_client(state, packet);
+        }
+      }
+    }
+    ::shutdown(client, SHUT_WR);
+    ::close(client);
+    ::close(upstream);
+  }
+
+  static bool to_server(connection_state &state, const std::string &packet) {
+    // COM_BINLOG_DUMP / COM_BINLOG_DUMP_GTID: the server's answers are the dump
+    if (packet.size() > 4U && packet[3] == '\0' &&
+        (packet[4] == '\x12' || packet[4] == '\x1e')) {
+      state.dumping = true;
+      state.sequence = 0U;
+    }
+    return write_all(state.upstream, packet);
+  }
+
+  bool to_client(connection_state &state, const std::string &packet) {
+    if (!state.dumping) {
+      return write_all(state.client, packet);
+    }
+    const auto length{packet.size() - 4U};
+    const auto payload{packet.substr(4U)};
+    const bool event{!state.continuation && length != 0xFFFFFFU && payload.size() >= 24U &&
+                     payload[0] == '\0'};
+    if (!event || fired_) {
+      state.continuation = length == 0xFFFFFFU;
+      const auto held{std::exchange(state.held, {})};
+      return send_all(state, held) && send(state, payload);
+    }
+    const auto code{static_cast<std::uint8_t>(payload[5])};
+    if (state.held.empty()) {
+      if (code != gtid_event && code != anonymous_gtid_event) {
+        return send(state, payload);
+      }
+      // transaction_length_field / write_length: D42
+      const auto field{transaction_length_field(payload.substr(1U))};
+      if (!field) {
+        return send(state, payload);
+      }
+      state.remaining = static_cast<std::int64_t>(field->value);
+    }
+    state.held.push_back(payload);
+    state.remaining -= static_cast<std::int64_t>(payload.size() - 1U);
+    if (state.remaining > 0 && state.held.size() < 1000U) {
+      return true;
+    }
+    const auto transaction{std::exchange(state.held, {})};
+    const bool target{std::ranges::any_of(transaction, [](const std::string &held) {
+      return held.find(cut_target_marker) != std::string::npos;
+    })};
+    if (!target || state.remaining != 0 || fired_.exchange(true)) {
+      return send_all(state, transaction);
+    }
+    return attack(state, transaction);
+  }
+
+  void set(std::string &field, const std::string &text) {
+    const std::scoped_lock lock{mutex_};
+    field = text;
+  }
+
+  bool attack(connection_state &state, std::vector<std::string> transaction) {
+    std::vector<std::uint8_t> codes;
+    std::uint64_t true_length{0U};
+    std::string shape;
+    for (const auto &payload : transaction) {
+      codes.push_back(static_cast<std::uint8_t>(payload[5]));
+      true_length += payload.size() - 1U;
+      shape += (shape.empty() ? "" : " ") + std::to_string(codes.back());
+    }
+    std::string report{"target: " + std::to_string(transaction.size()) + " events (types " +
+                       shape + "), " + std::to_string(true_length) + " bytes"};
+    const bool expected_shape{codes.size() >= 5U && codes[1] == cut_query_event &&
+                              codes[2] == cut_table_map_event && codes.back() == cut_xid_event &&
+                              packet_crc32_ok(transaction[0])};
+    const auto field{transaction_length_field(transaction[0].substr(1U))};
+    if (!expected_shape || !field || field->width < 3U) {
+      set(error_, report + ": not GTID, BEGIN, TABLE_MAP, ROWS..., XID with CRC32 and a "
+                           "multi-byte transaction_length");
+      return send_all(state, transaction);
+    }
+    const auto bytes_before{[&transaction](std::size_t count) {
+      std::uint64_t sum{0U};
+      for (std::size_t i{0U}; i < count; ++i) {
+        sum += transaction[i].size() - 1U;
+      }
+      return sum;
+    }};
+    if (!plan_.lie.empty()) {
+      const auto value{plan_.lie == "minus1" ? true_length - 1U
+                                             : bytes_before(cut_index(codes, plan_.lie))};
+      auto event{transaction[0].substr(1U)};
+      write_length(event, *field, value);
+      auto &gtid{transaction[0]};
+      gtid = '\0' + event;
+      const auto crc{packet_crc32(gtid)};
+      for (std::size_t i{0U}; i < 4U; ++i) {
+        gtid[gtid.size() - 4U + i] = static_cast<char>((crc >> (8U * i)) & 0xFFU);
+      }
+      report += "; transaction_length " + std::to_string(true_length) + " -> " +
+                std::to_string(value);
+    }
+    const auto count{plan_.send == "all" ? transaction.size() : cut_index(codes, plan_.send)};
+    report += "; " + std::to_string(count) + " event(s) sent, then " + plan_.then;
+    set(report_, report);
+    for (std::size_t i{0U}; i < count; ++i) {
+      if (!send(state, transaction[i])) {
+        return false;
+      }
+    }
+    if (plan_.then == "eof") {
+      // the end of a dump as the source sends it
+      std::ignore = send(state, std::string{"\xfe\x00\x00\x02\x00", 5U});
+      return false;
+    }
+    if (plan_.then == "half_drop") {
+      std::ignore = send(state, transaction[count], transaction[count].size() / 2U);
+      return false;
+    }
+    return plan_.then != "drop"; // go_on, skip: the dump goes on
+  }
+
+  cut_plan plan_;
+  std::uint16_t port_{};
+  int listen_fd_{-1};
+  std::atomic<bool> stop_{false};
+  std::atomic<bool> fired_{false};
+  std::thread acceptor_;
+  std::mutex mutex_;
+  std::vector<std::thread> connections_;
+  std::string report_;
+  std::string error_;
+};
+
+// the storage's config with connection.port = the proxy, TLS off
+std::string cut_proxy_config(const pbs_storage &storage, std::uint16_t port) {
+  auto config{json::parse(read_file(storage.config_path)).as_object()};
+  auto &connection{config["connection"].as_object()};
+  connection["port"] = unsigned{port};
+  connection["ssl"] = json::object{{"mode", "disabled"}};
+  const auto path{(storage.directory.path() / "config-cut-proxy.json").string()};
+  std::ofstream{path} << json::serialize(config);
+  return path;
+}
+
+// the stored transactions are the first ones of the server, each complete
+// and as the server wrote it (normalized_transactions)
+void require_stored_transactions_complete(hegel::TestCase &tc, sql_connection &sql,
+                                          const server_info &info, const pbs_storage &storage,
+                                          const std::string &when) {
+  std::vector<normalized_transaction> on_server;
+  for (const auto &binlog : server_binlogs(sql)) {
+    auto transactions{
+        normalized_transactions(server_file(info, binlog.name), "server " + binlog.name)};
+    on_server.insert(on_server.end(), std::make_move_iterator(transactions.begin()),
+                     std::make_move_iterator(transactions.end()));
+  }
+  const auto response{list(tc, storage)};
+  pbt::require_equal(std::string{response.at("status").as_string()}, std::string{"success"},
+                     "list status " + when);
+  std::vector<normalized_transaction> stored;
+  for (const auto &value : response.at("result").as_array()) {
+    const std::string name{value.as_object().at("name").as_string()};
+    auto transactions{
+        normalized_transactions(storage.plaintext(name), "stored " + name + " " + when)};
+    stored.insert(stored.end(), std::make_move_iterator(transactions.begin()),
+                  std::make_move_iterator(transactions.end()));
+  }
+  pbt::require(stored.size() <= on_server.size(),
+               when + ": the storage holds " + std::to_string(stored.size()) +
+                   " transactions, the server " + std::to_string(on_server.size()));
+  for (std::size_t i{0U}; i < stored.size(); ++i) {
+    const auto &server_side{on_server[i]};
+    const auto &stored_side{stored[i]};
+    if (server_side.gtid == stored_side.gtid && server_side.events == stored_side.events) {
+      continue;
+    }
+    std::string detail{"server " + transaction_label(server_side, i) + ", stored " +
+                       transaction_label(stored_side, i)};
+    for (std::size_t e{0U}; e < std::min(server_side.events.size(), stored_side.events.size());
+         ++e) {
+      if (server_side.events[e] != stored_side.events[e]) {
+        detail += "; event " + std::to_string(e) + ": " +
+                  first_difference(server_side.events[e], stored_side.events[e]);
+        break;
+      }
+    }
+    pbt::fail(when + ": the storage holds a transaction that is not the source's "
+                     "(cut short or altered): " + detail);
+  }
+}
+
+void cut_transaction_case(hegel::TestCase &tc, bool lie) {
+  server_session server;
+  start_case(tc, server);
+  auto options{draw_options(tc)};
+  const bool pull{tc.draw("attacked_pull", gs::integers<int>({.min_value = 0, .max_value = 2})) ==
+                  0};
+  if (pull) {
+    // a running pull writes to the storage at checkpoints only
+    options.checkpoint_size = "1";
+  }
+  const auto plan{draw_cut_plan(tc, lie)};
+  pbt::note(tc, "binlog_server: " + describe(options) + "; attacked run: " +
+                    (pull ? "pull" : "fetch") + "; target: " + describe(plan));
+  const auto storage{make_storage(options)};
+  const auto insert{[&server](const std::string &label, int count) {
+    for (int i{0}; i < count; ++i) {
+      server.sql.exec("INSERT INTO pbt.t1 (v, b) VALUES (" + std::to_string(i) + ", '" + label +
+                      "')");
+    }
+  }};
+  insert("before", 2);
+  fetch(tc, *storage);
+  insert("pre", 1);
+  const auto rows{tc.draw("target_rows", gs::integers<int>({.min_value = 2, .max_value = 4}))};
+  const auto row_size{
+      tc.draw("target_row_size", gs::sampled_from<std::size_t>({300U, 3000U}))};
+  std::string values;
+  for (int i{0}; i < rows; ++i) {
+    values += std::string{i == 0 ? "" : ", "} + "(" + std::to_string(i) + ", CONCAT('" +
+              std::string{cut_target_marker} + "', REPEAT('T', " + std::to_string(row_size) +
+              ")))";
+  }
+  server.sql.exec("INSERT INTO pbt.t1 (v, b) VALUES " + values);
+  insert("post", 2);
+
+  transaction_cut_proxy proxy{plan};
+  const auto proxied{cut_proxy_config(*storage, proxy.port())};
+  background_run attacked{{pull ? "pull" : "fetch", proxied}};
+  const auto [result, in_time]{[&]() {
+    if (!pull) {
+      return attacked.wait_for(std::chrono::seconds{60});
+    }
+    const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{30}};
+    while (!proxy.fired() && std::chrono::steady_clock::now() < deadline && !attacked.poll()) {
+      wait_ms(50U);
+    }
+    // what pull stores of it, and its reconnects
+    wait_ms(4000U);
+    attacked.send(SIGTERM);
+    return attacked.wait_for(std::chrono::seconds{20});
+  }()};
+  pbt::note(tc, "proxy: " + proxy.report());
+  pbt::note(tc, std::string{"attacked "} + (pull ? "pull" : "fetch") + ": " +
+                    (in_time ? result.describe() : std::string{"killed after the time limit"}));
+  if (!in_time || result.signaled) {
+    pbt::note(tc, "binlog_server log:" + log_tail(*storage));
+  }
+  pbt::require(proxy.error().empty(), "the proxy could not cut the target: " + proxy.error());
+  pbt::require(proxy.fired(), "the dump through the proxy never reached the target transaction");
+  pbt::require(in_time, std::string{"the attacked "} + (pull ? "pull did not stop" : "fetch did not end") +
+                            " in time");
+  pbt::require(!result.signaled, "the attacked run crashed (" + result.describe() + ")");
+  require_stored_transactions_complete(tc, server.sql, server.info, *storage,
+                                       "after the attacked run");
+
+  pbt::note(tc, "one more transaction, then fetch without the proxy");
+  insert("after", 1);
+  auto honest{run({"fetch", storage->config_path})};
+  if (honest.signaled || honest.exit_code != 0) {
+    pbt::note(tc, "fetch without the proxy: " + honest.describe() + ", once more");
+    honest = run({"fetch", storage->config_path});
+  }
+  if (honest.signaled || honest.exit_code != 0) {
+    pbt::note(tc, "binlog_server log:" + log_tail(*storage));
+  }
+  pbt::require(!honest.signaled && honest.exit_code == 0,
+               "fetch without the proxy after the attacked run failed twice (" +
+                   honest.describe() + ")");
+  require_storage_matches_server(tc, server.sql, server.info, *storage);
+}
+
+} // namespace
+
+// D54: the connection to the source ends in the middle of a transaction
+// (an EOF packet, a closed connection, half an event): nothing of it is
+// stored; the next fetch stores it whole. Guards Hrvoje's ticket 83.
+BOOST_AUTO_TEST_CASE(CutOffTransactionIsNotStoredMySQL) {
+  pbt::check([](hegel::TestCase &tc) { cut_transaction_case(tc, false); },
+             {.test_cases = 15U, .slow = true});
+}
+
+// D55: a lowered transaction_length (CRC32 fixed) does not make PBS store
+// the first events of a transaction as all of it. Hrvoje's ticket 82.
+BOOST_AUTO_TEST_CASE(LoweredTransactionLengthIsNotStoredMySQL) {
+  pbt::check([](hegel::TestCase &tc) { cut_transaction_case(tc, true); },
+             {.test_cases = 20U, .slow = true});
+}
