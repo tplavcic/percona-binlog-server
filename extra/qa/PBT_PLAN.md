@@ -239,9 +239,9 @@ walker (magic, sizes, log_pos, CRC32, GTID order).
 | D48 | `EditedStoredGtidsDoNotSkipTransactionsMySQL`: rewrite-mode storage of 2 - 6 transactions; 1 - 3 future GTIDs added to the newest binlog's added_gtids; the source commits them (+ 0 - 2): fetch refuses or stores every transaction of the source in the binlog files (Hrvoje's ticket 81, High) | ✅ (PBT-074) |
 | D49 | `storage_property_test::ReplacedKekBytesAreRefused`: encrypted storage with 1 - 2 binlogs; the keyring's bytes for the active KEK id replaced; the next binlog written: refused, or readable with the original keyring (Hrvoje's ticket 85, High) | ✅ (PBT-075) |
 | D50 | `RewriteFileSizeIsHonouredAcrossFetchesMySQL`: rewrite file_size 1K / 4K; 2 - 8 fetch runs of 1 - 2 transactions of 600 - 5000 bytes each: no transaction but a binlog's first starts at or beyond file_size; the storage holds the server's transactions (found in Jenkins #39) | ✅ (PBT-076) |
-| D51 | `storage_property_test::StrippedEncryptionRecordDoesNotTurnOffEncryption`: encrypted storage with 1 - 2 binlogs; the newest binlog's encryption record removed from its metadata; the writer resumes it and appends 8 - 32 bytes: refused, or not stored in plaintext (Hrvoje's ticket 62, High) | ✅ (PBT-077; first run pending) |
-| D52 | `ListenerLogIsNotForgeableMySQL`: a logged-in client sends a statement / a dump of a binlog name with a line feed / CR LF / lone CR + a forged log line, an ANSI escape, a NUL or 1 MiB of text: pull's log has no forged line, no raw CR / ESC / NUL, no line over 64 KiB (Hrvoje's ticket 92, High) | ✅ (PBT-078; first run pending) |
-| D53 | `GappedGtidsDoNotGrowStorageQuadraticallyMySQL`: 300 - 600 one-row transactions with GTIDs 1, 3, 5, ... (SET gtid_next) on one source binlog; a rewrite-mode storage with file_size 4K holds at most 4 x the source's bytes + 64 KiB (Hrvoje's ticket 88, High) | ✅ (PBT-079; first run pending) |
+| D51 | `storage_property_test::StrippedEncryptionRecordDoesNotTurnOffEncryption`: encrypted storage with 1 - 2 binlogs; the newest binlog's encryption record removed from its metadata; the writer resumes it and appends 8 - 32 bytes: refused, or not stored in plaintext (Hrvoje's ticket 62, High) | ✅ (PBT-077) |
+| D52 | `ListenerLogIsNotForgeableMySQL`: a logged-in client sends a statement / a dump of a binlog name with a line feed / CR LF / lone CR + a forged log line, an ANSI escape, a NUL or 1 MiB of text: pull's log has no forged line, no raw CR / ESC / NUL, no line over 64 KiB (Hrvoje's ticket 92, High) | ✅ (PBT-078) |
+| D53 | `GappedGtidsDoNotGrowStorageQuadraticallyMySQL`: 300 - 600 one-row transactions with GTIDs 1, 3, 5, ... (SET gtid_next) on one source binlog; a rewrite-mode storage with file_size 4K holds at most 4 x the source's bytes + 64 KiB (Hrvoje's ticket 88, High) | ✅ (PBT-079) |
 | D9 | `PurgeOnServerMySQL`: `PURGE BINARY LOGS TO` before / after the storage got the binlogs; fetch succeeds exactly when the server still has what the storage needs (position: its newest binlog; GTID: gtid_purged covered; empty storage), else exits 1 leaving the storage unchanged | ✅ |
 
 GTID auto-positioning: the server starts a GTID dump at the newest binlog
@@ -895,6 +895,13 @@ Upstream 4717df9 (PBS-80, PBS-98) makes `<replication.rewrite>` mandatory in gti
 - The #40 test fixes hold (listener port, PR_SET_PDEATHSIG, UnindexedObjects base name).
 - PBT-043 / 050 / 062 / 035 possibly fixed for the third run in a row: their GTID-without-rewrite sequences no longer exist; PBT-020 (magic-only binlog) still occurs in position mode, so they stay open for now.
 - Closed after the run (2026-11-24, user decision): PBT-043 as obsolete (all three rows; GTID mode without rewrite no longer exists), and the GTID-only row of PBT-062 (`DiskFullLeavesStorageConsistentMySQL`). PBT-062 itself stays open: the storage-level `CrashWhileCreatingLaterBinlogIsRecovered` still fails. PBT-050 stays open: only its `IdleDumpSendsHeartbeatsMySQL` row passed, the main property `HeartbeatsContinueAfterRotationMySQL` still fails.
+
+### Jenkins run #42 (asan_gcc14-ubsan, PS 8.4.10-10, 23d39d5 on upstream 0e45db5)
+
+236 properties, 163 passed, 73 failed: 73 known, 0 new, 0 regressions; possibly fixed PBT-069 (failover row), PBT-035, PBT-050 (IdleDumpSendsHeartbeats row).
+
+- D51 - D53 confirm Hrvoje's tickets 62, 92 and 88 in their first run: PBT-077 (8 appended bytes stored in plaintext after the encryption record was removed), PBT-078 (a line feed in a statement forges a log line), PBT-079 (300 gapped transactions, 85 KB at the source, stored as 507 KB in 111 binlogs).
+- PBT-040 (two writers) fails again after passing in #41.
 
 ## 6. Open questions
 
