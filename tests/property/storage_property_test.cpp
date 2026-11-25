@@ -2449,3 +2449,60 @@ BOOST_AUTO_TEST_CASE(ReplacedKekBytesAreRefused) {
       },
       {.test_cases = 100U});
 }
+
+// The encryption record of a binlog (wrapped file key, IV, cipher, KEK id)
+// lives in its unauthenticated metadata file. An encrypted storage (any
+// compatible KEK / data cipher, storage.encryption still configured) with
+// 1 - 2 binlogs; the newest binlog's record is removed from its
+// <binlog>.json (someone who can write the storage, no key); the writer
+// then resumes that binlog (open_binlog of the same name, as fetch / pull
+// do) and appends 8 - 32 bytes. Either the storage refuses (at start or
+// when it writes), or the appended data is not stored in plaintext.
+// Hrvoje's ticket 62 (PBS-136): validate_binlog_encryption_record() checks
+// a record only when it is present, and write_data_to_stream() writes
+// plaintext when the loaded record is missing - so encryption is turned off
+// for data PBS has not received yet; the metadata is saved again without
+// a record. (The read side is EncryptedBinlogStrippedOfEncryptionIsNotServed.)
+BOOST_AUTO_TEST_CASE(StrippedEncryptionRecordDoesNotTurnOffEncryption) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        const temporary_directory directory;
+        auto expected{encrypted_storage(tc, directory, 1U, 2U)};
+        const auto config{make_config(directory, expected.settings)};
+        const auto name{expected.files.back().name};
+        const auto metadata_path{vault_path(directory, name.str() + ".json")};
+        auto metadata{boost::json::parse(read_text(metadata_path)).as_object()};
+        pbt::require(metadata.erase("encryption") == 1U,
+                     "oracle: the metadata of " + name.str() + " has an encryption record");
+        write_text(metadata_path, boost::json::serialize(metadata));
+        const auto old_size{read_file(vault_path(directory, name.str())).size()};
+        const auto data{tc.draw("appended", gs::binary({.min_size = 8U, .max_size = 32U}))};
+        pbt::note(tc, "encryption record removed from " + name.str() + ".json (" +
+                          std::to_string(old_size) + " bytes); the writer resumes it and appends " +
+                          std::to_string(data.size()) + " bytes");
+        std::string error;
+        try {
+          auto storage{make_storage(*config)};
+          std::ignore = storage->open_binlog(name);
+          storage->write_event(cspan(data), true, tc.draw("gtid", gtids()),
+                               util::ctime_timestamp{9}, 1U);
+          storage->close_binlog();
+        } catch (const std::exception &exception) {
+          error = exception.what();
+        }
+        if (!error.empty()) {
+          pbt::note(tc, "refused: " + error);
+          return;
+        }
+        const auto file{read_file(vault_path(directory, name.str()))};
+        pbt::require(file.size() >= old_size + data.size(),
+                     "oracle: the appended data is in " + name.str());
+        const bytes stored(file.begin() + static_cast<std::ptrdiff_t>(old_size),
+                           file.begin() + static_cast<std::ptrdiff_t>(old_size + data.size()));
+        pbt::require(stored != data,
+                     "with the encryption record removed from " + name.str() +
+                         ".json, the storage appended " + std::to_string(data.size()) +
+                         " bytes in plaintext to an encrypted storage without an error");
+      },
+      {.test_cases = 100U});
+}

@@ -239,6 +239,9 @@ walker (magic, sizes, log_pos, CRC32, GTID order).
 | D48 | `EditedStoredGtidsDoNotSkipTransactionsMySQL`: rewrite-mode storage of 2 - 6 transactions; 1 - 3 future GTIDs added to the newest binlog's added_gtids; the source commits them (+ 0 - 2): fetch refuses or stores every transaction of the source in the binlog files (Hrvoje's ticket 81, High) | ✅ (PBT-074) |
 | D49 | `storage_property_test::ReplacedKekBytesAreRefused`: encrypted storage with 1 - 2 binlogs; the keyring's bytes for the active KEK id replaced; the next binlog written: refused, or readable with the original keyring (Hrvoje's ticket 85, High) | ✅ (PBT-075) |
 | D50 | `RewriteFileSizeIsHonouredAcrossFetchesMySQL`: rewrite file_size 1K / 4K; 2 - 8 fetch runs of 1 - 2 transactions of 600 - 5000 bytes each: no transaction but a binlog's first starts at or beyond file_size; the storage holds the server's transactions (found in Jenkins #39) | ✅ (PBT-076) |
+| D51 | `storage_property_test::StrippedEncryptionRecordDoesNotTurnOffEncryption`: encrypted storage with 1 - 2 binlogs; the newest binlog's encryption record removed from its metadata; the writer resumes it and appends 8 - 32 bytes: refused, or not stored in plaintext (Hrvoje's ticket 62, High) | ✅ (PBT-077; first run pending) |
+| D52 | `ListenerLogIsNotForgeableMySQL`: a logged-in client sends a statement / a dump of a binlog name with a line feed / CR LF / lone CR + a forged log line, an ANSI escape, a NUL or 1 MiB of text: pull's log has no forged line, no raw CR / ESC / NUL, no line over 64 KiB (Hrvoje's ticket 92, High) | ✅ (PBT-078; first run pending) |
+| D53 | `GappedGtidsDoNotGrowStorageQuadraticallyMySQL`: 300 - 600 one-row transactions with GTIDs 1, 3, 5, ... (SET gtid_next) on one source binlog; a rewrite-mode storage with file_size 4K holds at most 4 x the source's bytes + 64 KiB (Hrvoje's ticket 88, High) | ✅ (PBT-079; first run pending) |
 | D9 | `PurgeOnServerMySQL`: `PURGE BINARY LOGS TO` before / after the storage got the binlogs; fetch succeeds exactly when the server still has what the storage needs (position: its newest binlog; GTID: gtid_purged covered; empty storage), else exits 1 leaving the storage unchanged | ✅ |
 
 GTID auto-positioning: the server starts a GTID dump at the newest binlog
@@ -269,8 +272,8 @@ there is authoritative):
 
 | Severity | Issues |
 |---|---|
-| high | PBT-015, PBT-022, PBT-040, PBT-058, PBT-060, PBT-065, PBT-066, PBT-067, PBT-069, PBT-073, PBT-074, PBT-075 |
-| medium | PBT-001, PBT-002, PBT-004, PBT-012, PBT-013, PBT-016, PBT-019, PBT-029, PBT-030, PBT-031, PBT-032, PBT-033, PBT-035, PBT-036, PBT-037, PBT-041, PBT-042, PBT-045, PBT-048, PBT-050, PBT-052, PBT-054, PBT-055, PBT-056, PBT-057, PBT-061, PBT-062, PBT-068, PBT-070, PBT-071, PBT-072, PBT-076 |
+| high | PBT-015, PBT-022, PBT-040, PBT-058, PBT-060, PBT-065, PBT-066, PBT-067, PBT-069, PBT-073, PBT-074, PBT-075, PBT-077, PBT-079 |
+| medium | PBT-001, PBT-002, PBT-004, PBT-012, PBT-013, PBT-016, PBT-019, PBT-029, PBT-030, PBT-031, PBT-032, PBT-033, PBT-035, PBT-036, PBT-037, PBT-041, PBT-042, PBT-045, PBT-048, PBT-050, PBT-052, PBT-054, PBT-055, PBT-056, PBT-057, PBT-061, PBT-062, PBT-068, PBT-070, PBT-071, PBT-072, PBT-076, PBT-078 |
 | fixed | PBT-043 (obsolete since 4717df9, PBS-80 / PBS-98), PBT-039 (upstream PBS-150, 0e45db5), PBT-051 (upstream PBS-120, 1659166), PBT-034 (upstream PBS-10), PBT-026 and PBT-038 (upstream PBS-59), PBT-025 (upstream PBS-29), PBT-024 (upstream PBS-29 part 3, 2d7dc80), PBT-046 and PBT-047 (upstream PBS-31 part 3, 6b0960f), PBT-017 and PBT-044 (upstream PBS-68 / PBS-112, dd136e5) |
 | low | PBT-003, PBT-005, PBT-006, PBT-007, PBT-008, PBT-009, PBT-010, PBT-011, PBT-014, PBT-018, PBT-020, PBT-021, PBT-023, PBT-027, PBT-028, PBT-049, PBT-053, PBT-059, PBT-063, PBT-064 |
 

@@ -9092,3 +9092,142 @@ BOOST_AUTO_TEST_CASE(RewriteFileSizeIsHonouredAcrossFetchesMySQL) {
       },
       {.test_cases = 15U, .slow = true});
 }
+
+// ---------------------------------------------------------------------------
+// D52: what a client of the listener can write into pull's log (Hrvoje's
+// ticket 92)
+// ---------------------------------------------------------------------------
+
+// A client logged in to the listener with the replication account sends a
+// statement (or asks for a binlog dump of a file name) carrying a line feed
+// / CR LF / lone CR followed by a forged PBS log line, an ANSI escape
+// sequence, a NUL byte, or 1 MiB of text. pull's log must not contain the
+// forged line as a line of its own, raw CR / ESC / NUL bytes, or a line of
+// more than 64 KiB. Hrvoje's ticket 92 (PBS-166, a regression of PBS-118 in
+// dd6b598): print_client_command() logs every command at info level with
+// the statement, the dump's binlog name and GTID set as they came - no
+// escaping, no length limit - so a client can forge log lines.
+BOOST_AUTO_TEST_CASE(ListenerLogIsNotForgeableMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        start_case(tc, server);
+        const auto options{draw_options(tc)};
+        pbt::note(tc, "binlog_server: " + describe(options));
+        const auto storage{make_storage(options)};
+        apply_all(tc, server.sql, {operation{.kind = op_kind::insert_rows, .count = 1}});
+        fetch(tc, *storage);
+        pull_process pull{tc, *storage};
+        pull.wait_until_listening();
+
+        const std::string forged{"[1999-01-01T00:00:00.000000] [  error] forged-by-a-client-pbt"};
+        const auto payload{tc.draw("payload", gs::sampled_from<std::string>(
+                                                  {"line feed", "CR LF", "lone CR", "ANSI escape",
+                                                   "NUL", "1 MiB"}))};
+        std::string text;
+        if (payload == "line feed") {
+          text = "\n" + forged;
+        } else if (payload == "CR LF") {
+          text = "\r\n" + forged;
+        } else if (payload == "lone CR") {
+          text = "\r" + forged;
+        } else if (payload == "ANSI escape") {
+          text = "\x1b[2K\x1b[1G" + forged;
+        } else if (payload == "NUL") {
+          text = std::string{"a"} + '\0' + "b";
+        } else {
+          text = std::string(1048576U, 'x');
+        }
+        const auto channel{tc.draw("channel", gs::sampled_from<std::string>(
+                                                  {"statement", "dump file name"}))};
+        std::string client_view;
+        if (channel == "statement") {
+          client_view = send_statement_to_listener("SELECT 1" + text);
+        } else {
+          const auto outcome{run_dump({.port = listener_port(), .file = "binlog" + text})};
+          client_view = outcome.error.empty() ? std::string{"dump ended"} : outcome.error;
+        }
+        pbt::note(tc, payload + " in a " + channel + ": " + client_view.substr(0U, 200U));
+        wait_ms(500U);
+        pull.require_running();
+        const auto log{read_file_if_exists(storage->log())};
+        pull.stop();
+
+        std::string problem;
+        std::istringstream lines{log};
+        for (std::string line; problem.empty() && std::getline(lines, line);) {
+          if (line.starts_with(forged.substr(0U, 30U))) {
+            problem = "a client forged a log line of its own: '" + line.substr(0U, 120U) + "'";
+          } else if (line.size() > 65536U) {
+            problem = "a log line of " + std::to_string(line.size()) + " bytes (client input logged whole)";
+          } else if (const auto at{line.find_first_of(std::string{"\r\x1b"} + '\0')};
+                     at != std::string::npos) {
+            problem = "a raw control byte " + std::to_string(static_cast<unsigned>(
+                                                  static_cast<unsigned char>(line[at]))) +
+                      " from a client in the log";
+          }
+        }
+        pbt::require(problem.empty(), "pull logged client input unescaped (" + payload + " in a " +
+                                          channel + "): " + problem);
+      },
+      {.test_cases = 15U, .slow = true});
+}
+
+// ---------------------------------------------------------------------------
+// D53: gapped GTIDs and the size of a rewrite-mode storage (Hrvoje's
+// ticket 88)
+// ---------------------------------------------------------------------------
+
+// The source commits 300 - 600 one-row transactions whose GTIDs skip every
+// second number (SET gtid_next = '<uuid>:1', ':3', ...), on a single source
+// binlog. A rewrite-mode storage with file_size 4K must stay in proportion
+// to what the source wrote: at most 4 x the source's binlog bytes + 64 KiB.
+// Hrvoje's ticket 88 (PBS-164): every binlog rewrite mode starts begins with
+// a PREVIOUS_GTIDS_LOG event of the storage's whole GTID set, and each gap
+// adds an interval; once that event alone exceeds file_size, every
+// transaction starts a new binlog carrying the whole set again - the storage
+// grows quadratically (6,000 gapped transactions: 362 MiB, then
+// std::bad_alloc at start).
+BOOST_AUTO_TEST_CASE(GappedGtidsDoNotGrowStorageQuadraticallyMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        start_case(tc, server);
+        server.sql.exec("SET GLOBAL max_binlog_size = 1073741824");
+        auto options{draw_options(tc, true)};
+        options.rewrite_file_size = "4K";
+        pbt::note(tc, "binlog_server: " + describe(options));
+        const auto storage{make_storage(options)};
+        const auto transactions{tc.draw("transactions", gs::integers<std::uint64_t>(
+                                                            {.min_value = 300U, .max_value = 600U}))};
+        const auto uuid{server.sql.scalar("SELECT @@GLOBAL.server_uuid")};
+        for (std::uint64_t i{0U}; i < transactions; ++i) {
+          server.sql.exec("SET gtid_next = '" + uuid + ":" + std::to_string(2U * i + 1U) + "'");
+          server.sql.exec("INSERT INTO pbt.t1 (v, b) VALUES (1, 'g')");
+          server.sql.exec("SET gtid_next = 'AUTOMATIC'");
+        }
+        fetch(tc, *storage);
+        std::uint64_t source_bytes{0U};
+        for (const auto &binlog : server_binlogs(server.sql)) {
+          source_bytes += binlog.size;
+        }
+        std::uint64_t stored_bytes{0U};
+        std::size_t stored_binlogs{0U};
+        const auto listing{list(tc, *storage)};
+        for (const auto &item : listing.at("result").as_array()) {
+          stored_bytes += item.at("size").to_number<std::uint64_t>();
+          ++stored_binlogs;
+        }
+        pbt::note(tc, std::to_string(transactions) + " gapped transactions: source " +
+                          std::to_string(source_bytes) + " bytes, storage " +
+                          std::to_string(stored_bytes) + " bytes in " +
+                          std::to_string(stored_binlogs) + " binlogs");
+        pbt::require(stored_bytes <= 4U * source_bytes + 65536U,
+                     "a rewrite-mode storage of " + std::to_string(transactions) +
+                         " gapped transactions holds " + std::to_string(stored_bytes) +
+                         " bytes in " + std::to_string(stored_binlogs) + " binlogs for " +
+                         std::to_string(source_bytes) + " source bytes (file_size 4K)");
+        require_storage_matches_server(tc, server.sql, server.info, *storage);
+      },
+      {.test_cases = 6U, .slow = true});
+}
