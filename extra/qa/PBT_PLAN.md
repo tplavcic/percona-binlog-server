@@ -269,9 +269,9 @@ there is authoritative):
 
 | Severity | Issues |
 |---|---|
-| high | PBT-015, PBT-022, PBT-039, PBT-040, PBT-043, PBT-058, PBT-060, PBT-065, PBT-066, PBT-067, PBT-069, PBT-073, PBT-074, PBT-075 |
+| high | PBT-015, PBT-022, PBT-040, PBT-058, PBT-060, PBT-065, PBT-066, PBT-067, PBT-069, PBT-073, PBT-074, PBT-075 |
 | medium | PBT-001, PBT-002, PBT-004, PBT-012, PBT-013, PBT-016, PBT-019, PBT-029, PBT-030, PBT-031, PBT-032, PBT-033, PBT-035, PBT-036, PBT-037, PBT-041, PBT-042, PBT-045, PBT-048, PBT-050, PBT-052, PBT-054, PBT-055, PBT-056, PBT-057, PBT-061, PBT-062, PBT-068, PBT-070, PBT-071, PBT-072, PBT-076 |
-| fixed | PBT-051 (upstream PBS-120, 1659166), PBT-034 (upstream PBS-10), PBT-026 and PBT-038 (upstream PBS-59), PBT-025 (upstream PBS-29), PBT-024 (upstream PBS-29 part 3, 2d7dc80), PBT-046 and PBT-047 (upstream PBS-31 part 3, 6b0960f), PBT-017 and PBT-044 (upstream PBS-68 / PBS-112, dd136e5) |
+| fixed | PBT-043 (obsolete since 4717df9, PBS-80 / PBS-98), PBT-039 (upstream PBS-150, 0e45db5), PBT-051 (upstream PBS-120, 1659166), PBT-034 (upstream PBS-10), PBT-026 and PBT-038 (upstream PBS-59), PBT-025 (upstream PBS-29), PBT-024 (upstream PBS-29 part 3, 2d7dc80), PBT-046 and PBT-047 (upstream PBS-31 part 3, 6b0960f), PBT-017 and PBT-044 (upstream PBS-68 / PBS-112, dd136e5) |
 | low | PBT-003, PBT-005, PBT-006, PBT-007, PBT-008, PBT-009, PBT-010, PBT-011, PBT-014, PBT-018, PBT-020, PBT-021, PBT-023, PBT-027, PBT-028, PBT-049, PBT-053, PBT-059, PBT-063, PBT-064 |
 
 ### GTID sets (prototype run)
@@ -884,6 +884,14 @@ Upstream 4717df9 (PBS-80, PBS-98) makes `<replication.rewrite>` mandatory in gti
 - D50 confirms PBT-076 (with file_size 1K a transaction starts at rw.000001:1040). D27 (`GtidDump*`) and `InterruptedPurgeIsRecoveredMySQL` pass their premises now; `GtidDumpAheadOfSourceIsRefusedMySQL` fails as PBT-052 in rewrite mode too.
 - New, test: `UnindexedObjectsFollowTheRulesMySQL` planted binlog.000004 next to rw.* binlogs (a foreign name, correctly refused). It now names the planted objects with the storage's own base name.
 - Regression reported for PBT-044 (`ListenerSurvivesInvalidDumpRequestsMySQL`) is not PBT-044: pull exited at its first start with "bind: Address already in use" on the listener port (something already listened there). `listener_port()` now picks, once per process, a pid-derived port that nothing listens on (and the next one, for D18), and the binaries are started with PR_SET_PDEATHSIG(SIGKILL) so that none outlives a killed test process.
+
+### Jenkins run #41 (asan_gcc14-ubsan, PS 8.4.10-10, 329c656 on upstream 0e45db5)
+
+233 properties, 164 passed, 69 failed: 69 known, 0 new, 0 regressions; possibly fixed PBT-040, PBT-043 (3 properties), PBT-069 (failover row), PBT-035, PBT-062, PBT-050.
+
+- The #40 test fixes hold (listener port, PR_SET_PDEATHSIG, UnindexedObjects base name).
+- PBT-043 / 050 / 062 / 035 possibly fixed for the third run in a row: their GTID-without-rewrite sequences no longer exist; PBT-020 (magic-only binlog) still occurs in position mode, so they stay open for now.
+- Closed after the run (2026-11-24, user decision): PBT-043 as obsolete (all three rows; GTID mode without rewrite no longer exists), and the GTID-only row of PBT-062 (`DiskFullLeavesStorageConsistentMySQL`). PBT-062 itself stays open: the storage-level `CrashWhileCreatingLaterBinlogIsRecovered` still fails. PBT-050 stays open: only its `IdleDumpSendsHeartbeatsMySQL` row passed, the main property `HeartbeatsContinueAfterRotationMySQL` still fails.
 
 ## 6. Open questions
 
