@@ -9994,3 +9994,446 @@ BOOST_AUTO_TEST_CASE(UnverifiedSourceIsRefusedByDefaultMySQL) {
       },
       {.test_cases = 6U, .slow = true});
 }
+
+// ---------------------------------------------------------------------------
+// D58 - D60: binlog names chosen by the source (Hrvoje's tickets 59, 69, 70)
+// ---------------------------------------------------------------------------
+
+// In position mode 'fetch' / 'pull' name the stored binlogs after the
+// ROTATE events the source sends. A proxy between PBS and the source (TLS
+// off, as a man in the middle on an unverified connection - PBT-082 - or a
+// compromised source) rewrites the binlog name of the ROTATE events that
+// announce the source's next binlog (the closing one at the end of the
+// current binlog and the artificial one that starts the next), fixing the
+// event size, its log_pos, the CRC32 footer and the packet length. Each
+// case: fetch stores the source's binlogs directly and the stored files are
+// recorded; the source runs FLUSH BINARY LOGS and commits; fetch resumes
+// through the proxy. Whatever that fetch does (it may refuse the name):
+//  - every binlog stored before keeps its data (it may only grow at its
+//    end), metadata.json is unchanged, binlog.index only grows;
+//  - every stored binlog holds at most one FORMAT_DESCRIPTION event;
+//  - the storage still opens ('list'), lists no name with a control
+//    character, and a direct fetch afterwards does not refuse the storage
+//    itself (it may fail because the source has no binlog of a fake name).
+// D58 (ticket 59, PBS-131): names with a NUL byte (the C file API stops
+// there: 'binlog.000001\0.N', 'metadata.json\0.N', 'binlog.index\0.N'),
+// a line feed ('binlog.000077\nbinlog.N'), a base name '..' or of 3000
+// bytes. D59 (ticket 69, PBS-144): the current binlog announced again (its
+// own name), which appends a second preamble to it. D60 (ticket 70,
+// PBS-158): a lower sequence number ('binlog.000002') for a storage that
+// starts after the source purged its first binlogs, which the next start
+// takes for the leftover of a purge.
+
+namespace {
+
+constexpr std::uint8_t renamed_rotate_event{4U};
+
+// the name as text for a message: NUL / line feed / other control bytes
+// spelled out, long names shortened
+std::string printable_name(const std::string &name) {
+  std::string result;
+  for (const char c : name) {
+    const auto byte{static_cast<unsigned char>(c)};
+    if (byte == 0U) {
+      result += "\\0";
+    } else if (byte == '\n') {
+      result += "\\n";
+    } else if (byte < 0x20U || byte >= 0x7FU) {
+      result += "\\x" + std::string{"0123456789abcdef"[byte >> 4U]} +
+                std::string{"0123456789abcdef"[byte & 0x0FU]};
+    } else {
+      result += c;
+    }
+  }
+  return result.size() > 80U ? result.substr(0U, 40U) + "...(" + std::to_string(name.size()) +
+                                   " bytes)..." + result.substr(result.size() - 20U)
+                             : result;
+}
+
+// the ROTATE events (in a dump packet) that name 'from' name 'to' instead:
+// event size, log_pos (when not 0), CRC32 footer (when the stream has one)
+// fixed; counts the events it rewrote
+class rotate_renamer {
+public:
+  rotate_renamer(std::string from, std::string to) : from_{std::move(from)}, to_{std::move(to)} {}
+
+  std::string operator()(const std::string &payload) {
+    constexpr std::size_t name_at{1U + 19U + 8U};
+    if (payload.size() < name_at || payload[0] != '\0' ||
+        static_cast<std::uint8_t>(payload[5]) != renamed_rotate_event) {
+      return payload;
+    }
+    const bool crc{packet_crc32_ok(payload) && payload.size() >= name_at + 4U};
+    const std::size_t footer{crc ? 4U : 0U};
+    if (payload.substr(name_at, payload.size() - name_at - footer) != from_) {
+      return payload;
+    }
+    std::string result{payload.substr(0U, name_at) + to_ + std::string(footer, '\0')};
+    const auto old_size{static_cast<std::uint32_t>(payload.size() - 1U)};
+    const auto new_size{static_cast<std::uint32_t>(result.size() - 1U)};
+    put_le32(result, 1U + 9U, new_size);
+    if (const auto log_pos{le32(result, 1U + 13U)}; log_pos != 0U) {
+      put_le32(result, 1U + 13U, log_pos - old_size + new_size);
+    }
+    if (crc) {
+      put_le32(result, result.size() - 4U, packet_crc32(result));
+    }
+    ++renamed_;
+    return result;
+  }
+
+  [[nodiscard]] std::size_t renamed() const { return renamed_; }
+
+private:
+  std::string from_;
+  std::string to_;
+  std::atomic<std::size_t> renamed_{0U};
+};
+
+// a TCP proxy in front of the MySQL server that passes everything through,
+// except the events of a binlog dump, which the renamer may rewrite (one
+// packet in, one out)
+class binlog_dump_proxy {
+public:
+  explicit binlog_dump_proxy(std::shared_ptr<rotate_renamer> rewrite)
+      : rewrite_{std::move(rewrite)} {
+    listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd_ < 0) {
+      throw std::runtime_error{"dump proxy: socket failed"};
+    }
+    const int reuse{1};
+    ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof reuse);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = 0;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    // NOLINTBEGIN(cppcoreguidelines-pro-type-reinterpret-cast)
+    if (::bind(listen_fd_, reinterpret_cast<sockaddr *>(&address), sizeof address) != 0 ||
+        ::listen(listen_fd_, 16) != 0) {
+      ::close(listen_fd_);
+      throw std::runtime_error{"dump proxy: bind / listen failed"};
+    }
+    socklen_t length{sizeof address};
+    ::getsockname(listen_fd_, reinterpret_cast<sockaddr *>(&address), &length);
+    // NOLINTEND(cppcoreguidelines-pro-type-reinterpret-cast)
+    port_ = ntohs(address.sin_port);
+    acceptor_ = std::thread{[this]() { accept_loop(); }};
+  }
+  binlog_dump_proxy(const binlog_dump_proxy &) = delete;
+  binlog_dump_proxy &operator=(const binlog_dump_proxy &) = delete;
+  binlog_dump_proxy(binlog_dump_proxy &&) = delete;
+  binlog_dump_proxy &operator=(binlog_dump_proxy &&) = delete;
+  ~binlog_dump_proxy() {
+    stop_ = true;
+    acceptor_.join();
+    std::vector<std::thread> connections;
+    {
+      const std::scoped_lock lock{mutex_};
+      connections.swap(connections_);
+    }
+    for (auto &connection : connections) {
+      connection.join();
+    }
+    ::close(listen_fd_);
+  }
+
+  [[nodiscard]] std::uint16_t port() const noexcept { return port_; }
+
+private:
+  void accept_loop() {
+    while (!stop_) {
+      pollfd waiting{.fd = listen_fd_, .events = POLLIN, .revents = 0};
+      if (::poll(&waiting, 1, 50) <= 0) {
+        continue;
+      }
+      const int client{::accept(listen_fd_, nullptr, nullptr)};
+      if (client < 0) {
+        continue;
+      }
+      const std::scoped_lock lock{mutex_};
+      connections_.emplace_back([this, client]() { serve(client); });
+    }
+  }
+
+  static bool write_all(int fd, const std::string &data) {
+    std::size_t written{0U};
+    while (written < data.size()) {
+      const auto result{::write(fd, data.data() + written, data.size() - written)};
+      if (result <= 0) {
+        return false;
+      }
+      written += static_cast<std::size_t>(result);
+    }
+    return true;
+  }
+
+  void serve(int client) {
+    const int upstream{::socket(AF_INET, SOCK_STREAM, 0)};
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(static_cast<std::uint16_t>(settings().port));
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    if (upstream < 0 || ::connect(upstream, reinterpret_cast<sockaddr *>(&address),
+                                  sizeof address) != 0) {
+      ::close(client);
+      if (upstream >= 0) {
+        ::close(upstream);
+      }
+      return;
+    }
+    bool dumping{false};
+    bool continuation{false};
+    std::array<std::string, 2> incoming;
+    std::array<char, 65536> buffer{};
+    std::array<pollfd, 2> fds{pollfd{.fd = client, .events = POLLIN, .revents = 0},
+                              pollfd{.fd = upstream, .events = POLLIN, .revents = 0}};
+    bool open{true};
+    while (!stop_ && open) {
+      if (::poll(fds.data(), fds.size(), 50) <= 0) {
+        continue;
+      }
+      for (std::size_t i{0U}; i < fds.size() && open; ++i) {
+        if ((fds[i].revents & (POLLIN | POLLHUP | POLLERR)) == 0) {
+          continue;
+        }
+        const auto count{::read(fds[i].fd, buffer.data(), buffer.size())};
+        if (count <= 0) {
+          open = false;
+          break;
+        }
+        auto &bytes{incoming[i]};
+        bytes.append(buffer.data(), static_cast<std::size_t>(count));
+        while (open && bytes.size() >= 4U) {
+          const std::size_t length{std::size_t{static_cast<std::uint8_t>(bytes[0])} |
+                                   (std::size_t{static_cast<std::uint8_t>(bytes[1])} << 8U) |
+                                   (std::size_t{static_cast<std::uint8_t>(bytes[2])} << 16U)};
+          if (bytes.size() < 4U + length) {
+            break;
+          }
+          auto packet{bytes.substr(0U, 4U + length)};
+          bytes.erase(0U, 4U + length);
+          if (i == 0U) {
+            // COM_BINLOG_DUMP / COM_BINLOG_DUMP_GTID: the answers are the dump
+            if (packet.size() > 4U && packet[3] == '\0' &&
+                (packet[4] == '\x12' || packet[4] == '\x1e')) {
+              dumping = true;
+            }
+            open = write_all(upstream, packet);
+            continue;
+          }
+          if (dumping && !continuation && length != 0xFFFFFFU) {
+            // one packet in, one out: the sequence number stays
+            const auto payload{(*rewrite_)(packet.substr(4U))};
+            packet.resize(4U);
+            packet[0] = static_cast<char>(payload.size() & 0xFFU);
+            packet[1] = static_cast<char>((payload.size() >> 8U) & 0xFFU);
+            packet[2] = static_cast<char>((payload.size() >> 16U) & 0xFFU);
+            packet += payload;
+          }
+          continuation = dumping && length == 0xFFFFFFU;
+          open = write_all(client, packet);
+        }
+      }
+    }
+    ::shutdown(client, SHUT_WR);
+    ::close(client);
+    ::close(upstream);
+  }
+
+  std::shared_ptr<rotate_renamer> rewrite_;
+  std::uint16_t port_{};
+  int listen_fd_{-1};
+  std::atomic<bool> stop_{false};
+  std::thread acceptor_;
+  std::mutex mutex_;
+  std::vector<std::thread> connections_;
+};
+
+} // namespace
+
+namespace {
+
+// the FORMAT_DESCRIPTION events of a stored (plain) binlog, walked by the
+// event sizes only
+std::size_t format_descriptions(const std::string &data) {
+  std::size_t count{0U};
+  std::size_t offset{4U};
+  while (offset + 19U <= data.size()) {
+    const auto size{le32(data, offset + 9U)};
+    if (static_cast<std::uint8_t>(data[offset + 4U]) == format_description_event) {
+      ++count;
+    }
+    if (size < 19U) {
+      break;
+    }
+    offset += size;
+  }
+  return count;
+}
+
+bool is_binlog_data_name(const std::string &name) {
+  const auto dot{name.rfind('.')};
+  return dot != std::string::npos && name.size() - dot == 7U &&
+         std::all_of(name.begin() + static_cast<std::ptrdiff_t>(dot) + 1, name.end(),
+                     [](char c) { return c >= '0' && c <= '9'; });
+}
+
+std::map<std::string, std::string> storage_files(const pbs_storage &storage) {
+  std::map<std::string, std::string> result;
+  for (const auto &entry : fs::directory_iterator{storage.vault()}) {
+    if (entry.is_regular_file()) {
+      result[entry.path().filename().string()] = read_file(entry.path());
+    }
+  }
+  return result;
+}
+
+void hostile_binlog_name_case(hegel::TestCase &tc, const std::vector<std::string> &attacks) {
+  server_session server;
+  start_case(tc, server);
+  const auto attack{tc.draw("attack", gs::sampled_from(attacks))};
+  auto options{draw_options(tc, false)};
+  options.encryption.reset();
+  pbt::note(tc, "binlog_server: " + describe(options));
+  const auto storage{make_storage(options)};
+  const auto insert{[&server]() {
+    server.sql.exec("INSERT INTO pbt.t1 (v, b) VALUES (1, 'hostile-name')");
+  }};
+  if (attack == "lower_sequence") {
+    // a storage that starts after the source purged its first binlogs
+    for (int i{0}; i < 4; ++i) {
+      insert();
+      server.sql.exec("FLUSH BINARY LOGS");
+    }
+    insert();
+    const auto current{server_binlogs(server.sql).back().name};
+    server.sql.exec("PURGE BINARY LOGS TO '" + current + "'");
+    pbt::note(tc, "the source purged its binlogs before " + current);
+  } else {
+    pbt::note(tc, "workload:");
+    apply_all(tc, server.sql, draw_workload(tc, server.info, 3U));
+    insert();
+  }
+  fetch(tc, *storage);
+  const auto before{storage_files(*storage)};
+  const auto stored_names{listed_names(tc, *storage)};
+  const auto current{server_binlogs(server.sql).back().name};
+  server.sql.exec("FLUSH BINARY LOGS");
+  const auto next{server_binlogs(server.sql).back().name};
+  insert();
+  insert();
+  const auto suffix{next.substr(next.rfind('.'))};
+  std::string hostile;
+  if (attack == "nul_existing_binlog") {
+    hostile = stored_names.front() + '\0' + suffix;
+  } else if (attack == "nul_metadata") {
+    hostile = std::string{"metadata.json"} + '\0' + suffix;
+  } else if (attack == "nul_index") {
+    hostile = std::string{"binlog.index"} + '\0' + suffix;
+  } else if (attack == "newline") {
+    hostile = "binlog.000077\nbinlog" + suffix;
+  } else if (attack == "dot_dot") {
+    hostile = ".." + suffix;
+  } else if (attack == "long_name") {
+    hostile = std::string(3000U, 'b') + suffix;
+  } else if (attack == "reannounce") {
+    hostile = current;
+  } else {
+    hostile = "binlog.000002";
+  }
+  pbt::note(tc, "the source rotates from " + current + " to " + next +
+                    "; the proxy names that binlog '" + printable_name(hostile) + "' (" +
+                    attack + ")");
+  auto renamer{std::make_shared<rotate_renamer>(next, hostile)};
+  binlog_dump_proxy proxy{renamer};
+  const auto proxied{cut_proxy_config(*storage, proxy.port())};
+  background_run attacked{{"fetch", proxied}};
+  const auto [result, in_time]{attacked.wait_for(std::chrono::seconds{60})};
+  pbt::note(tc, "fetch through the proxy: " +
+                    (in_time ? result.describe() : std::string{"killed after 60 s"}) + ", " +
+                    std::to_string(renamer->renamed()) + " ROTATE event(s) renamed");
+  pbt::require(in_time, "fetch through the proxy did not end within 60 s");
+  pbt::require(!result.signaled, "fetch crashed on the binlog name '" + printable_name(hostile) +
+                                     "' (" + result.describe() + ")");
+  pbt::require(renamer->renamed() > 0U, "the dump through the proxy announced no " + next);
+
+  const auto after{storage_files(*storage)};
+  pbt::note(tc, "storage after: " + joined(vault_objects(*storage)));
+  const std::string named{"after the source named its next binlog '" + printable_name(hostile) +
+                          "' (" + attack + ")"};
+  for (const auto &[name, content] : before) {
+    const auto found{after.find(name)};
+    pbt::require(found != after.end(), named + ": " + name + " is gone from the storage");
+    const auto &now{found->second};
+    if (name == "metadata.json") {
+      pbt::require(now == content, named + ": metadata.json was changed");
+    } else if (is_binlog_data_name(name) || name == "binlog.index") {
+      pbt::require(now.size() >= content.size() && now.starts_with(content),
+                   named + ": " + name + " lost its data (" + std::to_string(content.size()) +
+                       " bytes before, " + std::to_string(now.size()) +
+                       " now, the old content no longer its prefix)");
+    }
+  }
+  for (const auto &[name, content] : after) {
+    if (is_binlog_data_name(name)) {
+      const auto count{format_descriptions(content)};
+      pbt::require(count <= 1U, named + ": " + name + " holds " + std::to_string(count) +
+                                    " FORMAT_DESCRIPTION events (a second preamble appended)");
+    }
+  }
+  const auto listed{run({"list", storage->config_path})};
+  pbt::require(!listed.signaled && listed.exit_code == 0,
+               named + ": the storage no longer opens (list: " + listed.describe() + ": " +
+                   listed.output.substr(0U, 300U) + ")");
+  for (const auto &name : listed_names(tc, *storage)) {
+    pbt::require(std::ranges::none_of(name, [](char c) {
+                   return static_cast<unsigned char>(c) < 0x20U;
+                 }),
+                 named + ": the storage lists a binlog named '" + printable_name(name) + "'");
+  }
+  // the source has no binlog of a fake name, so the next fetch may fail
+  // for that reason, but not because the storage itself is refused
+  const auto log_before{read_file_if_exists(storage->log()).size()};
+  const auto direct{run({"fetch", storage->config_path})};
+  const auto whole_log{read_file_if_exists(storage->log())};
+  const auto log{whole_log.size() >= log_before ? whole_log.substr(log_before) : whole_log};
+  pbt::note(tc, "fetch from the source directly: " + direct.describe());
+  if (direct.exit_code != 0) {
+    pbt::note(tc, "binlog_server log:" + log_tail(*storage, 8U));
+  }
+  for (const std::string_view refusal :
+       {"binlog index contains", "storage is not empty", "non-existing object"}) {
+    const auto at{log.rfind(refusal)};
+    pbt::require(direct.exit_code == 0 || at == std::string::npos,
+                 named + ": the next fetch refuses the storage (" +
+                     log.substr(at == std::string::npos ? 0U : at, 160U) + ")");
+  }
+}
+
+} // namespace
+
+// D58: names with a NUL byte, a line feed, a base name '..' or 3000 bytes
+// long (Hrvoje's ticket 59)
+BOOST_AUTO_TEST_CASE(SourceBinlogNamesDoNotTouchOtherFilesMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        hostile_binlog_name_case(tc, {"nul_existing_binlog", "nul_metadata", "nul_index",
+                                      "newline", "dot_dot", "long_name"});
+      },
+      {.test_cases = 18U, .slow = true});
+}
+
+// D59: the current binlog announced again after its closing ROTATE
+// (Hrvoje's ticket 69)
+BOOST_AUTO_TEST_CASE(ReannouncedBinlogGetsNoSecondPreambleMySQL) {
+  pbt::check([](hegel::TestCase &tc) { hostile_binlog_name_case(tc, {"reannounce"}); },
+             {.test_cases = 8U, .slow = true});
+}
+
+// D60: a lower sequence number for a storage that does not start at
+// .000001 (Hrvoje's ticket 70)
+BOOST_AUTO_TEST_CASE(LowerBinlogSequenceKeepsStorageOpenMySQL) {
+  pbt::check([](hegel::TestCase &tc) { hostile_binlog_name_case(tc, {"lower_sequence"}); },
+             {.test_cases = 8U, .slow = true});
+}

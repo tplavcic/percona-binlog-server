@@ -246,6 +246,9 @@ walker (magic, sizes, log_pos, CRC32, GTID order).
 | D55 | `LoweredTransactionLengthIsNotStoredMySQL`: the same proxy lowers the transaction's `transaction_length` (CRC32 fixed) to end after one of those events or 1 byte before its true end; the rest is sent, or the dump ends / closes, or the rest of the transaction is left out; the same checks (Hrvoje's ticket 82, High) | ✅ (PBT-080) |
 | D56 | `CollectorMemoryDoesNotGrowWithDataMySQL`: the source writes 256 / 384 MiB into one binlog (1 MiB transactions, or one transaction of 1 MiB rows); a fetch of it (no checkpoint settings, checkpoint_size 1M or checkpoint_interval 1s; rewrite file_size 1G) uses at most 96 MiB more peak RSS (VmHWM) than a fetch of one 1 MiB transaction, with ASan's quarantine at 1 MiB; the storage then matches the server (Hrvoje's ticket 87, High) | ✅ (PBT-081) |
 | D57 | `UnverifiedSourceIsRefusedByDefaultMySQL`: without an `ssl` section, fetch refuses a source whose identity it has not verified: a certificate of the (untrusted) test CA for 127.0.0.1 or for another name, or no TLS at all (Hrvoje's ticket 60, High). When PBS-134 is fixed, D22's model of the default (preferred) changes with it | ✅ (PBT-082) |
+| D58 | `SourceBinlogNamesDoNotTouchOtherFilesMySQL`: position mode; a proxy between PBS and the source (TLS off) renames the source's next binlog in its ROTATE events (size, log_pos, CRC32 fixed) to 'binlog.000001\0.N', 'metadata.json\0.N', 'binlog.index\0.N', 'binlog.000077\nbinlog.N', '...N' or a 3000-byte base name; whatever the fetch through the proxy does, every binlog stored before keeps its data, metadata.json is unchanged, binlog.index only grows, no binlog holds two FORMAT_DESCRIPTION events, the storage still opens and lists no name with a control character, and a direct fetch afterwards does not refuse the storage (Hrvoje's ticket 59, High) | ✅ (PBT-083) |
+| D59 | `ReannouncedBinlogGetsNoSecondPreambleMySQL`: the same, the next binlog renamed to the current one (Hrvoje's ticket 69, Medium) | ✅ (PBT-084) |
+| D60 | `LowerBinlogSequenceKeepsStorageOpenMySQL`: the same for a storage that starts after the source purged its first binlogs, the next binlog renamed to 'binlog.000002' (Hrvoje's ticket 70, Low) | ✅ (PBT-085) |
 | D9 | `PurgeOnServerMySQL`: `PURGE BINARY LOGS TO` before / after the storage got the binlogs; fetch succeeds exactly when the server still has what the storage needs (position: its newest binlog; GTID: gtid_purged covered; empty storage), else exits 1 leaving the storage unchanged | ✅ |
 
 GTID auto-positioning: the server starts a GTID dump at the newest binlog
@@ -276,10 +279,10 @@ there is authoritative):
 
 | Severity | Issues |
 |---|---|
-| high | PBT-015, PBT-022, PBT-040, PBT-058, PBT-060, PBT-065, PBT-066, PBT-067, PBT-069, PBT-073, PBT-074, PBT-075, PBT-077, PBT-079, PBT-080, PBT-081, PBT-082 |
-| medium | PBT-001, PBT-002, PBT-004, PBT-012, PBT-013, PBT-016, PBT-019, PBT-029, PBT-030, PBT-031, PBT-032, PBT-033, PBT-035, PBT-036, PBT-037, PBT-041, PBT-042, PBT-045, PBT-048, PBT-050, PBT-052, PBT-054, PBT-055, PBT-056, PBT-057, PBT-061, PBT-062, PBT-068, PBT-070, PBT-071, PBT-072, PBT-076, PBT-078 |
+| high | PBT-015, PBT-022, PBT-040, PBT-058, PBT-060, PBT-065, PBT-066, PBT-067, PBT-069, PBT-073, PBT-074, PBT-075, PBT-077, PBT-079, PBT-080, PBT-081, PBT-082, PBT-083 |
+| medium | PBT-001, PBT-002, PBT-004, PBT-012, PBT-013, PBT-016, PBT-019, PBT-029, PBT-030, PBT-031, PBT-032, PBT-033, PBT-035, PBT-036, PBT-037, PBT-041, PBT-042, PBT-045, PBT-048, PBT-050, PBT-052, PBT-054, PBT-055, PBT-056, PBT-057, PBT-061, PBT-062, PBT-068, PBT-070, PBT-071, PBT-072, PBT-076, PBT-078, PBT-084 |
 | fixed | PBT-043 (obsolete since 4717df9, PBS-80 / PBS-98), PBT-039 (upstream PBS-150, 0e45db5), PBT-051 (upstream PBS-120, 1659166), PBT-034 (upstream PBS-10), PBT-026 and PBT-038 (upstream PBS-59), PBT-025 (upstream PBS-29), PBT-024 (upstream PBS-29 part 3, 2d7dc80), PBT-046 and PBT-047 (upstream PBS-31 part 3, 6b0960f), PBT-017 and PBT-044 (upstream PBS-68 / PBS-112, dd136e5) |
-| low | PBT-003, PBT-005, PBT-006, PBT-007, PBT-008, PBT-009, PBT-010, PBT-011, PBT-014, PBT-018, PBT-020, PBT-021, PBT-023, PBT-027, PBT-028, PBT-049, PBT-053, PBT-059, PBT-063, PBT-064 |
+| low | PBT-003, PBT-005, PBT-006, PBT-007, PBT-008, PBT-009, PBT-010, PBT-011, PBT-014, PBT-018, PBT-020, PBT-021, PBT-023, PBT-027, PBT-028, PBT-049, PBT-053, PBT-059, PBT-063, PBT-064, PBT-085 |
 
 ### GTID sets (prototype run)
 
