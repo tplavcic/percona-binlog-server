@@ -9790,3 +9790,202 @@ BOOST_AUTO_TEST_CASE(LoweredTransactionLengthIsNotStoredMySQL) {
   pbt::check([](hegel::TestCase &tc) { cut_transaction_case(tc, true); },
              {.test_cases = 20U, .slow = true});
 }
+
+// ---------------------------------------------------------------------------
+// D56: the collector's memory and the size of what it collects (Hrvoje's
+// ticket 87)
+// ---------------------------------------------------------------------------
+
+// The source writes 256 or 384 MiB into one binlog (max_binlog_size 1G;
+// rewrite mode: file_size 1G), as 1 MiB transactions or as one transaction
+// of 1 MiB rows. A fetch of it may use at most 96 MiB more memory (peak
+// resident set size, /proc/<pid>/status VmHWM sampled every 10 ms) than a
+// fetch of a single 1 MiB transaction into the same storage, with any
+// checkpoint setting (none, checkpoint_size 1M, checkpoint_interval 1s);
+// the storage then matches the server. Sanitizer builds keep freed memory
+// in a quarantine (256 MiB by default for ASan): the runs get a 1 MiB one.
+// Hrvoje's ticket 87 (PBS-163): storage::write_event() keeps everything
+// since the last checkpoint in event_buffer_, and an unfinished transaction
+// always - without checkpoint settings a whole binlog, and a transaction
+// that never ends without limit, until std::bad_alloc.
+
+namespace {
+
+// the environment variable 'name' set to 'value' for the processes started
+// while this object lives
+class scoped_environment {
+public:
+  scoped_environment(std::string name, const std::string &value) : name_{std::move(name)} {
+    if (const char *old{std::getenv(name_.c_str())}; old != nullptr) {
+      old_ = old;
+    }
+    ::setenv(name_.c_str(), value.c_str(), 1);
+  }
+  scoped_environment(const scoped_environment &) = delete;
+  scoped_environment &operator=(const scoped_environment &) = delete;
+  scoped_environment(scoped_environment &&) = delete;
+  scoped_environment &operator=(scoped_environment &&) = delete;
+  ~scoped_environment() {
+    if (old_) {
+      ::setenv(name_.c_str(), old_->c_str(), 1);
+    } else {
+      ::unsetenv(name_.c_str());
+    }
+  }
+
+private:
+  std::string name_;
+  std::optional<std::string> old_;
+};
+
+// the peak resident set size of a running process in KiB (0: gone)
+std::uint64_t peak_rss_kib(pid_t pid) {
+  std::ifstream status{"/proc/" + std::to_string(pid) + "/status"};
+  for (std::string line; std::getline(status, line);) {
+    if (line.starts_with("VmHWM:")) {
+      return std::stoull(line.substr(6U));
+    }
+  }
+  return 0U;
+}
+
+struct measured_run {
+  run_result result;
+  bool in_time{};
+  std::uint64_t peak_kib{};
+};
+
+measured_run run_measured(const std::vector<std::string> &arguments,
+                          std::chrono::seconds timeout) {
+  background_run process{arguments};
+  std::uint64_t peak{0U};
+  const auto deadline{std::chrono::steady_clock::now() + timeout};
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (const auto result{process.poll()}; result) {
+      return {*result, true, peak};
+    }
+    peak = std::max(peak, peak_rss_kib(process.pid()));
+    wait_ms(10U);
+  }
+  const auto [result, in_time]{process.wait_for(std::chrono::milliseconds{0})};
+  return {result, in_time, peak};
+}
+
+} // namespace
+
+BOOST_AUTO_TEST_CASE(CollectorMemoryDoesNotGrowWithDataMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        start_case(tc, server);
+        server.sql.exec("SET GLOBAL max_binlog_size = 1073741824");
+        auto options{draw_options(tc)};
+        options.checkpoint_size.reset();
+        options.checkpoint_interval.reset();
+        const auto checkpointing{tc.draw(
+            "checkpointing", gs::sampled_from<std::string>(
+                                 {"no checkpoint settings", "checkpoint_size 1M",
+                                  "checkpoint_interval 1s"}))};
+        if (checkpointing == "checkpoint_size 1M") {
+          options.checkpoint_size = "1M";
+        } else if (checkpointing == "checkpoint_interval 1s") {
+          options.checkpoint_interval = "1s";
+        }
+        if (options.gtid_mode) {
+          // a rotation also writes the buffer: one stored binlog
+          options.rewrite_file_size = "1G";
+        }
+        const auto mib{tc.draw("source_mib", gs::sampled_from<std::uint64_t>({256U, 384U}))};
+        const bool one_transaction{tc.draw("one_transaction", gs::booleans())};
+        const std::string shape{one_transaction ? "one transaction of " + std::to_string(mib) +
+                                                      " 1 MiB rows"
+                                                : std::to_string(mib) + " transactions of 1 MiB"};
+        pbt::note(tc, "binlog_server: " + describe(options) + "; source: " + shape);
+        const auto storage{make_storage(options)};
+        const std::string row{"INSERT INTO pbt.t1 (v, b) VALUES (1, REPEAT('m', 1048576))"};
+        server.sql.exec(row);
+        const char *asan_now{std::getenv("ASAN_OPTIONS")};
+        const scoped_environment small_quarantine{
+            "ASAN_OPTIONS", std::string{asan_now != nullptr ? asan_now : ""} +
+                                ":quarantine_size_mb=1:thread_local_quarantine_size_kb=64"};
+        const auto baseline{run_measured({"fetch", storage->config_path}, std::chrono::seconds{120})};
+        pbt::require(baseline.in_time && !baseline.result.signaled && baseline.result.exit_code == 0,
+                     "fetch of one 1 MiB transaction failed (" + baseline.result.describe() + ")");
+        if (one_transaction) {
+          server.sql.exec("BEGIN");
+        }
+        for (std::uint64_t i{0U}; i < mib; ++i) {
+          server.sql.exec(row);
+        }
+        if (one_transaction) {
+          server.sql.exec("COMMIT");
+        }
+        const auto measured{run_measured({"fetch", storage->config_path}, std::chrono::seconds{900})};
+        const auto growth_mib{
+            (measured.peak_kib > baseline.peak_kib ? measured.peak_kib - baseline.peak_kib : 0U) /
+            1024U};
+        pbt::note(tc, "peak RSS: " + std::to_string(baseline.peak_kib / 1024U) +
+                          " MiB fetching 1 MiB, " + std::to_string(measured.peak_kib / 1024U) +
+                          " MiB fetching " + std::to_string(mib) + " MiB more (" +
+                          measured.result.describe() + ")");
+        if (!measured.in_time || measured.result.signaled || measured.result.exit_code != 0) {
+          pbt::note(tc, "binlog_server log:" + log_tail(*storage));
+        }
+        pbt::require(measured.in_time, "fetch of " + std::to_string(mib) + " MiB did not end in 900 s");
+        pbt::require(!measured.result.signaled && measured.result.exit_code == 0,
+                     "fetch of " + std::to_string(mib) + " MiB failed (" +
+                         measured.result.describe() + ")");
+        pbt::require(growth_mib <= 96U,
+                     "fetch of " + shape + " (" + checkpointing + ") used " +
+                         std::to_string(growth_mib) +
+                         " MiB more memory than a fetch of one 1 MiB transaction (bound 96 MiB)");
+        require_storage_matches_server(tc, server.sql, server.info, *storage);
+      },
+      {.test_cases = 6U, .slow = true});
+}
+
+// ---------------------------------------------------------------------------
+// D57: the default connection to the source (Hrvoje's ticket 60)
+// ---------------------------------------------------------------------------
+
+// Without an 'ssl' section PBS connects like the MySQL client with
+// --ssl-mode=PREFERRED: TLS when the server offers it, any certificate
+// accepted, and plaintext when it does not (or a man in the middle strips
+// CLIENT_SSL from the greeting). Hrvoje's ticket 60 (PBS-134): by default a
+// man in the middle captures the replication password (caching_sha2_password
+// full authentication over its own TLS) and can rewrite the binlog stream
+// (PBT-080, PBT-079, ...). The property states the secure default: without
+// an 'ssl' section, fetch does not replicate from a source whose identity
+// it has not verified. The source shows what a man in the middle would: a
+// certificate of the test CA (which PBS has not been told to trust) for
+// 127.0.0.1 or for another name, or no TLS at all. A fix that only makes
+// the default 'required' still fails the certificate cases.
+// When PBS-134 is fixed, D22's model of "no 'ssl' section" (preferred)
+// changes with it.
+BOOST_AUTO_TEST_CASE(UnverifiedSourceIsRefusedByDefaultMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        start_case(tc, server);
+        const auto kind{static_cast<server_tls_kind>(
+            tc.draw("server_tls", gs::integers<int>({.min_value = 0, .max_value = 2})))};
+        const server_tls_setup tls{server.sql, kind, "TLSv1.2,TLSv1.3"};
+        auto options{draw_options(tc)};
+        options.ssl.reset();
+        options.tls.reset();
+        pbt::note(tc, "binlog_server: " + describe(options) + " (no 'ssl' section); source: " +
+                          describe(kind));
+        const auto storage{make_storage(options)};
+        apply_all(tc, server.sql, {operation{.kind = op_kind::insert_rows, .count = 1}});
+        background_run fetch_run{{"fetch", storage->config_path}};
+        const auto [result, in_time]{fetch_run.wait_for(std::chrono::seconds{60})};
+        pbt::note(tc, "fetch: " + (in_time ? result.describe() : std::string{"killed after 60 s"}));
+        pbt::require(in_time, "fetch did not end within 60 s");
+        pbt::require(!result.signaled, "fetch crashed (" + result.describe() + ")");
+        pbt::require(result.exit_code != 0,
+                     "fetch without an 'ssl' section replicated from a source whose identity it "
+                     "did not verify (" +
+                         describe(kind) + ") and exited 0");
+      },
+      {.test_cases = 6U, .slow = true});
+}
