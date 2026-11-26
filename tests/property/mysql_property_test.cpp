@@ -5053,6 +5053,11 @@ BOOST_AUTO_TEST_CASE(UnindexedObjectsFollowTheRulesMySQL) {
                           .as_object()};
           if (metadata == "empty binlog") {
             object["size"] = 4;
+          } else if (object.at("size").to_number<std::uint64_t>() <= 4U) {
+            // the newest binlog itself can be stored as its magic only
+            // (PBT-020, an empty binlog at the end, Jenkins #44): a metadata
+            // file "with events" must record more than the magic
+            object["size"] = 1004;
           }
           return json::serialize(object);
         }};

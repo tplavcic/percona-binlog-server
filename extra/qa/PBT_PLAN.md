@@ -917,6 +917,14 @@ Upstream 4717df9 (PBS-80, PBS-98) makes `<replication.rewrite>` mandatory in gti
 - `ListDuringPullIsConsistentMySQL` fails through PBT-053 (pull exits 1 on a fresh instance id) instead of PBT-042.
 - PBT-040 now fails in GTID mode ("stored rw.000001: event size 0 at offset 4").
 
+### Jenkins run #44 (asan_gcc14-ubsan, PS 8.4.10-10, c387d40 on upstream 0e45db5)
+
+240 properties, 164 passed, 76 failed: 75 known, 1 new (a test premise, fixed), 0 regressions; possibly fixed PBT-069 (failover row), PBT-035, PBT-042, PBT-050 (IdleDumpSendsHeartbeats row), PBT-053.
+
+- D56 confirms Hrvoje's ticket 87 (PBT-081) in its first case: without checkpoint settings, fetching 256 MiB of 1 MiB transactions from one source binlog raises the peak RSS from 125 to 641 MiB.
+- D57 confirms Hrvoje's ticket 60 (PBT-082) in its first case: without an `ssl` section, fetch accepts a certificate from a CA it was not told to trust and exits 0.
+- New, a test premise: `UnindexedObjectsFollowTheRulesMySQL` drew "next binlog with metadata 'with events'", but the metadata copied from the newest binlog recorded 4 bytes (that binlog was stored as its magic only, PBT-020), so PBS rightly removed the objects as garbage. A metadata file "with events" now records 1004 bytes when the newest binlog's records only the magic.
+
 ## 6. Open questions
 
 See the hand-over message; the answers will be folded in here.
