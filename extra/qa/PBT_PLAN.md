@@ -905,6 +905,16 @@ Upstream 4717df9 (PBS-80, PBS-98) makes `<replication.rewrite>` mandatory in gti
 - D51 - D53 confirm Hrvoje's tickets 62, 92 and 88 in their first run: PBT-077 (8 appended bytes stored in plaintext after the encryption record was removed), PBT-078 (a line feed in a statement forges a log line), PBT-079 (300 gapped transactions, 85 KB at the source, stored as 507 KB in 111 binlogs).
 - PBT-040 (two writers) fails again after passing in #41.
 
+### Jenkins run #43 (asan_gcc14-ubsan, PS 8.4.10-10, aba066d on upstream 0e45db5)
+
+238 properties, 163 passed, 75 failed: 75 known, 0 new, 0 regressions; possibly fixed PBT-069 (failover row), PBT-050 (IdleDumpSendsHeartbeats row).
+
+- D55 confirms Hrvoje's ticket 82 (PBT-080) in its first case, in position mode with `pull`: with transaction_length 923 lowered to 79, the storage keeps the GTID event alone as the whole transaction (1 event of 5) and pull exits 1.
+- D54 (connection ends inside a transaction: EOF packet, close, half an event) passes: the guard of Hrvoje's ticket 83 (PBS-150) holds.
+- PBT-035 is reached again through `ServerRestartDuringPullMySQL` (the `storage.cpp:138` assertion after a server crash right after FLUSH BINARY LOGS).
+- `ListDuringPullIsConsistentMySQL` fails through PBT-053 (pull exits 1 on a fresh instance id) instead of PBT-042.
+- PBT-040 now fails in GTID mode ("stored rw.000001: event size 0 at offset 4").
+
 ## 6. Open questions
 
 See the hand-over message; the answers will be folded in here.
