@@ -10437,3 +10437,137 @@ BOOST_AUTO_TEST_CASE(LowerBinlogSequenceKeepsStorageOpenMySQL) {
   pbt::check([](hegel::TestCase &tc) { hostile_binlog_name_case(tc, {"lower_sequence"}); },
              {.test_cases = 8U, .slow = true});
 }
+
+// ---------------------------------------------------------------------------
+// D61: binlog data is durable before the metadata that records it (a guard
+// of Hrvoje's ticket 19)
+// ---------------------------------------------------------------------------
+
+// A power loss (or a kernel crash) loses what is still in the page cache;
+// a killed process does not, so the kill -9 properties cannot show it. What
+// can be checked is the order that makes a power loss harmless: a binlog
+// metadata file (<binlog>.json, written to a .tmp file and renamed into
+// place) that records a size S may become visible only after the binlog's
+// data has been synced up to S. Otherwise, after a power loss, the binlog
+// can be shorter than its metadata says, and the storage no longer opens
+// (InconsistentBinlogSizeIsRejected: "size from the binlog metadata is
+// bigger than the actual binlog file size").
+//
+// binlog_server runs with the LD_PRELOAD library pbt_fsync_trace
+// (common/fsync_trace.cpp), which records every successful fsync /
+// fdatasync (the file and its size at that moment) and rename (the target
+// and the "size" its JSON records), in order, also across processes. fetch
+// (some rounds) or pull (some workloads, then SIGTERM) runs with any
+// checkpoint setting, file storage, both replication modes. For every
+// metadata file renamed into place, the size it records must not exceed
+// the largest size at which the binlog data file has been synced so far.
+// Hrvoje's ticket 19 (PBS-85), fixed upstream in 2b18690 (fsync after
+// every stream write); this property keeps it fixed.
+
+namespace {
+
+struct durability_check {
+  std::size_t syncs{0U};
+  std::size_t publications{0U};
+  std::string problem;
+};
+
+durability_check check_durability_order(const std::string &trace) {
+  durability_check result;
+  // by file name: the storage's files have distinct names, and the paths
+  // the two kinds of lines carry are spelled differently (/proc/self/fd
+  // resolves links, a rename keeps the path it was given)
+  std::map<std::string, long long> synced;
+  std::istringstream lines{trace};
+  for (std::string line; std::getline(lines, line);) {
+    std::vector<std::string> fields;
+    std::size_t start{0U};
+    for (auto tab{line.find('\t')}; tab != std::string::npos; tab = line.find('\t', start)) {
+      fields.push_back(line.substr(start, tab - start));
+      start = tab + 1U;
+    }
+    fields.push_back(line.substr(start));
+    if (fields.size() == 3U && fields[0] == "fsync") {
+      ++result.syncs;
+      auto &size{synced[fs::path{fields[1]}.filename().string()]};
+      size = std::max(size, std::stoll(fields[2]));
+    } else if (fields.size() == 4U && fields[0] == "rename") {
+      const auto target{fs::path{fields[2]}.filename().string()};
+      const auto recorded{std::stoll(fields[3])};
+      if (!target.ends_with(".json") || target == "metadata.json" || recorded < 0) {
+        continue;
+      }
+      ++result.publications;
+      const auto data{target.substr(0U, target.size() - 5U)};
+      const auto found{synced.find(data)};
+      const auto durable{found == synced.end() ? -1LL : found->second};
+      if (durable < recorded && result.problem.empty()) {
+        result.problem = target + " was renamed into place recording " +
+                         std::to_string(recorded) + " bytes while " + data + " was " +
+                         (durable < 0 ? std::string{"never synced"}
+                                      : "synced only up to " + std::to_string(durable) +
+                                            " bytes");
+      }
+    }
+  }
+  return result;
+}
+
+} // namespace
+
+BOOST_AUTO_TEST_CASE(BinlogDataIsDurableBeforeItsMetadataMySQL) {
+  pbt::check(
+      [](hegel::TestCase &tc) {
+        server_session server;
+        start_case(tc, server);
+        auto options{draw_options(tc)};
+        options.encryption.reset();  // the data file size is the stored size
+        const bool use_pull{tc.draw("pull", gs::booleans())};
+        pbt::note(tc, "binlog_server: " + describe(options) + "; " +
+                          (use_pull ? "pull" : "fetch"));
+        const auto storage{make_storage(options)};
+        const auto trace_path{storage->directory.path() / "fsync-trace.log"};
+        const auto rounds{tc.draw("rounds", gs::integers<int>({.min_value = 1, .max_value = 3}))};
+        {
+          const char *asan_now{std::getenv("ASAN_OPTIONS")};
+          const char *preload_now{std::getenv("LD_PRELOAD")};
+          const scoped_environment asan{
+              "ASAN_OPTIONS",
+              std::string{asan_now != nullptr ? asan_now : ""} + ":verify_asan_link_order=0"};
+          const scoped_environment trace_log{"PBT_FSYNC_TRACE_LOG", trace_path.string()};
+          const scoped_environment preload{
+              "LD_PRELOAD", std::string{PBS_FSYNC_TRACE_PATH} +
+                                (preload_now != nullptr && *preload_now != '\0'
+                                     ? ":" + std::string{preload_now}
+                                     : std::string{})};
+          if (use_pull) {
+            pull_process pull{tc, *storage};
+            for (int round{0}; round < rounds; ++round) {
+              pbt::note(tc, "workload:");
+              apply_all(tc, server.sql, draw_workload(tc, server.info, 5U));
+              wait_until_pull_caught_up(tc, server.sql, pull);
+            }
+            pull.stop();
+          } else {
+            for (int round{0}; round < rounds; ++round) {
+              pbt::note(tc, "workload, then fetch:");
+              apply_all(tc, server.sql, draw_workload(tc, server.info, 5U));
+              fetch(tc, *storage);
+            }
+          }
+        }
+        const auto checked{check_durability_order(read_file_if_exists(trace_path))};
+        pbt::note(tc, "trace: " + std::to_string(checked.syncs) + " fsync call(s), " +
+                          std::to_string(checked.publications) +
+                          " binlog metadata file(s) renamed into place");
+        pbt::require(checked.syncs > 0U && checked.publications > 0U,
+                     "the trace library recorded no fsync or no metadata rename (" +
+                         std::string{PBS_FSYNC_TRACE_PATH} + " not preloaded?)");
+        pbt::require(checked.problem.empty(),
+                     "binlog metadata became visible before the data it records was "
+                     "synced (a power loss would leave the binlog shorter than its "
+                     "metadata): " + checked.problem);
+        require_storage_matches_server(tc, server.sql, server.info, *storage);
+      },
+      {.test_cases = 15U, .slow = true});
+}

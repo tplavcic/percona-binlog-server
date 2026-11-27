@@ -184,8 +184,19 @@ if(TARGET pbs_test_binsrv)
     SOURCES mysql_property_test.cpp
     LIBRARIES pbs_test_binsrv MySQL::client ZLIB::ZLIB OpenSSL::Crypto
   )
+  # D61: an LD_PRELOAD library that records the fsync / rename calls of
+  # binlog_server; without sanitizers, as it is loaded before their runtime
+  add_library(pbt_fsync_trace SHARED common/fsync_trace.cpp)
+  target_compile_options(pbt_fsync_trace PRIVATE
+    "$<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-fno-sanitize=all>"
+  )
+  target_link_options(pbt_fsync_trace PRIVATE
+    "$<$<CXX_COMPILER_ID:GNU,Clang>:-fno-sanitize=all>"
+  )
+  target_link_libraries(pbt_fsync_trace PRIVATE ${CMAKE_DL_LIBS})
   target_compile_definitions(mysql_property_test PRIVATE
     PBS_BINLOG_SERVER_PATH="$<TARGET_FILE:binlog_server>"
+    PBS_FSYNC_TRACE_PATH="$<TARGET_FILE:pbt_fsync_trace>"
   )
-  add_dependencies(mysql_property_test binlog_server)
+  add_dependencies(mysql_property_test binlog_server pbt_fsync_trace)
 endif()
