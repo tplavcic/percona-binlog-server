@@ -929,6 +929,14 @@ Upstream 4717df9 (PBS-80, PBS-98) makes `<replication.rewrite>` mandatory in gti
 - D57 confirms Hrvoje's ticket 60 (PBT-082) in its first case: without an `ssl` section, fetch accepts a certificate from a CA it was not told to trust and exits 0.
 - New, a test premise: `UnindexedObjectsFollowTheRulesMySQL` drew "next binlog with metadata 'with events'", but the metadata copied from the newest binlog recorded 4 bytes (that binlog was stored as its magic only, PBT-020), so PBS rightly removed the objects as garbage. A metadata file "with events" now records 1004 bytes when the newest binlog's records only the magic.
 
+### Jenkins run #46 (asan_gcc14-ubsan, PS 8.4.10-10, 88cc334 on upstream 0e45db5)
+
+244 properties, 164 passed, 80 failed: 79 known, 1 new (a test premise, fixed), 0 regressions; possibly fixed PBT-069 (failover row), PBT-035, PBT-050 (IdleDumpSendsHeartbeats row).
+
+- D58 - D60 confirm Hrvoje's tickets 59, 69 and 70 in their first case (position mode, the next binlog renamed by the proxy, fetch exits 0 each time): 'binlog.000001\0.000002' truncates binlog.000001 from 452 to 125 bytes (PBT-083); the current binlog announced again gets a second FORMAT_DESCRIPTION (PBT-084); 'binlog.000002' after binlog.000005 is stored and the next fetch refuses the storage (PBT-085).
+- New, a test premise: D61 drew a workload without operations in GTID mode, so fetch stored nothing and no metadata was written ("2 fsync calls, 0 metadata renames"); its 7 earlier cases passed, so the trace library works and found no ordering problem. Every round now commits at least one transaction.
+- `ListDuringPullIsConsistentMySQL` fails again through PBT-053.
+
 ## 6. Open questions
 
 See the hand-over message; the answers will be folded in here.

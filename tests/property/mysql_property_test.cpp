@@ -10513,6 +10513,14 @@ durability_check check_durability_order(const std::string &trace) {
   return result;
 }
 
+// a drawn workload and at least one transaction: an empty one stores
+// nothing in GTID mode, so no metadata would be written (Jenkins #46)
+std::vector<operation> durability_workload(hegel::TestCase &tc, const server_info &info) {
+  auto workload{draw_workload(tc, info, 5U)};
+  workload.push_back(operation{.kind = op_kind::insert_rows, .count = 1});
+  return workload;
+}
+
 } // namespace
 
 BOOST_AUTO_TEST_CASE(BinlogDataIsDurableBeforeItsMetadataMySQL) {
@@ -10544,14 +10552,14 @@ BOOST_AUTO_TEST_CASE(BinlogDataIsDurableBeforeItsMetadataMySQL) {
             pull_process pull{tc, *storage};
             for (int round{0}; round < rounds; ++round) {
               pbt::note(tc, "workload:");
-              apply_all(tc, server.sql, draw_workload(tc, server.info, 5U));
+              apply_all(tc, server.sql, durability_workload(tc, server.info));
               wait_until_pull_caught_up(tc, server.sql, pull);
             }
             pull.stop();
           } else {
             for (int round{0}; round < rounds; ++round) {
               pbt::note(tc, "workload, then fetch:");
-              apply_all(tc, server.sql, draw_workload(tc, server.info, 5U));
+              apply_all(tc, server.sql, durability_workload(tc, server.info));
               fetch(tc, *storage);
             }
           }
