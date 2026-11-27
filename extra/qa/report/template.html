@@ -1,0 +1,415 @@
+<title>PBS Property Test Findings</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: a run header band, a summary strip, then a filterable issue ledger whose rows open in place into a full write-up. */
+:root {
+  --bg: #f6f7f9; --surface: #ffffff; --sunken: #eef0f4; --line: #d9dde5;
+  --fg: #1b2230; --muted: #5d6676; --accent: #2f5bd3; --accent-soft: #e6ecfb;
+  --high: #c2362f; --high-soft: #fbe9e7; --medium: #a8650a; --medium-soft: #fbf1df;
+  --low: #4c6a8a; --low-soft: #e8eef5; --fixed: #23824f; --fixed-soft: #e3f3ea;
+  --code-bg: #f0f2f6;
+  --font-ui: "Instrument Sans", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #12161d; --surface: #191e27; --sunken: #141922; --line: #2a3140;
+  --fg: #e3e7ee; --muted: #98a2b3; --accent: #7fa2ff; --accent-soft: #1f2a45;
+  --high: #ff7a70; --high-soft: #3a1d1c; --medium: #f0b45a; --medium-soft: #36290f;
+  --low: #93b2d4; --low-soft: #1e2a38; --fixed: #5fd394; --fixed-soft: #15301f;
+  --code-bg: #0f131a; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #12161d; --surface: #191e27; --sunken: #141922; --line: #2a3140;
+  --fg: #e3e7ee; --muted: #98a2b3; --accent: #7fa2ff; --accent-soft: #1f2a45;
+  --high: #ff7a70; --high-soft: #3a1d1c; --medium: #f0b45a; --medium-soft: #36290f;
+  --low: #93b2d4; --low-soft: #1e2a38; --fixed: #5fd394; --fixed-soft: #15301f;
+  --code-bg: #0f131a; color-scheme: dark }
+* { box-sizing: border-box }
+body { background: var(--bg); color: var(--fg); font-family: var(--font-ui); font-size: 15px; line-height: 1.55 }
+.wrap { max-width: 1080px; margin: 0 auto; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); padding-block: 28px 64px; display: grid; gap: 28px }
+h1, h2, h3 { text-wrap: balance; margin: 0 }
+h1 { font-size: 1.85rem; font-weight: 700; letter-spacing: -0.01em }
+h2 { font-size: 1.15rem; font-weight: 600 }
+.eyebrow { font-size: .72rem; letter-spacing: .09em; text-transform: uppercase; color: var(--muted); font-weight: 600 }
+code, .mono { font-family: var(--font-mono); font-size: .86em }
+p code, li code { background: var(--code-bg); padding: .08em .35em; border-radius: 4px; overflow-wrap: anywhere }
+header.run { display: grid; gap: 10px }
+.meta { display: flex; flex-wrap: wrap; gap: 6px 18px; color: var(--muted); font-size: .88rem }
+.meta b { color: var(--fg); font-weight: 600 }
+.lede { max-width: 68ch; color: var(--muted); margin: 0 }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: 10px; overflow: hidden }
+.stat { background: var(--surface); padding: 14px 16px; display: grid; gap: 2px }
+.stat .n { font-size: 1.7rem; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1.1 }
+.stat .l { font-size: .8rem; color: var(--muted) }
+.stat.high .n { color: var(--high) } .stat.medium .n { color: var(--medium) } .stat.low .n { color: var(--low) } .stat.fixed .n { color: var(--fixed) }
+.sevbar { display: flex; height: 8px; border-radius: 4px; overflow: hidden; background: var(--sunken) }
+.sevbar span { display: block } .sevbar .h { background: var(--high) } .sevbar .m { background: var(--medium) } .sevbar .lo { background: var(--low) }
+.coverage { display: grid; gap: 8px }
+.cov-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 6px 22px }
+.cov { display: grid; grid-template-columns: 1fr auto; gap: 2px 10px; align-items: center; font-size: .84rem }
+.cov .bar { grid-column: 1 / -1; height: 5px; border-radius: 3px; background: var(--sunken); overflow: hidden; display: flex }
+.cov .bar i { display: block; background: var(--fixed) } .cov .bar em { display: block; background: var(--high) }
+.cov .num { color: var(--muted); font-variant-numeric: tabular-nums }
+.controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center }
+.chips { display: flex; flex-wrap: wrap; gap: 6px }
+.chip { font: inherit; font-size: .84rem; border: 1px solid var(--line); background: var(--surface); color: var(--fg); padding: 5px 11px; border-radius: 999px; cursor: pointer }
+.chip[aria-pressed="true"] { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); font-weight: 600 }
+.chip:focus-visible, .row:focus-visible, button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px }
+select, input[type="search"] { font: inherit; font-size: .88rem; padding: 6px 10px; border: 1px solid var(--line); background: var(--surface); color: var(--fg); border-radius: 8px }
+input[type="search"] { flex: 1 1 200px; min-width: 0 }
+.count { color: var(--muted); font-size: .85rem }
+.ledger { border: 1px solid var(--line); border-radius: 10px; background: var(--surface); overflow: hidden }
+.item + .item { border-top: 1px solid var(--line) }
+.row { display: grid; grid-template-columns: 88px 78px minmax(0, 1fr) auto; gap: 12px; align-items: center; width: 100%; padding: 12px 16px; background: none; border: 0; color: inherit; font: inherit; text-align: left; cursor: pointer }
+.row:hover { background: var(--sunken) }
+.row .id { font-family: var(--font-mono); font-size: .84rem; font-weight: 600 }
+.row .t { min-width: 0; display: grid; gap: 1px }
+.row .t span:first-child { font-weight: 600 }
+.row .t span + span { color: var(--muted); font-size: .82rem }
+.row .chev { color: var(--muted); transition: transform .15s }
+.item.open .row .chev { transform: rotate(90deg) }
+.item.open .row { background: var(--sunken) }
+.sev { justify-self: start; font-size: .72rem; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; padding: 3px 8px; border-radius: 4px }
+.sev.high { color: var(--high); background: var(--high-soft) } .sev.medium { color: var(--medium); background: var(--medium-soft) } .sev.low { color: var(--low); background: var(--low-soft) } .sev.fixed { color: var(--fixed); background: var(--fixed-soft) }
+.detail { padding: 6px 16px 22px; display: grid; gap: 18px; border-top: 1px dashed var(--line) }
+.detail .summary { font-size: 1.02rem; max-width: 72ch; margin: 10px 0 0 }
+.sections { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px 28px }
+.sec { display: grid; gap: 6px; min-width: 0; align-content: start }
+.sec h3 { font-size: .74rem; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); font-weight: 700 }
+.sec p { margin: 0; max-width: 70ch; overflow-wrap: anywhere } .sec p + p { margin-top: 8px }
+.sec.wide { grid-column: 1 / -1 }
+.sec.cause { border-left: 3px solid var(--high); padding-left: 12px } .sec.fix { border-left: 3px solid var(--fixed); padding-left: 12px }
+.fails { display: grid; gap: 10px }
+.fail { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; display: grid; gap: 8px; min-width: 0; background: var(--bg) }
+.fail .name { font-family: var(--font-mono); font-size: .82rem; font-weight: 600; overflow-wrap: anywhere }
+.fail .msg { font-family: var(--font-mono); font-size: .8rem; color: var(--high); overflow-wrap: anywhere; white-space: pre-wrap; margin: 0 }
+details summary { cursor: pointer; font-size: .84rem; color: var(--accent); font-weight: 600 }
+pre.block { margin: 6px 0 0; padding: 10px 12px; background: var(--code-bg); border-radius: 6px; overflow-x: auto; font-family: var(--font-mono); font-size: .76rem; line-height: 1.5; max-height: 360px }
+.cmd { display: flex; gap: 8px; align-items: start; min-width: 0 }
+.cmd pre { flex: 1; margin: 0; min-width: 0 }
+.copy { font: inherit; font-size: .78rem; border: 1px solid var(--line); background: var(--surface); color: var(--fg); padding: 4px 10px; border-radius: 6px; cursor: pointer; white-space: nowrap }
+.props { margin: 0; padding-left: 18px; font-size: .84rem } .props code { font-size: .8rem }
+.permalink { font-size: .82rem; color: var(--muted) } .permalink a { color: var(--accent) }
+.empty { padding: 24px 16px; color: var(--muted) }
+footer { color: var(--muted); font-size: .82rem; max-width: 80ch }
+.notes { display: grid; gap: 10px }
+.notes-list { display: grid; gap: 10px }
+.note { border: 1px solid var(--line); border-radius: 10px; background: var(--surface); padding: 12px 16px; display: grid; gap: 6px; min-width: 0 }
+.note-head { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: baseline; justify-content: space-between }
+.note { min-width: 0; overflow-wrap: anywhere }
+.note-head .mono { font-weight: 600; overflow-wrap: anywhere; min-width: 0; max-width: 100%; word-break: break-all }
+.verdict { font-size: .78rem; font-weight: 700; color: var(--accent); background: var(--accent-soft); padding: 2px 8px; border-radius: 4px }
+.note p { margin: 0; color: var(--muted); max-width: 80ch }
+.cmp { display: grid; gap: 14px }
+.cmp .lede { max-width: 80ch }
+.cmp-list { border: 1px solid var(--line); border-radius: 10px; background: var(--surface); overflow: hidden }
+.cmp-row { display: grid; grid-template-columns: 88px 78px minmax(0, 1fr); gap: 4px 12px; padding: 11px 16px; align-items: start }
+.cmp-row + .cmp-row { border-top: 1px solid var(--line) }
+.cmp-row .id { font-family: var(--font-mono); font-size: .84rem; font-weight: 600 }
+.cmp-row .id a { color: var(--accent); text-decoration: none } .cmp-row .id a:hover { text-decoration: underline }
+.cmp-row .t { display: grid; gap: 3px; min-width: 0 }
+.cmp-row .t > span:first-child { font-weight: 600 }
+.cmp-row .sub { color: var(--muted); font-size: .84rem; overflow-wrap: anywhere }
+.cmp-row .rel { font-size: .82rem; color: var(--fg); background: var(--accent-soft); border-radius: 6px; padding: 4px 8px; justify-self: start }
+.sev.other { color: var(--muted); background: var(--sunken) }
+.pairs { display: flex; flex-wrap: wrap; gap: 6px 10px; font-size: .84rem; color: var(--muted) }
+.pairs a { color: var(--accent); font-family: var(--font-mono); font-size: .82rem }
+.pair { border: 1px solid var(--line); border-radius: 999px; padding: 3px 10px; background: var(--surface) }
+@media (max-width: 720px) { .cmp-row { grid-template-columns: 72px minmax(0, 1fr) } .cmp-row .sevcell { grid-column: 2 } .cmp-row .t { grid-column: 1 / -1 } }
+.xrow { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr) minmax(0, .9fr) minmax(0, 2.4fr); gap: 4px 14px; padding: 10px 16px; align-items: start; font-size: .88rem }
+.xrow + .xrow { border-top: 1px solid var(--line) }
+.xrow.head { font-size: .72rem; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); font-weight: 700; background: var(--sunken) }
+.xrow .ids { display: flex; flex-wrap: wrap; gap: 4px 8px; font-family: var(--font-mono); font-size: .82rem; font-weight: 600 }
+.xrow .ids a { color: var(--accent); text-decoration: none } .xrow .ids a:hover { text-decoration: underline }
+.xrow .src { overflow-wrap: anywhere } .xrow .src.none { color: var(--muted) }
+.xrow .sub { color: var(--muted); overflow-wrap: anywhere }
+.xrow .lbl { display: none; color: var(--muted); font-size: .72rem; text-transform: uppercase; letter-spacing: .06em; margin-right: 6px }
+.status { font-size: .72rem; color: var(--muted); border: 1px solid var(--line); border-radius: 4px; padding: 1px 6px; white-space: nowrap }
+.rnote { font-size: .78rem; color: var(--muted); font-style: italic }
+@media (max-width: 720px) {
+  .xrow { grid-template-columns: minmax(0, 1fr) } .xrow.head { display: none } .xrow .lbl { display: inline }
+  .row { grid-template-columns: 72px minmax(0, 1fr) auto; } .row .sevcell { display: none }
+  .sections { grid-template-columns: minmax(0, 1fr) }
+  h1 { font-size: 1.5rem }
+}
+@media (prefers-reduced-motion: reduce) { .row .chev { transition: none } }
+</style>
+
+<div class="wrap">
+  <header class="run">
+    <span class="eyebrow">Percona Binlog Server · property-based testing</span>
+    <h1>Findings from the latest QA run</h1>
+    <p class="lede" id="lede"></p>
+    <div class="meta" id="meta"></div>
+  </header>
+
+  <section class="stats" id="stats" aria-label="Run totals"></section>
+
+  <section class="notes" id="notes" hidden aria-labelledby="notes-h">
+    <h2 id="notes-h">New in this run</h2>
+    <div class="notes-list" id="notes-list"></div>
+  </section>
+
+  <section class="coverage" aria-labelledby="cov-h">
+    <h2 id="cov-h">Properties by test program</h2>
+    <div class="cov-grid" id="coverage"></div>
+  </section>
+
+  <section style="display:grid;gap:12px" aria-labelledby="issues-h">
+    <h2 id="issues-h">Issues</h2>
+    <div class="controls">
+      <div class="chips" id="sevchips" role="group" aria-label="Severity"></div>
+      <select id="component" aria-label="Component"></select>
+      <input type="search" id="q" placeholder="Search titles, causes, property names" aria-label="Search issues">
+    </div>
+    <div class="count" id="count"></div>
+    <div class="ledger" id="ledger"></div>
+  </section>
+
+  <section class="cmp" id="cmp" hidden aria-labelledby="cmp-h">
+    <h2 id="cmp-h">Cross findings with Manish and Hrvoje</h2>
+    <p class="lede" id="cmp-lede"></p>
+    <div class="cmp-list" id="cmp-cross"></div>
+  </section>
+
+  <section class="cmp" id="cmp-ours" hidden aria-labelledby="cmp-ours-h">
+    <h2 id="cmp-ours-h">Found only by us</h2>
+    <p class="lede" id="cmp-ours-lede"></p>
+    <div class="cmp-list" id="cmp-ours-list"></div>
+  </section>
+
+  <section class="cmp" id="cmp-manish" hidden aria-labelledby="cmp-manish-h">
+    <h2 id="cmp-manish-h">Only in Manish's PDF</h2>
+    <p class="lede" id="cmp-manish-lede"></p>
+    <div class="cmp-list" id="cmp-manish-list"></div>
+  </section>
+
+  <section class="cmp" id="cmp-hrvoje" hidden aria-labelledby="cmp-hrvoje-h">
+    <h2 id="cmp-hrvoje-h">Only in Hrvoje's tickets</h2>
+    <p class="lede" id="cmp-hrvoje-lede"></p>
+    <div class="cmp-list" id="cmp-hrvoje-list"></div>
+  </section>
+
+  <footer>
+    Severity follows <code>extra/qa/known_bugs.md</code>: <b>high</b> means a crash, data loss or corruption, or replication stopping with valid input; <b>medium</b> means wrong results or wrongly accepted or rejected input that a user can reach, or failures under unusual but valid conditions; <b>low</b> means API-contract issues, input MySQL never produces, or astronomically unlikely conditions. PBT-NNN are local IDs until the issues are filed in Jira. Root causes were traced in the source of the tested revision; suggested fixes are proposals, not reviewed patches.
+  </footer>
+</div>
+
+<script id="data" type="application/json">__DATA__</script>
+<script>
+(function () {
+  const data = JSON.parse(document.getElementById('data').textContent);
+  const run = data.run, totals = data.totals;
+  const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  const rich = s => esc(s).split(/\n\s*\n/).map(p => '<p>' + p.replace(/`([^`]+)`/g, '<code>$1</code>').replace(/\n/g, '<br>') + '</p>').join('');
+  const sevOrder = { high: 0, medium: 1, low: 2 };
+  const issues = data.issues.slice().sort((a, b) => {
+    const fa = a.status === 'fixed', fb = b.status === 'fixed';
+    if (fa !== fb) return fa ? 1 : -1;
+    return (sevOrder[a.severity] - sevOrder[b.severity]) || a.id.localeCompare(b.id);
+  });
+  const open = issues.filter(i => i.status !== 'fixed');
+  const fixed = issues.filter(i => i.status === 'fixed');
+  const by = s => open.filter(i => i.severity === s).length;
+
+  const started = run.started.replace('T', ' ');
+  const mins = Math.round(run.duration_s / 60);
+  const notes = data.notes || [];
+  const caused = open.filter(i => i.failures.length).length;
+  document.getElementById('lede').textContent =
+    `${totals.total} properties ran against the ${run.variant} build: ${totals.passed} passed and ${totals.failed} failed, ` +
+    `with ${totals.regressions} regression${totals.regressions === 1 ? "" : "s"}. ` +
+    (totals.new_issues ? `${totals.new_issues} failure${totals.new_issues === 1 ? ' was' : 's were'} new to the run (see "New in this run"); ` : 'No failure was new to the run; ') +
+    `${caused} open issues caused failures in this run, and ${fixed.length} earlier issues are fixed upstream.`;
+  const notesBox = document.getElementById('notes');
+  if (notes.length) {
+    notesBox.hidden = false;
+    document.getElementById('notes-list').innerHTML = notes.map(n => `
+      <div class="note"><div class="note-head"><span class="mono">${esc(n.test)}</span><span class="verdict">${esc(n.verdict)}</span></div>
+      <p>${esc(n.detail)}</p></div>`).join('');
+  }
+  document.getElementById('meta').innerHTML = [
+    ['Revision', run.git_revision.slice(0, 7) + ' (' + esc(run.git_branch || 'pbt-init-tomislav') + ')'],
+    ['Build', esc(run.variant)], ['Host', esc(run.host)], ['Started', esc(started)], ['Duration', mins + ' min'],
+  ].map(([k, v]) => `<span>${k} <b>${v}</b></span>`).join('');
+
+  const stat = (n, l, cls) => `<div class="stat ${cls || ''}"><span class="n">${n}</span><span class="l">${l}</span></div>`;
+  document.getElementById('stats').innerHTML =
+    stat(totals.passed + ' / ' + totals.total, 'properties passed') +
+    stat(open.length, 'open issues') +
+    stat(by('high'), 'high severity', 'high') + stat(by('medium'), 'medium', 'medium') + stat(by('low'), 'low', 'low') +
+    stat(fixed.length, 'fixed upstream', 'fixed') +
+    stat(totals.new_issues, 'new issues') + stat(totals.regressions, 'regressions');
+
+  document.getElementById('coverage').innerHTML = Object.entries(data.executables).map(([exe, c]) => {
+    const t = c.passed + c.failed;
+    return `<div class="cov"><span class="mono">${esc(exe.replace('_property_test', ''))}</span><span class="num">${c.passed}/${t}</span>` +
+      `<span class="bar"><i style="width:${100 * c.passed / t}%"></i><em style="width:${100 * c.failed / t}%"></em></span></div>`;
+  }).join('');
+
+  const sevs = [['all', 'All open'], ['high', 'High'], ['medium', 'Medium'], ['low', 'Low'], ['fixed', 'Fixed']];
+  let sevFilter = 'all', compFilter = '', query = '';
+  const chipBox = document.getElementById('sevchips');
+  chipBox.innerHTML = sevs.map(([k, l]) => {
+    const n = k === 'all' ? open.length : k === 'fixed' ? fixed.length : by(k);
+    return `<button class="chip" type="button" data-sev="${k}" aria-pressed="${k === 'all'}">${l} · ${n}</button>`;
+  }).join('');
+  chipBox.addEventListener('click', e => {
+    const b = e.target.closest('button'); if (!b) return;
+    sevFilter = b.dataset.sev;
+    chipBox.querySelectorAll('button').forEach(x => x.setAttribute('aria-pressed', String(x === b)));
+    render();
+  });
+  const comps = [...new Set(issues.map(i => i.component))].sort();
+  const sel = document.getElementById('component');
+  sel.innerHTML = '<option value="">All components</option>' + comps.map(c => `<option>${esc(c)}</option>`).join('');
+  sel.addEventListener('change', () => { compFilter = sel.value; render(); });
+  const q = document.getElementById('q');
+  q.addEventListener('input', () => { query = q.value.trim().toLowerCase(); render(); });
+
+  function detail(i) {
+    const fails = i.failures.length ? i.failures.map((f, k) => `
+      <div class="fail">
+        <div class="name">${esc(f.test)}${f.duration ? ` <span style="color:var(--muted);font-weight:400">· ${f.duration} s</span>` : ''}</div>
+        ${f.message ? `<pre class="msg">${esc(f.message.trim())}</pre>` : ''}
+        ${f.report ? `<details><summary>Minimal counterexample</summary>${f.report_note ? `<p class="rnote">${esc(f.report_note)}</p>` : ''}<pre class="block">${esc(f.report.trim())}</pre></details>` : ''}
+        ${f.command ? `<details><summary>Reproduce on the QA host</summary><div class="cmd"><pre class="block" id="cmd-${esc(i.id)}-${k}">${esc(f.command)}</pre><button class="copy" type="button" data-copy="cmd-${esc(i.id)}-${k}">Copy</button></div></details>` : ''}
+      </div>`).join('') : `<p style="margin:0;color:var(--muted)">No failing property in this run${i.status === 'fixed' ? ' (fixed)' : ''}.</p>`;
+    return `
+      <p class="summary">${esc(i.summary)}</p>
+      <div class="sections">
+        <div class="sec wide"><h3>What happens</h3>${rich(i.description)}</div>
+        <div class="sec cause"><h3>Root cause</h3>${rich(i.root_cause)}</div>
+        <div class="sec fix"><h3>${i.status === 'fixed' ? 'How it was fixed' : 'Suggested fix'}</h3>${rich(i.fix)}</div>
+        <div class="sec"><h3>Impact</h3>${rich(i.impact)}</div>
+        <div class="sec"><h3>How to verify</h3>${rich(i.verification)}</div>
+        <div class="sec wide"><h3>Properties that check it</h3><ul class="props">${i.properties.map(p => `<li><code>${esc(p)}</code></li>`).join('')}</ul></div>
+        <div class="sec wide"><h3>Failures in this run</h3><div class="fails">${fails}</div></div>
+      </div>
+      <div class="permalink">Link to this issue: <a href="#${esc(i.id)}">#${esc(i.id)}</a></div>`;
+  }
+
+  const ledger = document.getElementById('ledger');
+  function render() {
+    const list = issues.filter(i => {
+      if (sevFilter === 'fixed') { if (i.status !== 'fixed') return false; }
+      else { if (i.status === 'fixed') return false; if (sevFilter !== 'all' && i.severity !== sevFilter) return false; }
+      if (compFilter && i.component !== compFilter) return false;
+      if (query) {
+        const hay = [i.id, i.title, i.summary, i.description, i.root_cause, i.fix, i.component, ...i.properties].join(' ').toLowerCase();
+        if (!hay.includes(query)) return false;
+      }
+      return true;
+    });
+    document.getElementById('count').textContent = `${list.length} issue${list.length === 1 ? '' : 's'} shown`;
+    ledger.innerHTML = list.length ? list.map(i => {
+      const sev = i.status === 'fixed' ? 'fixed' : i.severity;
+      const n = i.failures.length;
+      return `<div class="item" id="${esc(i.id)}">
+        <button class="row" type="button" aria-expanded="false" aria-controls="d-${esc(i.id)}">
+          <span class="id">${esc(i.id)}</span>
+          <span class="sevcell"><span class="sev ${sev}">${sev}</span></span>
+          <span class="t"><span>${esc(i.title)}</span><span>${esc(i.component)} · ${n ? n + ' failing propert' + (n === 1 ? 'y' : 'ies') : 'no failure in this run'}</span></span>
+          <span class="chev" aria-hidden="true">›</span>
+        </button>
+        <div class="detail" id="d-${esc(i.id)}" hidden></div>
+      </div>`;
+    }).join('') : '<div class="empty">No issue matches these filters.</div>';
+  }
+  function toggle(item, force) {
+    const btn = item.querySelector('.row'), panel = item.querySelector('.detail');
+    const willOpen = force ?? panel.hidden;
+    if (willOpen && !panel.dataset.filled) {
+      panel.innerHTML = detail(issues.find(i => i.id === item.id)); panel.dataset.filled = '1';
+    }
+    panel.hidden = !willOpen; item.classList.toggle('open', willOpen); btn.setAttribute('aria-expanded', String(willOpen));
+  }
+  ledger.addEventListener('click', e => {
+    const copy = e.target.closest('.copy');
+    if (copy) {
+      const pre = document.getElementById(copy.dataset.copy);
+      const done = () => { copy.textContent = 'Copied'; setTimeout(() => copy.textContent = 'Copy', 1500); };
+      try {
+        navigator.clipboard.writeText(pre.textContent).then(done, () => { selectText(pre); copy.textContent = 'Selected'; });
+      } catch (_) { selectText(pre); copy.textContent = 'Selected'; }
+      return;
+    }
+    const row = e.target.closest('.row');
+    if (row) toggle(row.closest('.item'));
+  });
+  function selectText(el) { const r = document.createRange(); r.selectNodeContents(el); const s = getSelection(); s.removeAllRanges(); s.addRange(r); }
+
+  function openFromHash() {
+    const id = decodeURIComponent(location.hash.slice(1));
+    const target = issues.find(i => i.id === id); if (!target) return;
+    const wantSev = target.status === 'fixed' ? 'fixed' : 'all';
+    if (sevFilter !== wantSev || compFilter || query) {
+      sevFilter = wantSev; compFilter = ''; query = ''; sel.value = ''; q.value = '';
+      chipBox.querySelectorAll('button').forEach(x => x.setAttribute('aria-pressed', String(x.dataset.sev === wantSev)));
+      render();
+    }
+    const item = document.getElementById(id);
+    if (item) { toggle(item, true); item.scrollIntoView({ block: 'start' }); }
+  }
+  const cmp = data.comparison;
+  if (cmp) {
+    const link = id => `<a href="#${esc(id)}" data-jump="${esc(id)}">${esc(id)}</a>`;
+    const M = cmp.sources.manish, H = cmp.sources.hrvoje;
+    const inBoth = cmp.cross.filter(r => r.manish && r.hrvoje).length;
+    document.getElementById('cmp-lede').textContent =
+      `Compared with ${M.name} ("${M.title}", ${M.date}, ${M.version}, ${M.count} findings) and ${H.name} ("${H.title}", ${H.date}, ${H.version}, ${H.count} tickets: ${H.status}). ${M.excluded} ` +
+      `${cmp.cross.filter(r => r.ours.length).length} of our issues or groups of issues match a finding of theirs; ${inBoth} of them are in both lists. ` +
+      (cmp.cross.some(r => !r.ours.length) ? `${cmp.cross.filter(r => !r.ours.length).length} more of their tickets were fixed before our properties could find them and are guarded by passing properties ("guarded"). ` : '') +
+      `Click an ID to open our write-up.`;
+    const src = v => v ? `<span class="src">${esc(v)}</span>` : '<span class="src none">—</span>';
+    document.getElementById('cmp-cross').innerHTML =
+      `<div class="xrow head"><span>Ours</span><span>Manish</span><span>Hrvoje</span><span>Note</span></div>` +
+      cmp.cross.map(r => `<div class="xrow">
+        <span class="ids">${r.ours.length ? r.ours.map(link).join('') : '<span class="src none">guarded (passes)</span>'}</span>
+        <span><span class="lbl">Manish</span>${src(r.manish)}</span>
+        <span><span class="lbl">Hrvoje</span>${src(r.hrvoje)}</span>
+        <span class="sub">${esc(r.note || (issues.find(i => i.id === r.ours[0]) || {}).title || '')}</span>
+      </div>`).join('');
+    const sevRank = { high: 0, medium: 1, low: 2 };
+    const ours = cmp.only_ours.map(o => { const i = issues.find(x => x.id === o.id); return i && Object.assign({ note: o.note }, i); }).filter(Boolean)
+      .sort((a, b) => (sevRank[a.severity] - sevRank[b.severity]) || a.id.localeCompare(b.id));
+    const cnt = s => ours.filter(i => i.severity === s).length;
+    document.getElementById('cmp-ours-lede').textContent =
+      `${ours.length} open issues are in neither list: ${cnt('high')} high, ${cnt('medium')} medium, ${cnt('low')} low. Most come from storage, configuration and MySQL system-level properties, or from codec and cipher contracts neither list covers.`;
+    document.getElementById('cmp-ours-list').innerHTML = ours.map(i => `
+      <div class="cmp-row">
+        <span class="id">${link(i.id)}</span>
+        <span class="sevcell"><span class="sev ${i.severity}">${i.severity}</span></span>
+        <span class="t"><span>${esc(i.title)}</span><span class="sub">${esc(i.component)}</span>${i.note ? `<span class="rel">${esc(i.note)}</span>` : ''}</span>
+      </div>`).join('');
+    const sevOf = s => /high/i.test(s) ? 'high' : /medium/i.test(s) ? 'medium' : /low/i.test(s) ? 'low' : 'other';
+    document.getElementById('cmp-manish-lede').textContent =
+      `${cmp.only_manish.length} PDF findings match nothing in our list or Hrvoje's. Severity, component and location are as the PDF gives them (0.4 source). By the PDF's own assessment none affects current production paths: they are API-contract, latent, documentation or cosmetic issues in code our properties do not exercise.`;
+    document.getElementById('cmp-manish-list').innerHTML = cmp.only_manish.map(p => `
+      <div class="cmp-row">
+        <span class="id">PDF #${p.num}</span>
+        <span class="sevcell"><span class="sev ${sevOf(p.severity)}">${esc(p.severity)}</span></span>
+        <span class="t"><span>${esc(p.title)}</span><span class="sub">${esc(p.summary)}</span><span class="sub"><code>${esc(p.where)}</code> · ${esc(p.component)}</span></span>
+      </div>`).join('');
+    const openH = cmp.only_hrvoje.filter(h => h.status === 'open' || h.status === 'partly fixed');
+    document.getElementById('cmp-hrvoje-lede').textContent =
+      `${cmp.only_hrvoje.length} of Hrvoje's tickets neither match an issue of ours nor are guarded by one of our properties, ${openH.length} of them still open. Priority and status are as his page gives them. The note says why our properties did not find it.`;
+    document.getElementById('cmp-hrvoje-list').innerHTML = cmp.only_hrvoje.map(h => `
+      <div class="cmp-row">
+        <span class="id">#${h.num}</span>
+        <span class="sevcell"><span class="sev ${sevOf(h.severity)}">${esc(h.severity)}</span></span>
+        <span class="t"><span>${esc(h.title)} <span class="status">${esc(h.status)}</span></span><span class="sub">${esc(h.component)}</span>${h.note ? `<span class="sub">${esc(h.note)}</span>` : ''}</span>
+      </div>`).join('');
+    ['cmp', 'cmp-ours', 'cmp-manish', 'cmp-hrvoje'].forEach(id => document.getElementById(id).hidden = false);
+    document.querySelector('.wrap').addEventListener('click', e => {
+      const a = e.target.closest('a[data-jump]');
+      if (a && location.hash === '#' + a.dataset.jump) { e.preventDefault(); openFromHash(); }
+    });
+  }
+  render();
+  window.addEventListener('hashchange', openFromHash);
+  openFromHash();
+})();
+</script>
+

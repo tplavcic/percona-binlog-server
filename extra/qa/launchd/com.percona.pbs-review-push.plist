@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- extra/qa/daily_sync.sh push-review for launchd (macOS); see extra/qa/launchd/README.md.
+     Replace REPO_DIR with the absolute path of your clone before loading. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.percona.pbs-review-push</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>REPO_DIR/extra/qa/daily_sync.sh</string>
+    <string>push-review</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>StartInterval</key>
+  <integer>600</integer>
+  <key>StandardOutPath</key>
+  <string>/tmp/com.percona.pbs-review-push.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/com.percona.pbs-review-push.log</string>
+</dict>
+</plist>
